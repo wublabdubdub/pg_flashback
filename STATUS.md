@@ -1,0 +1,148 @@
+# STATUS.md
+
+## 已完成
+
+- 确定项目主路线为 `reverse op stream`
+- 明确首版只读约束
+- 明确无主键表按 `bag/multiset` 语义处理
+- 明确时间窗内 DDL / rewrite 直接报错
+- 建立长期文档结构与仓库骨架
+- 初始化 git 仓库
+- 建立最小 PGXS 扩展骨架
+- 完成 `make`
+- 完成 `make install`
+- 完成最小回归测试通过
+- 记录本机 PG18 登录方式：`su - 18pg; psql postgres`
+- 完成 `fb_relation_gate` 回归，校验 `keyed` / `bag` 模式选择
+- 完成首轮 unsupported relation gate：
+  - `UNLOGGED`
+  - `TEMP`
+  - `MATERIALIZED VIEW`
+  - `PARTITIONED TABLE`
+- 完成 system catalog 的拒绝测试与错误模型
+- 明确 TOAST relation 不单独占错误分支，落入通用 unsupported relkind
+- 完成 TOAST presence 定位验证：
+  - 有大字段表 `has_toast=true`
+  - 无 TOAST 表 `has_toast=false`
+- 扩展 unsupported relation 覆盖到：
+  - `VIEW`
+  - `SEQUENCE`
+  - `INDEX`
+- 将 relation 打开方式改为通用 `relation_open()`，避免 index 在 gate 之前失败
+- 接入 `pg_flashback.archive_dir` GUC
+- 完成最小运行时 gate：
+  - 未设置 `pg_flashback.archive_dir` 时明确报错
+  - 路径不存在时明确报错
+  - 目录内没有 WAL 段时明确报错
+  - 设置后进入 WAL scan framework 占位
+- 完成目标时间点前置校验：
+  - `target_ts > now()` 时直接报错
+- `pg_flashback()` / `fb_export_undo()` 已接入 relation 校验链路
+- 建立最小 `FbWalScanContext`：
+  - 固定 `target_ts`
+  - 固定 `query_now_ts`
+  - 扫描 archive 目录得到首尾 WAL 段名
+- 已记录 `/root/pduforwm` 仅作为 WAL 扫描/解析参考，不作为直接实现依赖
+- 完成 P2 WAL 时间窗扫描骨架：
+  - 归档目录按 timeline 选择并排序 WAL 段
+  - 检查 WAL 段连续性，缺段直接报错
+  - 基于 `XLogReader` 完成 PG18 最小扫描循环
+  - 提取时间窗内事务边界信息
+  - 检测目标 relation 的 truncate / rewrite / storage change 风险
+  - `pg_flashback()` / `fb_export_undo()` 不再停在纯 gate，占位已推进到 scan 后的 `reverse op stream`
+- 新增开发期调试接口 `fb_scan_wal_debug(regclass, timestamptz)`
+- 旧版 `fb_decode_insert_debug(regclass, timestamptz)` 直读 WAL 行像链路已完成过一轮 PoC，但现已被页级重放路线取代
+- 已明确 `/root/pduforwm` 的主要慢因并写入架构文档：
+  - 扫描主循环内做 SQL 文本拼装
+  - 扫描阶段写 `public.replayforwal`
+  - relation 过滤过晚
+  - 扫描阶段做 TOAST/数据文件回读
+  - 事务分组、SQL cache、ctx lookup 与 toast check 都在热路径中
+- 已确认此前“直接从 WAL 行像提取 `DELETE/UPDATE old_row`”的前提不成立
+- 已重定技术路线：
+  - 核心来源改为 `checkpoint + FPI + block redo`
+  - `DELETE/UPDATE` 的 old tuple 从重放前页面提取
+  - `ForwardOp/ReverseOp` 只建立在页级重放内核之上
+- 已完成 `checkpoint -> now` 的目标 relation `RecordRef` 索引层：
+  - 单次 WAL 顺序扫描中定位 `target_ts` 之前最近 checkpoint
+  - 提取目标 relation 的 heap `insert/delete/update` refs
+  - 记录相关事务 commit / abort 状态
+  - 记录 `commit_lsn`
+  - 保留 unsafe window 检测
+- 已完成最小 `BlockReplayStore + heap redo` 内核：
+  - `heap insert`
+  - `heap delete`
+  - `heap update/hot update`
+- 已完成 `ForwardOp / ReverseOp` 主链：
+  - 从重放前/后页面提取 `old_row/new_row`
+  - 记录 row identity / key identity
+  - 构建按 `commit_lsn DESC, record_lsn DESC` 排序的 `reverse op stream`
+- 已完成 `P5` 查询执行主链：
+  - relation catalog 记录稳定唯一键列
+  - 当前表基线扫描
+  - `keyed` 模式应用
+  - `bag` 模式应用
+  - `pg_flashback(regclass, timestamptz)` 以 `SRF` 返回历史结果
+- 已新增用户级免列定义 helper：
+  - `fb_flashback_materialize(regclass, timestamptz, text)`
+  - 会从数据字典自动提取列定义并创建临时表 `fb_flashback_result`
+- 已实现新的纯文本用户入口：
+  - `fb_create_flashback_table(result_name text, source_table text, target_ts text)`
+  - 用户可直接：
+    - `SELECT fb_create_flashback_table('fb1', 't1', '2026-03-22 10:00:00+08');`
+    - `SELECT * FROM fb1;`
+  - 默认创建 `TEMP TABLE`
+  - 目标表已存在时直接报错
+- 已新增并跑通回归：
+  - `fb_flashback_keyed`
+  - `fb_flashback_bag`
+  - `fb_flashback_materialize`
+  - `fb_create_flashback_table`
+- 已完成当前 FPI / replay 热路径的效率检查：
+  - FPI 在 `RecordRef` 建立时通过 `RestoreBlockImage()` 提取后即复制进内存
+  - replay 阶段通过 `BlockReplayStore` 的内存 hash 维护 block 状态
+  - 当前 replay 热路径不再为 FPI 频繁回读 WAL 文件或临时文件
+  - 当前尚未实现 spool / spill / eviction，性能风险主要转为大时间窗下的内存占用
+- 已实现查询级内存上限：
+  - 新增 GUC `pg_flashback.memory_limit_kb`
+  - 当前已跟踪并限制：
+    - `RecordRef` 数组
+    - FPI image
+    - block data
+    - main data
+    - `BlockReplayStore` page state
+  - 命中上限时直接报错
+  - 已增加 `fb_memory_limit` 回归覆盖
+- 已新增开发期接口：
+  - `fb_recordref_debug(regclass, timestamptz)`
+  - `fb_replay_debug(regclass, timestamptz)`
+- 已删除 `fb_decode_delete_debug` 错误前提链路及其回归
+- 已将 `fb_decode_insert_debug` 熔断为显式占位，避免旧调试路径在新内核下继续误导或触发崩溃
+
+## 进行中
+
+- P6 导出能力
+- 开发期 `ForwardOp` 调试出口重建
+- `archive_dest + pg_wal` 的 WAL 来源解析设计
+## 下一步
+
+- 在现有 `ReverseOp` 主链之上接入 `fb_export_undo`
+- 重新引入稳定的 `fb_decode_insert_debug` / reverse-op 调试出口
+- 覆盖 TOAST 与主键变更场景
+- 将当前单目录 `archive_dir` 模型升级为：
+  - `archive_dest`
+  - `pg_wal` / `archive_dest` 双来源判断
+  - 被覆盖 WAL 的恢复策略（参考 `/root/xman` 的 `ckwal`）
+- 为当前热路径增加内存统计与上限校验
+- 增加低内存上限触发失败的回归测试
+
+## 当前风险
+
+- 本机默认 `pg_config` 指向 PG12，非 PG18
+- 本机默认 `psql` 为 PG10，不能代表最终目标环境
+- 当前 replay 内核只覆盖普通 heap `insert/delete/update`，`multi_insert` 仍未接入
+- `fb_decode_insert_debug` 仍为占位；此前 materialize/标量 SRF 路径会触发 backend crash，需单独重建
+- TOAST 的页级重放与逻辑值还原仍在后续阶段
+- 开发期 `fb_scan_wal_debug()` 只暴露稳定的扫描摘要，不暴露最终 reverse-op 细节
+- 当前 `pg_flashback.archive_dir` 仍是假设“单一目录完整可读”的基线实现，不代表最终 `archive_dest` 产品模型
+- 当前 `RecordRef`、`FPI`、`block data`、`main data` 都常驻当前查询内存上下文；虽然已有硬上限，但仍无 spill / eviction 策略

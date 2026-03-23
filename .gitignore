@@ -1,0 +1,12 @@
+.deps
+.dirstamp
+*.o
+*.so
+*.bc
+*.a
+*.out
+*.sql~
+results/
+regression.diffs
+tmp_check/
+

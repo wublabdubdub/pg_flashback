@@ -1,0 +1,113 @@
+#include "postgres.h"
+
+#include "utils/builtins.h"
+
+#include "fb_replay.h"
+#include "fb_reverse_ops.h"
+
+static void
+fb_reverse_stream_append(FbReverseOpStream *stream, const FbReverseOp *op)
+{
+	uint32 old_capacity;
+
+	if (stream->count == stream->capacity)
+	{
+		old_capacity = stream->capacity;
+		stream->capacity = (stream->capacity == 0) ? 32 : stream->capacity * 2;
+		if (stream->ops == NULL)
+			stream->ops = palloc0(sizeof(FbReverseOp) * stream->capacity);
+		else
+		{
+			stream->ops = repalloc(stream->ops,
+								   sizeof(FbReverseOp) * stream->capacity);
+			MemSet(stream->ops + old_capacity, 0,
+				   sizeof(FbReverseOp) * (stream->capacity - old_capacity));
+		}
+	}
+
+	stream->ops[stream->count++] = *op;
+}
+
+static int
+fb_reverse_op_cmp(const void *lhs, const void *rhs)
+{
+	const FbReverseOp *left = (const FbReverseOp *) lhs;
+	const FbReverseOp *right = (const FbReverseOp *) rhs;
+
+	if (left->commit_lsn < right->commit_lsn)
+		return 1;
+	if (left->commit_lsn > right->commit_lsn)
+		return -1;
+	if (left->record_lsn < right->record_lsn)
+		return 1;
+	if (left->record_lsn > right->record_lsn)
+		return -1;
+	return 0;
+}
+
+void
+fb_build_forward_ops(const FbRelationInfo *info,
+					 const FbWalRecordIndex *index,
+					 TupleDesc tupdesc,
+					 FbForwardOpStream *stream)
+{
+	FbReplayResult replay_result;
+
+	fb_replay_build_forward_ops(info, index, tupdesc, &replay_result, stream);
+}
+
+void
+fb_build_reverse_ops(const FbForwardOpStream *forward,
+					 FbReverseOpStream *reverse)
+{
+	uint32 i;
+
+	MemSet(reverse, 0, sizeof(*reverse));
+
+	for (i = 0; i < forward->count; i++)
+	{
+		const FbForwardOp *forward_op = &forward->ops[i];
+		FbReverseOp reverse_op;
+
+		MemSet(&reverse_op, 0, sizeof(reverse_op));
+		reverse_op.xid = forward_op->xid;
+		reverse_op.commit_ts = forward_op->commit_ts;
+		reverse_op.commit_lsn = forward_op->commit_lsn;
+		reverse_op.record_lsn = forward_op->record_lsn;
+
+		switch (forward_op->type)
+		{
+			case FB_FORWARD_INSERT:
+				reverse_op.type = FB_REVERSE_REMOVE;
+				reverse_op.new_row = forward_op->new_row;
+				break;
+			case FB_FORWARD_DELETE:
+				reverse_op.type = FB_REVERSE_ADD;
+				reverse_op.old_row = forward_op->old_row;
+				break;
+			case FB_FORWARD_UPDATE:
+				reverse_op.type = FB_REVERSE_REPLACE;
+				reverse_op.old_row = forward_op->old_row;
+				reverse_op.new_row = forward_op->new_row;
+				break;
+		}
+
+		fb_reverse_stream_append(reverse, &reverse_op);
+	}
+
+	if (reverse->count > 1)
+		qsort(reverse->ops, reverse->count, sizeof(FbReverseOp),
+			  fb_reverse_op_cmp);
+}
+
+char *
+fb_forward_ops_debug_summary(const FbForwardOpStream *stream)
+{
+	return psprintf("forward_ops=%u", stream->count);
+}
+
+char *
+fb_reverse_ops_debug_summary(const FbReverseOpStream *stream)
+{
+	return psprintf("reverse_ops=%u", stream->count);
+}
