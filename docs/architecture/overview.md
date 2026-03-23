@@ -3,9 +3,11 @@
 ## 模块划分
 
 - `fb_entry`：SQL 入口与统一错误出口
+- `fb_runtime`：扩展私有目录初始化、校验与状态摘要
 - `fb_catalog`：relation 校验、模式选择、TOAST 定位
 - `fb_wal_reader`：时间窗扫描、事务提交信息提取
 - `fb_wal_source_resolver`：后续 `pg_wal / archive_dest` 双来源解析与缺失 WAL 恢复衔接
+- `fb_ckwal`：内嵌缺失 WAL 恢复逻辑与 recovered_wal 目录输出
 - `fb_decode`：从 WAL 生成 `ForwardOp`
 - `fb_reverse_ops`：生成 `ReverseOp`
 - `fb_apply_keyed`：有键表的反向应用
@@ -24,10 +26,11 @@
 - `keyed / bag`
 - `pg_flashback()`
 - `fb_flashback_materialize()`
+- `fb_create_flashback_table()`
 
 当前仍未完成：
 
 - `fb_export_undo()`
 - 稳定的 `ForwardOp` 调试出口
-- `pg_wal / archive_dest` 双来源解析
-- 被覆盖 WAL 的恢复层
+- `pg_wal / archive_dest` 双来源解析的代码实现
+- 被覆盖 WAL 的恢复层代码实现

@@ -37,11 +37,17 @@ SET note = 'updated-later', amount = 99
 WHERE id = 1;
 DELETE FROM fb_create_flashback_table_target WHERE id = 2;
 
+SET client_min_messages = warning;
+
 SELECT fb_create_flashback_table(
 	'fb_created',
 	'fb_create_flashback_table_target',
 	(SELECT target_ts::text FROM fb_create_flashback_table_mark)
 );
+
+SELECT fb_wal_window_debug(
+	(SELECT target_ts FROM fb_create_flashback_table_mark)
+) ~ '^current_lsn=[0-9A-F]+/[0-9A-F]{8} current_wal=[0-9A-F]{24} start_lsn=[0-9A-F]+/[0-9A-F]{8} start_wal=[0-9A-F]{24} end_lsn=[0-9A-F]+/[0-9A-F]{8} end_wal=[0-9A-F]{24}$';
 
 SELECT * FROM fb_created;
 

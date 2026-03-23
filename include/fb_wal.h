@@ -40,6 +40,14 @@ typedef struct FbWalScanContext
 	TimestampTz anchor_time;
 	bool unsafe;
 	FbWalUnsafeReason unsafe_reason;
+	void *resolved_segments;
+	uint32 resolved_segment_count;
+	uint32 pg_wal_segment_count;
+	uint32 archive_segment_count;
+	uint32 ckwal_segment_count;
+	bool using_archive_dest;
+	bool using_legacy_archive_dir;
+	bool ckwal_invoked;
 } FbWalScanContext;
 
 typedef enum FbWalRecordKind
@@ -47,7 +55,14 @@ typedef enum FbWalRecordKind
 	FB_WAL_RECORD_HEAP_INSERT = 1,
 	FB_WAL_RECORD_HEAP_DELETE,
 	FB_WAL_RECORD_HEAP_UPDATE,
-	FB_WAL_RECORD_HEAP_HOT_UPDATE
+	FB_WAL_RECORD_HEAP_HOT_UPDATE,
+	FB_WAL_RECORD_HEAP_CONFIRM,
+	FB_WAL_RECORD_HEAP_LOCK,
+	FB_WAL_RECORD_HEAP_INPLACE,
+	FB_WAL_RECORD_HEAP2_PRUNE,
+	FB_WAL_RECORD_HEAP2_VISIBLE,
+	FB_WAL_RECORD_HEAP2_MULTI_INSERT,
+	FB_WAL_RECORD_HEAP2_LOCK_UPDATED
 } FbWalRecordKind;
 
 typedef enum FbWalXidStatus
@@ -135,6 +150,7 @@ char *fb_wal_index_debug_summary(const FbWalScanContext *ctx,
 void fb_wal_visit_records(FbWalScanContext *ctx, FbWalRecordVisitor visitor,
 						  void *arg);
 const char *fb_wal_unsafe_reason_name(FbWalUnsafeReason reason);
+char *fb_wal_source_debug_summary(const FbWalScanContext *ctx);
 char *fb_wal_debug_summary(const FbWalScanContext *ctx);
 
 #endif

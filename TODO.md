@@ -96,15 +96,37 @@
   - [x] 目标表已存在时直接报错
 - [x] 实现 `fb_create_flashback_table(text, text, text)`
 - [x] 增加 `fb_create_flashback_table` 回归测试
-- [ ] 重新设计最终用户接口，评估是否还需要保留 `pg_flashback(regclass, timestamptz)` 作为直接用户入口
-- [ ] 用文档固定 `archive_dir` 只是基线开发配置，不是最终产品模型
-- [ ] 设计 `archive_dest + pg_wal` 的 WAL 来源解析层
-- [ ] 设计 segment 选择规则：
-  - [ ] recent WAL 优先从 `pg_wal` 读取
-  - [ ] 历史 WAL 从 `archive_dest` 读取
-  - [ ] 两端都存在时的优先级与一致性判断
-- [ ] 设计 `pg_wal` 中 segment 已被覆盖时的恢复策略
-- [ ] 参考 `/root/xman` 的 `ckwal` 设计缺失 WAL 复原流程
+- [x] `fb_create_flashback_table` 输出 WAL 诊断 info：
+  - 当前时间对应的 LSN
+  - 该 LSN 所在 WAL 段
+  - 起始 WAL 段
+  - 终点 WAL 段
+- [x] 重新设计最终用户接口，评估是否还需要保留 `pg_flashback(regclass, timestamptz)` 作为直接用户入口
+- [x] 用文档固定 `archive_dir` 只是基线开发配置，不是最终产品模型
+- [x] 设计 `archive_dest + pg_wal` 的 WAL 来源解析层
+- [x] 实现最小 `archive_dest + pg_wal` 双来源 segment 解析
+- [x] 设计 segment 选择规则：
+  - [x] `archive_dest` 缺失时才从 `pg_wal` 读取
+  - [x] 两端都存在时一律优先 `archive_dest`
+  - [x] `pg_wal` 只承接 archive 尚未覆盖的 recent tail
+- [x] 设计 `pg_wal` 中 segment 已被覆盖时的恢复策略
+- [x] 参考 `/root/xman` 的 `ckwal` 设计缺失 WAL 复原流程
+- [x] 实现 `pg_wal` segment 名称/头部/pageaddr 错配检测
+- [x] 实现 overlap 一律优先 `archive_dest`
+- [x] 接入 `ckwal` 恢复接口层与错误模型
+- [x] 将外露 `ckwal` GUC 收缩为扩展内部实现：
+  - [x] 移除 `pg_flashback.ckwal_restore_dir`
+  - [x] 移除 `pg_flashback.ckwal_command`
+  - [x] 在 `CREATE EXTENSION` 时自动创建 `DataDir/pg_flashback/`
+  - [x] 固定子目录：`runtime/`、`recovered_wal/`、`meta/`
+  - [x] 将 `fb_try_ckwal_segment()` 改为调用内嵌 `fb_ckwal`
+  - [x] 将恢复后的 segment 固定写入 `recovered_wal/`
+  - [x] 当 `pg_wal` 段发生错配/覆盖时，将其转换为 `ckwal` 结果并立即回灌到本轮 segment 候选集合
+  - [x] 让 resolver 持续消费 `archive_dest` / `pg_wal` / `recovered_wal` 三路候选，直到拼出连续可扫描 segment 集
+  - [ ] 实现内嵌 `fb_ckwal` 的真实恢复算法
+  - [ ] 让恢复引擎在 `archive_dest` / `pg_wal` / `recovered_wal` 都不可用时可重建缺失 segment
+  - [ ] 为恢复引擎增加可复用的坏段识别、修复和落盘流程
+  - [ ] 将“目录契约已完成”与“恢复引擎已完成”分开验收
 
 ## P5.6 效率与内存模型
 
@@ -125,6 +147,7 @@
 
 ## P6 导出能力
 
+- [ ] `fb_export_undo` 明确放到当前主线最后实现
 - [ ] 实现 reverse op 调试导出
 - [ ] 实现 undo SQL 渲染
 - [ ] 实现导出接口
@@ -134,6 +157,45 @@
 - [ ] 覆盖 TOAST 场景
 - [ ] 覆盖主键更新场景
 - [ ] 覆盖无主键重复行场景
+- [ ] 评估是否将当前“target 前最近 checkpoint”锚点策略升级为“更早的可恢复锚点搜索”
+- [ ] 按 PG18 源码补齐所有可能携带 main-fork block image / main-data 的 heap WAL 记录接入：
+  - [x] `XLOG_HEAP_CONFIRM`
+  - [x] `XLOG_HEAP_INPLACE`
+  - [x] `XLOG_HEAP2_VISIBLE`
+  - [x] `XLOG_HEAP2_MULTI_INSERT`
+  - [x] `XLOG_HEAP2_LOCK_UPDATED`
+  - [ ] 重新审视 `XLOG_HEAP_LOCK` / `XLOG_HEAP2_PRUNE_*`，将当前最小 no-op 升级为对后续页状态安全的最小重放
+- [ ] 为“可能带 image 但当前未做完整逻辑提取”的记录增加明确分类：
+  - [x] 仅建立页基线并推进页状态
+  - [x] 需要完整 page mutation，但不生成 `ForwardOp`
+  - [x] 需要生成 `ForwardOp`
 - [ ] 建立 PG18 基线测试集
 - [ ] 从 PG18 抽取版本兼容层
 - [ ] 扩展到 PG10-18
+
+## P8 深度生产化测试
+
+- [x] 完成深度生产化测试设计
+- [x] 完成深度生产化测试实施计划
+- [x] 建立 `tests/deep/` 目录结构
+- [x] 完成环境 bootstrap 脚本
+- [x] 完成大表 schema 与真值表 schema
+- [x] 完成 500 万级基线装载脚本
+- [x] 完成 truth snapshot 捕获脚本
+- [x] 完成批次 A：keyed 大表高压 DML（pilot）
+- [ ] 完成批次 B：事务边界与回滚
+  - 当前 pilot blocker：
+    - `target_ts` 前最近 checkpoint 之后，某些 block 首条相关记录不带 `FPI/INIT`
+    - 已确认真实样例：`PRUNE_VACUUM_CLEANUP` / `VISIBLE` -> `UPDATE/HOT_UPDATE`
+    - 见 `docs/reports/2026-03-23-deep-pilot-report.md`
+  - 处理方案分层：
+    - [x] 第一层：补齐可能携带 main-fork image 的 heap/heap2 记录进入 `RecordRef` 与 replay，避免漏掉可用页基线
+    - [ ] 第二层：对 `missing FPI` 增加更细诊断，区分“锚点不足”与“record 集合漏接”
+    - [ ] 第三层：在 batch B 复跑后，若仍命中首条相关记录无 image，则进入“更早可恢复锚点搜索”设计与实现
+- [x] 完成批次 C：bag 重复值大表（pilot）
+- [x] 完成批次 D：WAL 来源跨目录（pilot）
+- [x] 完成批次 E：长时间窗与内存压力（pilot）
+- [ ] 完成 pilot 模式联调
+- [x] 产出 pilot 阶段报告
+- [ ] 完成 full 模式深测
+- [ ] 产出最终深测报告

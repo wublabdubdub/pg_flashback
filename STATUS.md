@@ -93,6 +93,32 @@
     - `SELECT * FROM fb1;`
   - 默认创建 `TEMP TABLE`
   - 目标表已存在时直接报错
+  - 执行成功后输出 WAL 诊断信息：
+    - 当前时间对应的 LSN
+    - 该 LSN 所在 WAL 段
+    - 起始 WAL 段
+    - 终点 WAL 段
+- 已完成 `P5.5` 用户接口决策收口：
+  - `fb_create_flashback_table()` 被确定为首推用户入口
+  - `fb_flashback_materialize()` 作为中间层 helper 保留
+  - `pg_flashback()` 继续保留为底层能力，但不再是首推用户入口
+- 已完成 `P5.5` WAL 来源模型决策收口：
+  - `archive_dir` 被明确固定为基线开发配置
+  - 最终模型固定为 `archive_dest + pg_wal` 双来源解析
+  - segment 选择规则已定：
+    - `archive_dest` 缺失时才从 `pg_wal` 读取
+    - 两端重叠时一律优先 `archive_dest`
+    - `pg_wal` 只承接 archive 尚未覆盖的 recent tail
+  - 缺失 WAL 恢复层正式纳入路线，参考 `/root/xman` 的 `ckwal`
+- 已完成 `P5.5` 外露 `ckwal` GUC 收缩为扩展内部实现：
+  - `CREATE EXTENSION` 时自动初始化 `DataDir/pg_flashback/`
+  - 固定子目录：
+    - `runtime/`
+    - `recovered_wal/`
+    - `meta/`
+  - `fb_try_ckwal_segment()` 已改为调用内嵌 `fb_ckwal`
+  - 恢复后的 segment 固定写入 `recovered_wal/`
+  - 但内嵌 `fb_ckwal` 目前仍停留在骨架层，真实 segment 重建逻辑尚未完成
 - 已新增并跑通回归：
   - `fb_flashback_keyed`
   - `fb_flashback_bag`
@@ -121,18 +147,98 @@
 
 ## 进行中
 
-- P6 导出能力
+- 深度生产化测试 pilot 联调
 - 开发期 `ForwardOp` 调试出口重建
-- `archive_dest + pg_wal` 的 WAL 来源解析设计
+- `fb_export_undo` 已明确延后到当前主线最后实现
+- 按 PG18 源码回补“可能携带 main-fork image / main-data 的 heap/heap2 record 集合”，避免当前只覆盖 `HEAP_LOCK` / `HEAP2_PRUNE_*`
+- 为 batch B 制定分层处理方案：
+  - 先补足 record 集
+  - 再细化 `missing FPI` 诊断
+  - 最后再评估是否必须进入“更早可恢复锚点搜索”
+- 内嵌 `fb_ckwal` + `DataDir/pg_flashback/` 私有目录已完成收口，后续进入恢复算法细化
+- 已补记 `ckwal` 当前阶段的明确收口目标：
+  - 错配/覆盖的 `pg_wal` 段必须先转换为标准 `ckwal` 结果
+  - 转换结果必须在同一轮 resolver 中回灌到当前候选集合
+  - resolver 需要持续组合 `archive_dest` / `pg_wal` / `recovered_wal`，直到得到连续可扫描 segment 集
+- 上述两条已完成：
+  - `pg_wal` 错配段现在会先按页头转换为标准 `recovered_wal/<actual-segname>`
+  - 转换结果会在同一轮 resolver 中立即作为 `FB_WAL_SOURCE_CKWAL` 候选重新参与组合
+  - `fb_wal_source_policy` 已更新为覆盖该路径
+
+## 新完成
+
+- 已落地最小 `archive_dest + pg_wal` WAL 来源解析实现：
+  - 新增 `pg_flashback.archive_dest`
+  - 自动推导当前实例 `DataDir/pg_wal` 作为 recent WAL 来源
+  - 保留 `pg_flashback.archive_dir` 作为兼容回退路径
+  - 归档扫描阶段合并 `pg_wal` 与 `archive_dest` 的 segment 集合
+  - 当前版本仍是最小来源合并，不代表最终 archive-first 规则已全部落实
+  - 当前已新增 `fb_wal_sources` 回归覆盖
+- 已完成 archive-first + `ckwal` 接口层增强：
+  - overlap segment 一律优先 `archive_dest`
+  - 新增 `pg_wal` segment 名称/头部/pageaddr 错配检测
+  - `pg_wal` 错配且 archive 缺失时，统一转入 `ckwal` 错误模型
+  - 新增开发期 `pg_flashback.debug_pg_wal_dir`
+  - 新增开发期 `fb_wal_source_debug()`
+  - 当前已新增 `fb_wal_source_policy` 回归覆盖
+- 已移除用户侧 `pg_flashback.ckwal_restore_dir` / `pg_flashback.ckwal_command`，恢复目录改为扩展内部管理
+- 已新增内嵌 `fb_ckwal` 设计规格：
+  - `docs/specs/2026-03-23-embedded-ckwal-design.md`
+  - 新产品方向：
+    - `CREATE EXTENSION` 自动创建 `DataDir/pg_flashback/`
+    - 自动维护 `runtime/`、`recovered_wal/`、`meta/`
+    - 自动恢复错配/缺失 segment
+    - 用户侧 `ckwal` 参数已移除，恢复目录由扩展内部管理
+- 已完成深度生产化测试方案设计：
+  - 目标覆盖 >50 字段、>500 万行、>50 WAL segment
+  - 采用分批分层测试，而不是单次大杂烩
+  - 已形成正式设计文档与实施计划
+- 已建立 `tests/deep/` 深测脚手架：
+  - `bootstrap_env.sh`
+  - `load_baseline.sh`
+  - `capture_truth.sh`
+  - `run_batch_{a,b,c,d,e}.sh`
+  - `run_all_deep_tests.sh`
+  - 大表 schema / workload / validate SQL
+- 已完成 pilot 批次结果：
+  - 批次 A `keyed`：通过
+  - 批次 C `bag`：通过
+  - 批次 D `archive_dest + fake pg_wal overlap`：通过
+  - 批次 E `长时间窗/多轮 DML`：通过
+  - 批次 B `事务边界与回滚`：失败
+- 已在 pilot 过程中补齐并验证：
+  - `HEAP_LOCK` 记录进入 `RecordRef` 和最小 no-op replay
+  - `HEAP2_PRUNE_*` 记录进入 `RecordRef` 和最小 no-op replay
+  - 跨页 `UPDATE` 在新页带 FPI 时不再机械二次 `PageAddItem`
+  - 深测库默认 `pg_flashback.memory_limit_kb` 已提升到测试级别
+  - deep batch D 的 archive/fake pg_wal fixture 顺序已修正
+- 已按 PG18 源码扩展 heap image-bearing record 集合：
+  - `HEAP_CONFIRM` 进入 `RecordRef` 与 replay
+  - `HEAP_INPLACE` 进入 `RecordRef` 与 replay
+  - `HEAP2_VISIBLE` 进入 `RecordRef` 与 replay
+  - `HEAP2_MULTI_INSERT` 进入 `RecordRef` 与 replay
+  - `HEAP2_LOCK_UPDATED` 进入 `RecordRef` 与 replay
+  - 其中：
+    - `HEAP2_MULTI_INSERT` 现在会真正写入页并生成多条 `ForwardOp(insert)`
+    - `HEAP_CONFIRM` / `HEAP_INPLACE` / `HEAP2_VISIBLE` / `HEAP2_LOCK_UPDATED` 目前作为“推进页状态但不直接生成 `ForwardOp`”的记录处理
+- 已产出 pilot 报告：
+  - `docs/reports/2026-03-23-deep-pilot-report.md`
 ## 下一步
 
-- 在现有 `ReverseOp` 主链之上接入 `fb_export_undo`
+- 解决 pilot 批次 B 的页基线 blocker
+- 补 `missing FPI` 的细粒度诊断，区分：
+  - 锚点不足
+  - 相关 record 已在 PG18 中存在但未被索引
+  - 相关 record 已被索引但当前最小 replay 仍不足以维持页状态
+- 在 pilot 全通过后再决定是否直接进入 full 模式
 - 重新引入稳定的 `fb_decode_insert_debug` / reverse-op 调试出口
+- 在现有 `ReverseOp` 主链之上接入 `fb_export_undo`
 - 覆盖 TOAST 与主键变更场景
-- 将当前单目录 `archive_dir` 模型升级为：
-  - `archive_dest`
-  - `pg_wal` / `archive_dest` 双来源判断
-  - 被覆盖 WAL 的恢复策略（参考 `/root/xman` 的 `ckwal`）
+- 在当前双来源解析上补齐：
+  - 内嵌 `fb_ckwal` 的真实恢复逻辑
+  - 扩展私有目录初始化与生命周期
+  - 更细的 overlap/source 决策调试信息
+  - 被覆盖 WAL 的恢复策略细化（参考 `/root/xman` 的 `ckwal`）
 - 为当前热路径增加内存统计与上限校验
 - 增加低内存上限触发失败的回归测试
 
@@ -144,5 +250,14 @@
 - `fb_decode_insert_debug` 仍为占位；此前 materialize/标量 SRF 路径会触发 backend crash，需单独重建
 - TOAST 的页级重放与逻辑值还原仍在后续阶段
 - 开发期 `fb_scan_wal_debug()` 只暴露稳定的扫描摘要，不暴露最终 reverse-op 细节
-- 当前 `pg_flashback.archive_dir` 仍是假设“单一目录完整可读”的基线实现，不代表最终 `archive_dest` 产品模型
+- 当前 `ckwal` 已完成运行时目录契约、内嵌接口层、错配段转换回灌与 resolver 接入；完整缺失段重建算法仍未完成，遇到真正缺失且无法从 `archive_dest` / `pg_wal` / `recovered_wal` 取回的段，仍会报错
+- 当前页级重放锚点仍固定为 `target_ts` 前最近 checkpoint；尚未实现“更早的可恢复锚点搜索”
 - 当前 `RecordRef`、`FPI`、`block data`、`main data` 都常驻当前查询内存上下文；虽然已有硬上限，但仍无 spill / eviction 策略
+- 深度生产化测试已经进入 pilot 执行，但批次 B 已证实当前“最近 checkpoint 锚点”策略并不充分：
+  - 存在 block 在 anchor 后首条相关记录为 `PRUNE_VACUUM_CLEANUP` / `VISIBLE` 之类无 FPI/INIT 记录
+  - 随后才出现 `UPDATE/HOT_UPDATE`
+  - 这类场景当前仍会报 `missing FPI`
+- 当前 replay 补洞仍偏保守：
+  - 当前已不再只停在 `HEAP_LOCK` / `HEAP2_PRUNE_*`
+  - 但 `HEAP_LOCK` / `HEAP2_PRUNE_*` 仍是保守路径，尚未全部提升到 PG 原生同等语义
+  - batch B 后续仍需先排除“页状态推进不足”，再判断是否必须进入“更早锚点搜索”

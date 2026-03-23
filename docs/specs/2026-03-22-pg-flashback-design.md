@@ -82,6 +82,12 @@ SELECT * FROM fb1;
 - 默认创建 `TEMP TABLE`
 - 目标表已存在时直接报错
 
+最终用户接口分层也已拍板：
+
+- 主用户入口：`fb_create_flashback_table(text, text, text)`
+- 中间层 helper：`fb_flashback_materialize(regclass, timestamptz, text)`
+- 底层能力：`pg_flashback(regclass, timestamptz)`
+
 ## keyed 模式
 
 适用于有主键或稳定唯一键的表。
@@ -138,6 +144,10 @@ FinalRowBag: RowImage -> final_count
   - `pg_wal`
   - `archive_dest`
   - 或两者都不完整
+- segment 选择规则：
+  - recent WAL 优先 `pg_wal`
+  - 历史 WAL 优先 `archive_dest`
+  - 两端同时存在时做一致性校验
 - 对 `pg_wal` 中已被覆盖的 segment，引入缺失 WAL 恢复层
 - 这一层将参考 `/root/xman` 中的 `ckwal`
 

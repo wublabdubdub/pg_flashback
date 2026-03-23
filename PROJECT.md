@@ -54,6 +54,7 @@
 4. 依照 LSN 顺序对目标 block 做前向重放：
    - `INSERT + INIT_PAGE` 可直接初始化页
    - 其他路径依赖 FPI 或更早已重放页状态
+   - 对于 PG18 中可能携带 main-fork block image / block data / main data 的 heap 记录，必须统一进入 `RecordRef` 与 replay 路径，不能只处理 `INSERT/DELETE/UPDATE`
 5. 在重放前/后页面中提取逻辑行像，生成 `ForwardOp`
 6. 由 `ForwardOp` 派生 `ReverseOp`
 7. 返回 `target_ts` 时刻的历史结果，或导出 undo SQL / reverse op
@@ -69,11 +70,15 @@
 
 当前仍未完成：
 
-- `fb_export_undo`
+- `archive_dest + pg_wal` 的 WAL 来源增强：
+  - 内嵌 `fb_ckwal` 的真实恢复逻辑
+  - 更细的来源决策与调试输出
 - 稳定的 `fb_decode_insert_debug`
 - TOAST 历史值重建
-- `multi_insert`
-- `archive_dest + pg_wal` 的 WAL 来源自动解析
+- `fb_export_undo`（明确放到当前主线最后实现）
+- 对 PG18 heap WAL 的补齐范围仍在推进：
+  - 已补齐：`HEAP_CONFIRM`、`HEAP_INPLACE`、`HEAP2_VISIBLE`、`HEAP2_MULTI_INSERT`、`HEAP2_LOCK_UPDATED`
+  - 仍需推进：`HEAP_LOCK` / `HEAP2_PRUNE_*` 从最小 no-op 向“对后续页状态安全”的最小重放升级
 
 ## 关于“无需 AS t(...)”的当前结论
 
@@ -98,6 +103,17 @@ SELECT * FROM pg_flashback('public.t1'::regclass, ts);
 ```
 
 完全不带 `AS t(...)` 仍能直接展开列，那就需要重新设计用户接口，而不是继续沿用当前 `SETOF record` 形态。
+
+已拍板的最终用户入口分层是：
+
+- 主用户入口：`fb_create_flashback_table(text, text, text)`
+- 中间层 helper：`fb_flashback_materialize(regclass, timestamptz, text)`
+- 底层能力：`pg_flashback(regclass, timestamptz)`
+
+其中：
+
+- `fb_create_flashback_table()` 是首推用户接口
+- `pg_flashback()` 会继续保留，但不再作为首推用户入口
 
 ## 当前新增的用户接口决策
 
@@ -124,6 +140,11 @@ SELECT * FROM fb1;
   - `AS t(...)`
 - 结果对象为 `TEMP TABLE`
 - 如果目标表名已存在：直接报错，不自动覆盖
+- 执行成功后输出一条 WAL 诊断 notice，包含：
+  - 当前时间对应的 LSN
+  - 该 LSN 所在 WAL 段
+  - 起始 WAL 段
+  - 终点 WAL 段
 
 ## 运行时前置配置
 
@@ -134,6 +155,8 @@ SELECT * FROM fb1;
     - `full_page_writes=on`
     - 目标时间点之前存在可用 checkpoint
     - 指定目录中的 WAL 完整
+- 内嵌缺失 WAL 恢复目录固定为 `DataDir/pg_flashback/recovered_wal/`
+- 用户不再配置 `pg_flashback.ckwal_restore_dir` / `pg_flashback.ckwal_command`
 
 - 后续要升级为 `archive_dest + source resolver` 模型
   - 不应把用户配置永久绑定到 `pg_wal`
@@ -144,7 +167,22 @@ SELECT * FROM fb1;
       - `archive_dest`
       - 或两者都不完整，需要额外恢复
   - 当 `pg_wal` 中需要的 segment 已被覆盖时，需要补上“缺失 WAL 恢复”这一层
-  - 这一层后续将参考 `/root/xman` 中的 `ckwal` 思路，但保持为参考，不直接耦合外部工具
+  - 这一层改为内嵌 `fb_ckwal`
+  - `/root/xman` 中的 `ckwal` 只作为实现参考，不作为运行时依赖
+  - segment 选择规则已拍板：
+  - `archive_dest` 缺失时才从 `pg_wal` 读取
+  - 两端同时存在时一律优先 `archive_dest`
+  - `pg_wal` 文件名与头部/pageaddr 不一致时，视为被覆盖或错配，转入 `ckwal`
+  - `CREATE EXTENSION` 时自动初始化扩展私有目录：
+    - `DataDir/pg_flashback/runtime/`
+    - `DataDir/pg_flashback/recovered_wal/`
+    - `DataDir/pg_flashback/meta/`
+  - 被自动恢复的 segment 固定落到 `recovered_wal/`
+  - 错配/覆盖的 `pg_wal` 段需要先转换为标准 `ckwal` 结果
+  - 转换结果必须立即回灌到当前 resolver 的候选集合，而不是只写盘不参与本轮组合
+  - resolver 必须持续组合 `archive_dest` / `pg_wal` / `recovered_wal` 三路候选，直到得到连续可扫描的 segment 集
+  - 恢复目录与命令均由扩展内部管理，用户不再直接配置
+  - `pg_flashback.debug_pg_wal_dir` 仍保留为开发期专用覆盖入口
 
 - `full_page_writes`
   - 首版物理内核依赖 checkpoint 后首次修改产生 FPI
@@ -184,6 +222,22 @@ SELECT * FROM fb1;
 - `DELETE/UPDATE` 的旧行像来源是：
   - checkpoint 锚点之后的页级重放状态
   - 在应用 redo 前从历史页面 offset 上提取 tuple
+
+## Batch B 当前处理策略
+
+针对 deep pilot 中暴露的 batch B 问题，当前正式策略分成三层：
+
+1. 先补齐 PG18 中所有可能携带 main-fork image / block data / main data 的 heap/heap2 记录进入 `RecordRef` 与 replay，排除“record 集漏接导致漏消费可用 image”的情况。
+   - 这一层当前已完成：
+     - `HEAP_CONFIRM`
+     - `HEAP_INPLACE`
+     - `HEAP2_VISIBLE`
+     - `HEAP2_MULTI_INSERT`
+     - `HEAP2_LOCK_UPDATED`
+2. 在此基础上增强 `missing FPI` 诊断，把“当前 block 首条相关 record 无 image/INIT”与“本应被索引但未被索引”的情况区分开。
+3. 若 batch B 复跑后仍存在真实 block 在 `target_ts` 前最近 checkpoint 的 `redo` 之后，首条相关 record 仍无 image/INIT，则再进入“更早的可恢复锚点搜索”设计与实现。
+
+也就是说，当前不会跳过第 1 层直接上“更早锚点搜索”；必须先把 PG18 现有 record 形态接齐。
 
 这样做的目的，是显式规避 `/root/pduforwm` 的重路径：
 

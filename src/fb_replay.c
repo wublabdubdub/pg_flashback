@@ -261,7 +261,7 @@ fb_replay_ensure_block_ready(FbReplayStore *store,
 		state->key.blkno = block_ref->blkno;
 	}
 
-	if (block_ref->has_image && block_ref->apply_image && block_ref->image != NULL)
+	if (block_ref->has_image && block_ref->image != NULL)
 	{
 		memcpy(state->page, block_ref->image, BLCKSZ);
 		state->initialized = true;
@@ -502,6 +502,8 @@ fb_replay_heap_update(const FbRelationInfo *info,
 		(FbRecordBlockRef *) &record->blocks[1] : (FbRecordBlockRef *) &record->blocks[0];
 	FbReplayBlockState *old_state;
 	FbReplayBlockState *new_state;
+	FbRecordBlockRef *tuple_data_ref;
+	bool new_page_image_only;
 	Page oldpage;
 	Page newpage;
 	HeapTupleHeader oldtup;
@@ -535,6 +537,8 @@ fb_replay_heap_update(const FbRelationInfo *info,
 
 	oldpage = (Page) old_state->page;
 	newpage = (Page) new_state->page;
+	new_page_image_only = (new_block_ref->has_image &&
+						   old_block_ref != new_block_ref);
 
 	if (stream != NULL && tupdesc != NULL &&
 		record->committed_after_target && old_block_ref->is_main_relation)
@@ -573,80 +577,98 @@ fb_replay_heap_update(const FbRelationInfo *info,
 	if (xlrec->flags & XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED)
 		PageClearAllVisible(oldpage);
 
-	if (!new_block_ref->has_data || new_block_ref->data_len == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("heap update record missing new tuple data")));
-
-	recdata = new_block_ref->data;
-	datalen = new_block_ref->data_len;
-	recdata_end = recdata + datalen;
-	offnum = xlrec->new_offnum;
-
-	if (PageGetMaxOffsetNumber(newpage) + 1 < offnum)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("invalid new offnum during heap update redo")));
-
-	if (xlrec->flags & XLH_UPDATE_PREFIX_FROM_OLD)
+	if (!new_page_image_only)
 	{
-		memcpy(&prefixlen, recdata, sizeof(uint16));
-		recdata += sizeof(uint16);
+		tuple_data_ref = new_block_ref;
+		if ((!tuple_data_ref->has_data || tuple_data_ref->data_len == 0) &&
+			old_block_ref != new_block_ref &&
+			old_block_ref->has_data && old_block_ref->data_len > 0)
+			tuple_data_ref = old_block_ref;
+
+		if (!tuple_data_ref->has_data || tuple_data_ref->data_len == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("heap update record missing new tuple data"),
+					 errdetail("lsn=%X/%08X newblk=%u oldblk=%u sameblk=%s new_has_image=%s new_has_data=%s old_has_data=%s block_count=%d",
+							   LSN_FORMAT_ARGS(record->lsn),
+							   new_block_ref->blkno,
+							   old_block_ref->blkno,
+							   old_block_ref == new_block_ref ? "true" : "false",
+							   new_block_ref->has_image ? "true" : "false",
+							   new_block_ref->has_data ? "true" : "false",
+							   old_block_ref->has_data ? "true" : "false",
+							   record->block_count)));
+
+		recdata = tuple_data_ref->data;
+		datalen = tuple_data_ref->data_len;
+		recdata_end = recdata + datalen;
+		offnum = xlrec->new_offnum;
+
+		if (PageGetMaxOffsetNumber(newpage) + 1 < offnum)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("invalid new offnum during heap update redo")));
+
+		if (xlrec->flags & XLH_UPDATE_PREFIX_FROM_OLD)
+		{
+			memcpy(&prefixlen, recdata, sizeof(uint16));
+			recdata += sizeof(uint16);
+		}
+		if (xlrec->flags & XLH_UPDATE_SUFFIX_FROM_OLD)
+		{
+			memcpy(&suffixlen, recdata, sizeof(uint16));
+			recdata += sizeof(uint16);
+		}
+
+		memcpy(&xlhdr, recdata, SizeOfHeapHeader);
+		recdata += SizeOfHeapHeader;
+		tuplen = recdata_end - recdata;
+
+		htup = &tbuf.hdr;
+		MemSet(htup, 0, SizeofHeapTupleHeader);
+		newp = (char *) htup + SizeofHeapTupleHeader;
+
+		if (prefixlen > 0)
+		{
+			int len = xlhdr.t_hoff - SizeofHeapTupleHeader;
+
+			memcpy(newp, recdata, len);
+			recdata += len;
+			newp += len;
+			memcpy(newp, (char *) oldtup + oldtup->t_hoff, prefixlen);
+			newp += prefixlen;
+			len = tuplen - (xlhdr.t_hoff - SizeofHeapTupleHeader);
+			memcpy(newp, recdata, len);
+			recdata += len;
+			newp += len;
+		}
+		else
+		{
+			memcpy(newp, recdata, tuplen);
+			recdata += tuplen;
+			newp += tuplen;
+		}
+
+		if (suffixlen > 0)
+			memcpy(newp, ((char *) oldtup) + oldtup_len - suffixlen, suffixlen);
+
+		newlen = SizeofHeapTupleHeader + tuplen + prefixlen + suffixlen;
+		htup->t_infomask2 = xlhdr.t_infomask2;
+		htup->t_infomask = xlhdr.t_infomask;
+		htup->t_hoff = xlhdr.t_hoff;
+		HeapTupleHeaderSetXmin(htup, record->xid);
+		HeapTupleHeaderSetCmin(htup, FirstCommandId);
+		HeapTupleHeaderSetXmax(htup, xlrec->new_xmax);
+		htup->t_ctid = newtid;
+
+		if (PageAddItem(newpage, (Item) htup, newlen, offnum, true, true) == InvalidOffsetNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("failed to replay heap update")));
+
+		if (xlrec->flags & XLH_UPDATE_NEW_ALL_VISIBLE_CLEARED)
+			PageClearAllVisible(newpage);
 	}
-	if (xlrec->flags & XLH_UPDATE_SUFFIX_FROM_OLD)
-	{
-		memcpy(&suffixlen, recdata, sizeof(uint16));
-		recdata += sizeof(uint16);
-	}
-
-	memcpy(&xlhdr, recdata, SizeOfHeapHeader);
-	recdata += SizeOfHeapHeader;
-	tuplen = recdata_end - recdata;
-
-	htup = &tbuf.hdr;
-	MemSet(htup, 0, SizeofHeapTupleHeader);
-	newp = (char *) htup + SizeofHeapTupleHeader;
-
-	if (prefixlen > 0)
-	{
-		int len = xlhdr.t_hoff - SizeofHeapTupleHeader;
-
-		memcpy(newp, recdata, len);
-		recdata += len;
-		newp += len;
-		memcpy(newp, (char *) oldtup + oldtup->t_hoff, prefixlen);
-		newp += prefixlen;
-		len = tuplen - (xlhdr.t_hoff - SizeofHeapTupleHeader);
-		memcpy(newp, recdata, len);
-		recdata += len;
-		newp += len;
-	}
-	else
-	{
-		memcpy(newp, recdata, tuplen);
-		recdata += tuplen;
-		newp += tuplen;
-	}
-
-	if (suffixlen > 0)
-		memcpy(newp, ((char *) oldtup) + oldtup_len - suffixlen, suffixlen);
-
-	newlen = SizeofHeapTupleHeader + tuplen + prefixlen + suffixlen;
-	htup->t_infomask2 = xlhdr.t_infomask2;
-	htup->t_infomask = xlhdr.t_infomask;
-	htup->t_hoff = xlhdr.t_hoff;
-	HeapTupleHeaderSetXmin(htup, record->xid);
-	HeapTupleHeaderSetCmin(htup, FirstCommandId);
-	HeapTupleHeaderSetXmax(htup, xlrec->new_xmax);
-	htup->t_ctid = newtid;
-
-	if (PageAddItem(newpage, (Item) htup, newlen, offnum, true, true) == InvalidOffsetNumber)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("failed to replay heap update")));
-
-	if (xlrec->flags & XLH_UPDATE_NEW_ALL_VISIBLE_CLEARED)
-		PageClearAllVisible(newpage);
 
 	old_state->page_lsn = record->end_lsn;
 	new_state->page_lsn = record->end_lsn;
@@ -661,6 +683,256 @@ fb_replay_heap_update(const FbRelationInfo *info,
 		if (old_tuple != NULL && new_tuple != NULL)
 			fb_append_forward_update(info, tupdesc, record, old_tuple, new_tuple, stream);
 	}
+}
+
+static void
+fb_replay_heap_lock(const FbRecordRef *record,
+					FbReplayStore *store,
+					FbReplayResult *result)
+{
+	xl_heap_lock *xlrec = (xl_heap_lock *) record->main_data;
+	FbReplayBlockState *state;
+	FbRecordBlockRef *block_ref = (FbRecordBlockRef *) &record->blocks[0];
+	Page page;
+	HeapTupleHeader htup;
+
+	fb_replay_ensure_block_ready(store, block_ref, false, result, &state);
+	page = (Page) state->page;
+	htup = fb_replay_get_tuple_from_page(page, xlrec->offnum, NULL);
+	if (htup == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("failed to locate tuple for heap lock redo")));
+
+	htup->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
+	htup->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+	fb_fix_infomask_from_infobits(xlrec->infobits_set,
+								  &htup->t_infomask, &htup->t_infomask2);
+	if (HEAP_XMAX_IS_LOCKED_ONLY(htup->t_infomask))
+	{
+		HeapTupleHeaderClearHotUpdated(htup);
+		ItemPointerSet(&htup->t_ctid, block_ref->blkno, xlrec->offnum);
+	}
+	HeapTupleHeaderSetXmax(htup, xlrec->xmax);
+	HeapTupleHeaderSetCmax(htup, FirstCommandId, false);
+
+	state->page_lsn = record->end_lsn;
+	result->records_replayed++;
+}
+
+static void
+fb_replay_heap2_prune(const FbRecordRef *record,
+					  FbReplayStore *store,
+					  FbReplayResult *result)
+{
+	FbReplayBlockState *state;
+	FbRecordBlockRef *block_ref = (FbRecordBlockRef *) &record->blocks[0];
+
+	fb_replay_ensure_block_ready(store, block_ref, false, result, &state);
+	state->page_lsn = record->end_lsn;
+	result->records_replayed++;
+}
+
+static void
+fb_replay_heap_confirm(const FbRecordRef *record,
+					   FbReplayStore *store,
+					   FbReplayResult *result)
+{
+	xl_heap_confirm *xlrec = (xl_heap_confirm *) record->main_data;
+	FbReplayBlockState *state;
+	FbRecordBlockRef *block_ref = (FbRecordBlockRef *) &record->blocks[0];
+	Page page;
+	HeapTupleHeader htup;
+
+	fb_replay_ensure_block_ready(store, block_ref, false, result, &state);
+	page = (Page) state->page;
+	htup = fb_replay_get_tuple_from_page(page, xlrec->offnum, NULL);
+	if (htup == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("failed to locate tuple for heap confirm redo")));
+
+	ItemPointerSet(&htup->t_ctid, block_ref->blkno, xlrec->offnum);
+	state->page_lsn = record->end_lsn;
+	result->records_replayed++;
+}
+
+static void
+fb_replay_heap_inplace(const FbRecordRef *record,
+					   FbReplayStore *store,
+					   FbReplayResult *result)
+{
+	xl_heap_inplace *xlrec = (xl_heap_inplace *) record->main_data;
+	FbReplayBlockState *state;
+	FbRecordBlockRef *block_ref = (FbRecordBlockRef *) &record->blocks[0];
+	Page page;
+	HeapTupleHeader htup;
+	uint32 oldlen;
+
+	fb_replay_ensure_block_ready(store, block_ref, false, result, &state);
+	page = (Page) state->page;
+	htup = fb_replay_get_tuple_from_page(page, xlrec->offnum, NULL);
+	if (htup == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("failed to locate tuple for heap inplace redo")));
+	if (!block_ref->has_data || block_ref->data_len == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("heap inplace record missing block data")));
+
+	oldlen = ItemIdGetLength(PageGetItemId(page, xlrec->offnum)) - htup->t_hoff;
+	if (oldlen != block_ref->data_len)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("wrong tuple length during heap inplace redo")));
+
+	memcpy((char *) htup + htup->t_hoff, block_ref->data, block_ref->data_len);
+	state->page_lsn = record->end_lsn;
+	result->records_replayed++;
+}
+
+static void
+fb_replay_heap2_visible(const FbRecordRef *record,
+						FbReplayStore *store,
+						FbReplayResult *result)
+{
+	FbReplayBlockState *state;
+	FbRecordBlockRef *block_ref = (FbRecordBlockRef *) &record->blocks[0];
+	Page page;
+
+	fb_replay_ensure_block_ready(store, block_ref, false, result, &state);
+	page = (Page) state->page;
+	PageSetAllVisible(page);
+	state->page_lsn = record->end_lsn;
+	result->records_replayed++;
+}
+
+static void
+fb_replay_heap2_lock_updated(const FbRecordRef *record,
+							 FbReplayStore *store,
+							 FbReplayResult *result)
+{
+	xl_heap_lock_updated *xlrec = (xl_heap_lock_updated *) record->main_data;
+	FbReplayBlockState *state;
+	FbRecordBlockRef *block_ref = (FbRecordBlockRef *) &record->blocks[0];
+	Page page;
+	HeapTupleHeader htup;
+
+	fb_replay_ensure_block_ready(store, block_ref, false, result, &state);
+	page = (Page) state->page;
+	htup = fb_replay_get_tuple_from_page(page, xlrec->offnum, NULL);
+	if (htup == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("failed to locate tuple for heap lock_updated redo")));
+
+	htup->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
+	htup->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+	fb_fix_infomask_from_infobits(xlrec->infobits_set,
+								  &htup->t_infomask, &htup->t_infomask2);
+	HeapTupleHeaderSetXmax(htup, xlrec->xmax);
+	state->page_lsn = record->end_lsn;
+	result->records_replayed++;
+}
+
+static void
+fb_replay_heap2_multi_insert(const FbRelationInfo *info,
+							 const FbRecordRef *record,
+							 FbReplayStore *store,
+							 TupleDesc tupdesc,
+							 FbReplayResult *result,
+							 FbForwardOpStream *stream)
+{
+	xl_heap_multi_insert *xlrec = (xl_heap_multi_insert *) record->main_data;
+	FbReplayBlockState *state;
+	FbRecordBlockRef *block_ref = (FbRecordBlockRef *) &record->blocks[0];
+	Page page;
+	char *tupdata;
+	char *endptr;
+	int i;
+	bool isinit = record->init_page;
+	Size len;
+
+	union
+	{
+		HeapTupleHeaderData hdr;
+		char data[MaxHeapTupleSize];
+	} tbuf;
+
+	fb_replay_ensure_block_ready(store, block_ref, isinit, result, &state);
+	page = (Page) state->page;
+
+	if (!block_ref->has_data || block_ref->data_len == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("heap multi insert record missing block data")));
+
+	tupdata = block_ref->data;
+	len = block_ref->data_len;
+	endptr = tupdata + len;
+
+	for (i = 0; i < xlrec->ntuples; i++)
+	{
+		OffsetNumber offnum;
+		xl_multi_insert_tuple *xlhdr;
+		HeapTupleHeader htup;
+		uint32 newlen;
+		ItemPointerData tid;
+
+		if (isinit)
+			offnum = FirstOffsetNumber + i;
+		else
+			offnum = xlrec->offsets[i];
+
+		xlhdr = (xl_multi_insert_tuple *) SHORTALIGN(tupdata);
+		tupdata = ((char *) xlhdr) + SizeOfMultiInsertTuple;
+
+		newlen = xlhdr->datalen;
+		htup = &tbuf.hdr;
+		MemSet(htup, 0, SizeofHeapTupleHeader);
+		memcpy((char *) htup + SizeofHeapTupleHeader, tupdata, newlen);
+		tupdata += newlen;
+
+		newlen += SizeofHeapTupleHeader;
+		htup->t_infomask2 = xlhdr->t_infomask2;
+		htup->t_infomask = xlhdr->t_infomask;
+		htup->t_hoff = xlhdr->t_hoff;
+		HeapTupleHeaderSetXmin(htup, record->xid);
+		HeapTupleHeaderSetCmin(htup, FirstCommandId);
+		ItemPointerSetBlockNumber(&tid, block_ref->blkno);
+		ItemPointerSetOffsetNumber(&tid, offnum);
+		htup->t_ctid = tid;
+
+		if (PageAddItem(page, (Item) htup, newlen, offnum, true, true) == InvalidOffsetNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("failed to replay heap multi insert")));
+
+		if (stream != NULL && tupdesc != NULL &&
+			record->committed_after_target && block_ref->is_main_relation)
+		{
+			HeapTuple new_tuple = fb_copy_page_tuple(page, block_ref->blkno, offnum);
+
+			if (new_tuple != NULL)
+				fb_append_forward_insert(info, tupdesc, record, new_tuple, stream);
+		}
+	}
+
+	if (tupdata != endptr)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("heap multi insert tuple length mismatch")));
+
+	if (xlrec->flags & XLH_INSERT_ALL_VISIBLE_CLEARED)
+		PageClearAllVisible(page);
+	if (xlrec->flags & XLH_INSERT_ALL_FROZEN_SET)
+		PageSetAllVisible(page);
+
+	state->page_lsn = record->end_lsn;
+	result->records_replayed++;
+	if (record->committed_after_target && block_ref->is_main_relation)
+		result->target_insert_count += xlrec->ntuples;
 }
 
 static void
@@ -704,6 +976,27 @@ fb_replay_execute_internal(const FbRelationInfo *info,
 				break;
 			case FB_WAL_RECORD_HEAP_HOT_UPDATE:
 				fb_replay_heap_update(info, record, &store, true, tupdesc, result, stream);
+				break;
+			case FB_WAL_RECORD_HEAP_CONFIRM:
+				fb_replay_heap_confirm(record, &store, result);
+				break;
+			case FB_WAL_RECORD_HEAP_LOCK:
+				fb_replay_heap_lock(record, &store, result);
+				break;
+			case FB_WAL_RECORD_HEAP_INPLACE:
+				fb_replay_heap_inplace(record, &store, result);
+				break;
+			case FB_WAL_RECORD_HEAP2_PRUNE:
+				fb_replay_heap2_prune(record, &store, result);
+				break;
+			case FB_WAL_RECORD_HEAP2_VISIBLE:
+				fb_replay_heap2_visible(record, &store, result);
+				break;
+			case FB_WAL_RECORD_HEAP2_MULTI_INSERT:
+				fb_replay_heap2_multi_insert(info, record, &store, tupdesc, result, stream);
+				break;
+			case FB_WAL_RECORD_HEAP2_LOCK_UPDATED:
+				fb_replay_heap2_lock_updated(record, &store, result);
 				break;
 		}
 	}

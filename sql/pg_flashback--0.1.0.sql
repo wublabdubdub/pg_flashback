@@ -10,6 +10,12 @@ AS 'MODULE_PATHNAME', 'fb_check_relation'
 LANGUAGE C
 STRICT;
 
+CREATE FUNCTION fb_runtime_dir_debug()
+RETURNS text
+AS 'MODULE_PATHNAME', 'fb_runtime_dir_debug'
+LANGUAGE C
+STRICT;
+
 CREATE FUNCTION fb_scan_wal_debug(regclass, timestamptz)
 RETURNS text
 AS 'MODULE_PATHNAME', 'fb_scan_wal_debug'
@@ -25,6 +31,12 @@ STRICT;
 CREATE FUNCTION fb_replay_debug(regclass, timestamptz)
 RETURNS text
 AS 'MODULE_PATHNAME', 'fb_replay_debug'
+LANGUAGE C
+STRICT;
+
+CREATE FUNCTION fb_wal_window_debug(timestamptz)
+RETURNS text
+AS 'MODULE_PATHNAME', 'fb_wal_window_debug'
 LANGUAGE C
 STRICT;
 
@@ -86,6 +98,7 @@ DECLARE
     source_relid regclass;
     target_ts timestamptz;
     coldef text;
+    window_info text;
 BEGIN
     IF to_regclass(result_name) IS NOT NULL THEN
         RAISE EXCEPTION 'flashback target relation "%" already exists', result_name;
@@ -111,11 +124,14 @@ BEGIN
         RAISE EXCEPTION 'could not derive row type for relation %', source_relid;
     END IF;
 
+    window_info := fb_wal_window_debug(target_ts);
     EXECUTE format(
         'CREATE TEMP TABLE %I AS SELECT * FROM pg_flashback($1, $2) AS t(%s)',
         result_name,
         coldef)
     USING source_relid, target_ts;
+
+    RAISE NOTICE 'flashback info: %', window_info;
 
     RETURN result_name;
 END;
@@ -133,6 +149,9 @@ COMMENT ON FUNCTION fb_version() IS
 COMMENT ON FUNCTION fb_check_relation(regclass) IS
 'Inspect current scaffold mode selection for a relation.';
 
+COMMENT ON FUNCTION fb_runtime_dir_debug() IS
+'Ensure the pg_flashback private runtime directories exist and return a compact status summary.';
+
 COMMENT ON FUNCTION fb_scan_wal_debug(regclass, timestamptz) IS
 'Development-only WAL scan summary for the current PG18 scaffold.';
 
@@ -141,6 +160,9 @@ COMMENT ON FUNCTION fb_recordref_debug(regclass, timestamptz) IS
 
 COMMENT ON FUNCTION fb_replay_debug(regclass, timestamptz) IS
 'Development-only page replay summary for the current PG18 scaffold.';
+
+COMMENT ON FUNCTION fb_wal_window_debug(timestamptz) IS
+'Development-only WAL window summary for the current PG18 scaffold.';
 
 COMMENT ON FUNCTION fb_decode_insert_debug(regclass, timestamptz) IS
 'Development-only placeholder for future replay-backed INSERT row-image output.';

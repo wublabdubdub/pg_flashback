@@ -31,6 +31,11 @@ psql postgres
 - 当前用户接口也新增了一个务实层：
   - `fb_flashback_materialize(regclass, timestamptz, text)` 从数据字典自动生成列定义并落临时表
   - 这是当前阶段“免手写 `AS t(...)`”的实际可用方案
+- 当前最终用户入口已经拍板：
+  - 主入口：`fb_create_flashback_table(text, text, text)`
+  - 中间层：`fb_flashback_materialize(regclass, timestamptz, text)`
+  - 底层：`pg_flashback(regclass, timestamptz)`
+  - 不要再把 `pg_flashback()` 当作首推用户入口来设计文档
 - 扩展首版严格只读。
 - 同时支持：
   - 历史结果集查询
@@ -58,10 +63,13 @@ psql postgres
   - 在热路径里做 TOAST 文件/数据文件回读
   - 在热路径里做事务分组输出、SQL cache 和大量上下文查找
 - 当前 `pg_flashback.archive_dir` 只是 PG18 基线开发配置。
-- 后续要升级为：
-  - `archive_dest` 主配置
-  - 对 `pg_wal` / `archive_dest` 的双来源解析
-  - 以及被覆盖 WAL 的恢复策略
+- WAL 来源模型也已经拍板：
+  - `archive_dest` 主配置语义
+  - `pg_wal` / `archive_dest` 双来源解析
+  - recent WAL 优先 `pg_wal`
+  - 历史 WAL 优先 `archive_dest`
+  - 重叠 segment 做一致性校验
+  - 缺失 segment 进入恢复层
 - 被覆盖 WAL 的恢复思路后续参考 `/root/xman` 的 `ckwal`，但只作参考，不直接绑定其实现
 
 ## 修改规则

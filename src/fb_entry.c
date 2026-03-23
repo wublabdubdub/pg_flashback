@@ -1,6 +1,8 @@
 #include "postgres.h"
 
 #include "access/relation.h"
+#include "access/xlog.h"
+#include "access/xlog_internal.h"
 #include "access/table.h"
 #include "funcapi.h"
 #include "fmgr.h"
@@ -16,6 +18,7 @@
 #include "fb_entry.h"
 #include "fb_error.h"
 #include "fb_guc.h"
+#include "fb_runtime.h"
 #include "fb_replay.h"
 #include "fb_reverse_ops.h"
 #include "fb_wal.h"
@@ -24,9 +27,11 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(fb_version);
 PG_FUNCTION_INFO_V1(fb_check_relation);
+PG_FUNCTION_INFO_V1(fb_wal_source_debug);
 PG_FUNCTION_INFO_V1(fb_scan_wal_debug);
 PG_FUNCTION_INFO_V1(fb_recordref_debug);
 PG_FUNCTION_INFO_V1(fb_replay_debug);
+PG_FUNCTION_INFO_V1(fb_wal_window_debug);
 PG_FUNCTION_INFO_V1(fb_decode_insert_debug);
 PG_FUNCTION_INFO_V1(pg_flashback);
 PG_FUNCTION_INFO_V1(fb_export_undo);
@@ -77,6 +82,12 @@ fb_require_materialize_mode(FunctionCallInfo fcinfo)
 	return rsinfo;
 }
 
+static char *
+fb_lsn_text(XLogRecPtr lsn)
+{
+	return psprintf("%X/%08X", LSN_FORMAT_ARGS(lsn));
+}
+
 static Tuplestorestate *
 fb_begin_materialized_result(FunctionCallInfo fcinfo, TupleDesc stored_tupdesc)
 {
@@ -118,6 +129,19 @@ fb_check_relation(PG_FUNCTION_ARGS)
 					 OidIsValid(info.toast_relid) ? "true" : "false");
 
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+Datum
+fb_wal_source_debug(PG_FUNCTION_ARGS)
+{
+	FbWalScanContext scan_ctx;
+	char *summary;
+
+	fb_require_archive_dir();
+	fb_wal_prepare_scan_context(GetCurrentTimestamp(), &scan_ctx);
+	summary = fb_wal_source_debug_summary(&scan_ctx);
+
+	PG_RETURN_TEXT_P(cstring_to_text(summary));
 }
 
 Datum
@@ -183,6 +207,50 @@ fb_replay_debug(PG_FUNCTION_ARGS)
 
 	fb_replay_execute(&info, &index, &replay_result);
 	summary = fb_replay_debug_summary(&replay_result);
+
+	PG_RETURN_TEXT_P(cstring_to_text(summary));
+}
+
+Datum
+fb_wal_window_debug(PG_FUNCTION_ARGS)
+{
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(0);
+	FbWalScanContext scan_ctx;
+	XLogRecPtr current_lsn;
+	TimeLineID current_tli;
+	XLogSegNo current_segno;
+	char *current_lsn_text;
+	char current_wal[MAXFNAMELEN];
+	char *start_lsn_text;
+	char *end_lsn_text;
+	char *summary;
+
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+	fb_wal_prepare_scan_context(target_ts, &scan_ctx);
+
+	current_lsn = scan_ctx.end_lsn;
+	current_tli = GetWALInsertionTimeLineIfSet();
+	if (current_tli == 0)
+		current_tli = scan_ctx.timeline_id;
+
+	current_lsn_text = fb_lsn_text(current_lsn);
+	start_lsn_text = fb_lsn_text(scan_ctx.start_lsn);
+	end_lsn_text = fb_lsn_text(scan_ctx.end_lsn);
+	XLByteToSeg(current_lsn, current_segno, scan_ctx.wal_seg_size);
+	XLogFileName(current_wal, current_tli, current_segno, scan_ctx.wal_seg_size);
+
+	summary = psprintf("current_lsn=%s current_wal=%s start_lsn=%s start_wal=%s end_lsn=%s end_wal=%s",
+					   current_lsn_text,
+					   current_wal,
+					   start_lsn_text,
+					   scan_ctx.first_segment,
+					   end_lsn_text,
+					   scan_ctx.last_segment);
+
+	pfree(current_lsn_text);
+	pfree(start_lsn_text);
+	pfree(end_lsn_text);
 
 	PG_RETURN_TEXT_P(cstring_to_text(summary));
 }
