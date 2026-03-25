@@ -6,6 +6,7 @@ BEGIN
 END;
 $$;
 CREATE EXTENSION pg_flashback;
+SET pg_flashback.show_progress = off;
 
 DO $$
 BEGIN
@@ -32,9 +33,12 @@ INSERT INTO fb_flashback_keyed_target VALUES (1, 'alpha');
 UPDATE fb_flashback_keyed_target SET payload = 'alpha-updated' WHERE id = 1;
 DELETE FROM fb_flashback_keyed_target WHERE id = 0;
 
+SELECT pg_flashback(
+	'fb_flashback_keyed_result',
+	'fb_flashback_keyed_target',
+	(SELECT target_ts::text FROM fb_flashback_keyed_mark)
+);
+
 SELECT *
-FROM pg_flashback(
-	'fb_flashback_keyed_target'::regclass,
-	(SELECT target_ts FROM fb_flashback_keyed_mark)
-) AS t(id integer, payload text)
+FROM fb_flashback_keyed_result
 ORDER BY 1, 2;

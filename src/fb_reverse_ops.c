@@ -2,6 +2,8 @@
 
 #include "utils/builtins.h"
 
+#include "fb_memory.h"
+#include "fb_progress.h"
 #include "fb_replay.h"
 #include "fb_reverse_ops.h"
 
@@ -14,6 +16,10 @@ fb_reverse_stream_append(FbReverseOpStream *stream, const FbReverseOp *op)
 	{
 		old_capacity = stream->capacity;
 		stream->capacity = (stream->capacity == 0) ? 32 : stream->capacity * 2;
+		fb_memory_charge_bytes(&stream->tracked_bytes,
+							   stream->memory_limit_bytes,
+							   sizeof(FbReverseOp) * (stream->capacity - old_capacity),
+							   "ReverseOp array");
 		if (stream->ops == NULL)
 			stream->ops = palloc0(sizeof(FbReverseOp) * stream->capacity);
 		else
@@ -54,6 +60,8 @@ fb_build_forward_ops(const FbRelationInfo *info,
 	FbReplayResult replay_result;
 
 	fb_replay_build_forward_ops(info, index, tupdesc, &replay_result, stream);
+	stream->tracked_bytes = replay_result.tracked_bytes;
+	stream->memory_limit_bytes = replay_result.memory_limit_bytes;
 }
 
 void
@@ -63,6 +71,9 @@ fb_build_reverse_ops(const FbForwardOpStream *forward,
 	uint32 i;
 
 	MemSet(reverse, 0, sizeof(*reverse));
+	reverse->tracked_bytes = forward->tracked_bytes;
+	reverse->memory_limit_bytes = forward->memory_limit_bytes;
+	fb_progress_enter_stage(FB_PROGRESS_STAGE_BUILD_REVERSE, NULL);
 
 	for (i = 0; i < forward->count; i++)
 	{
@@ -93,11 +104,17 @@ fb_build_reverse_ops(const FbForwardOpStream *forward,
 		}
 
 		fb_reverse_stream_append(reverse, &reverse_op);
+		fb_progress_update_fraction(FB_PROGRESS_STAGE_BUILD_REVERSE,
+									 (uint64) i + 1,
+									 forward->count,
+									 NULL);
 	}
 
 	if (reverse->count > 1)
 		qsort(reverse->ops, reverse->count, sizeof(FbReverseOp),
 			  fb_reverse_op_cmp);
+
+	fb_progress_update_percent(FB_PROGRESS_STAGE_BUILD_REVERSE, 100, NULL);
 }
 
 char *

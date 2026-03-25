@@ -48,6 +48,15 @@ typedef struct FbWalScanContext
 	bool using_archive_dest;
 	bool using_legacy_archive_dir;
 	bool ckwal_invoked;
+	bool parallel_segment_scan_enabled;
+	bool segment_prefilter_ready;
+	bool segment_prefilter_used;
+	uint32 prefilter_hit_segments;
+	uint32 prefilter_total_segments;
+	bool *segment_hit_map;
+	bool current_segment_may_hit;
+	uint32 progress_segment_total;
+	uint32 visited_segment_count;
 } FbWalScanContext;
 
 typedef enum FbWalRecordKind
@@ -62,7 +71,9 @@ typedef enum FbWalRecordKind
 	FB_WAL_RECORD_HEAP2_PRUNE,
 	FB_WAL_RECORD_HEAP2_VISIBLE,
 	FB_WAL_RECORD_HEAP2_MULTI_INSERT,
-	FB_WAL_RECORD_HEAP2_LOCK_UPDATED
+	FB_WAL_RECORD_HEAP2_LOCK_UPDATED,
+	FB_WAL_RECORD_XLOG_FPI,
+	FB_WAL_RECORD_XLOG_FPI_FOR_HINT
 } FbWalRecordKind;
 
 typedef enum FbWalXidStatus
@@ -80,6 +91,7 @@ typedef struct FbRecordBlockRef
 	ForkNumber forknum;
 	BlockNumber blkno;
 	bool is_main_relation;
+	bool is_toast_relation;
 	bool has_image;
 	bool apply_image;
 	char *image;
@@ -127,6 +139,7 @@ typedef struct FbWalRecordIndex
 	uint64 target_update_count;
 	uint64 tracked_bytes;
 	uint64 memory_limit_bytes;
+	void *payload_arena;
 	FbRecordRef *records;
 	uint32 record_count;
 	uint32 record_capacity;
@@ -145,12 +158,8 @@ bool fb_wal_lookup_xid_status(const FbWalRecordIndex *index,
 							  TransactionId xid,
 							  FbWalXidStatus *status,
 							  TimestampTz *commit_ts);
-char *fb_wal_index_debug_summary(const FbWalScanContext *ctx,
-								 const FbWalRecordIndex *index);
 void fb_wal_visit_records(FbWalScanContext *ctx, FbWalRecordVisitor visitor,
 						  void *arg);
 const char *fb_wal_unsafe_reason_name(FbWalUnsafeReason reason);
-char *fb_wal_source_debug_summary(const FbWalScanContext *ctx);
-char *fb_wal_debug_summary(const FbWalScanContext *ctx);
 
 #endif

@@ -28,14 +28,10 @@ psql postgres
 - 当前已修正为：
   - `reverse op stream` 仍然是最终查询/导出的逻辑层
   - 但其来源必须是 `checkpoint + FPI + block redo` 的页级重放内核
-- 当前用户接口也新增了一个务实层：
-  - `fb_flashback_materialize(regclass, timestamptz, text)` 从数据字典自动生成列定义并落临时表
-  - 这是当前阶段“免手写 `AS t(...)`”的实际可用方案
 - 当前最终用户入口已经拍板：
-  - 主入口：`fb_create_flashback_table(text, text, text)`
-  - 中间层：`fb_flashback_materialize(regclass, timestamptz, text)`
-  - 底层：`pg_flashback(regclass, timestamptz)`
-  - 不要再把 `pg_flashback()` 当作首推用户入口来设计文档
+  - 主入口：`pg_flashback(text, text, text)`
+  - `fb_create_flashback_table(text, text, text)` 已移除，不保留兼容别名
+  - `fb_flashback_materialize(regclass, timestamptz, text)` / `fb_internal_flashback(regclass, timestamptz)` 当前不对外安装
 - 扩展首版严格只读。
 - 同时支持：
   - 历史结果集查询
@@ -45,7 +41,8 @@ psql postgres
 - 时间窗内若检测到 DDL / rewrite / truncate / relfilenode 变化，直接报错。
 - TOAST 首版支持，但重建失败直接报错。
 - 开发阶段文档用中文，代码和标识符用英文。
-- 函数名前缀统一用 `fb`，不要引入 `pfb`。
+- 代码和内部标识符前缀统一用 `fb`，不要引入 `pfb`。
+- 公开用户 SQL 主入口例外保留为 `pg_flashback(...)`。
 - `/root/pduforwm` 仅作为 WAL 扫描与行像拼接思路参考：
 - `/root/pduforwm` 尤其要参考这些页级重放路径：
   - `heap_xlog_delete`
@@ -66,11 +63,19 @@ psql postgres
 - WAL 来源模型也已经拍板：
   - `archive_dest` 主配置语义
   - `pg_wal` / `archive_dest` 双来源解析
-  - recent WAL 优先 `pg_wal`
-  - 历史 WAL 优先 `archive_dest`
-  - 重叠 segment 做一致性校验
-  - 缺失 segment 进入恢复层
-- 被覆盖 WAL 的恢复思路后续参考 `/root/xman` 的 `ckwal`，但只作参考，不直接绑定其实现
+  - 两端同时存在时一律优先 `archive_dest`
+  - `pg_wal` 只承接 archive 尚未覆盖的 recent tail
+  - 错配 `pg_wal` 段会先转换为 `recovered_wal/<actual-segname>` 并在同一轮 resolver 中回灌
+  - 扩展当前会自动维护 `DataDir/pg_flashback/{runtime,recovered_wal,meta}`
+  - 被覆盖 WAL 的恢复思路参考 `/root/xman` 的 `ckwal`，但只作实现参考
+- 当前内嵌 `fb_ckwal` 只负责复制/转换/回灌已有可用段；三处都没有可用段时必须直接报错
+- 当前页基线修复策略已拍板：
+  - 保留 `target_ts` 前最近 checkpoint 作为全局首锚点
+  - `missing FPI` 不按 block 单独回扫
+  - 对本轮 replay 中缺基线的 block 集做一次共享回扫
+  - 为主表与 TOAST relation 共用同一套更早 `FPI/INIT_PAGE` 补锚逻辑
+- 当前 TOAST 深测有一个固定运维动作：
+  - 每次完成 TOAST 测试后，手动清空归档目录 `/isoTest/18waldata`
 
 ## 修改规则
 
@@ -96,9 +101,18 @@ psql postgres
 
 `P5` 已完成。当前主线进入：
 
-- `P6`：`fb_export_undo`
+- 先解决 deep pilot 的 batch B 页基线 blocker
+- 同步 `tests/deep/` 到当前内嵌恢复模型
+- 维持当前已完成的 TOAST 主链与深测结果：
+  - TOAST 深测脚本：`tests/deep/sql/80_toast_scale.sql`
+  - TOAST 报告：`docs/reports/2026-03-23-toast-scale-report.md`
+  - TOAST full 报告：`docs/reports/2026-03-23-toast-full-report.md`
+  - 最近一次复跑结果：
+    - 全量回归 `All 16 tests passed.`
+    - TOAST 深测 `diff_count = 0`
 - 开发期 `ForwardOp/ReverseOp` 调试出口重建
-- TOAST / `multi_insert` / 主键变更等正确性补齐
+- `P6`：`fb_export_undo`
+- 主键变更等剩余正确性补齐
 
 ## 交接要求
 

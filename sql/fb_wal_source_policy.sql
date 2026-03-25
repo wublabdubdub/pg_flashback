@@ -18,7 +18,38 @@ SELECT current_setting('pg_flashback.ckwal_restore_dir', true) IS NULL
 SET pg_flashback.archive_dir = '/__legacy_path_should_not_be_used__';
 DO $$
 BEGIN
-	EXECUTE format('SET pg_flashback.archive_dest = %L', current_setting('data_directory') || '/pg_wal');
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'rm -rf /tmp/fb_archive_fixture /tmp/fb_empty_pg_wal_fixture && mkdir -p /tmp/fb_archive_fixture /tmp/fb_empty_pg_wal_fixture');
+END;
+$$;
+
+DO $$
+DECLARE
+	datadir text;
+	seg text;
+BEGIN
+	datadir := current_setting('data_directory');
+
+	FOR seg IN
+		SELECT name
+		  FROM (
+			SELECT name
+			  FROM pg_ls_waldir()
+			 WHERE name ~ '^[0-9A-F]{24}(\\.partial)?$'
+			 ORDER BY name DESC
+			 LIMIT 4
+		  ) latest
+		 ORDER BY name
+	LOOP
+		EXECUTE format(
+			'COPY (SELECT '''') TO PROGRAM %L',
+			'cp ' || quote_literal(datadir || '/pg_wal/' || seg) ||
+			' ' || quote_literal('/tmp/fb_archive_fixture/' || seg));
+	END LOOP;
+
+	EXECUTE format('SET pg_flashback.archive_dest = %L', '/tmp/fb_archive_fixture');
+	EXECUTE format('SET pg_flashback.debug_pg_wal_dir = %L', '/tmp/fb_empty_pg_wal_fixture');
 END;
 $$;
 

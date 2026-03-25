@@ -16,7 +16,11 @@ SET pg_flashback.archive_dir = '/__legacy_path_should_not_be_used__';
 
 DO $$
 BEGIN
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'rm -rf /tmp/fb_empty_pg_wal_fixture && mkdir -p /tmp/fb_empty_pg_wal_fixture');
 	EXECUTE format('SET pg_flashback.archive_dest = %L', current_setting('data_directory') || '/pg_wal');
+	EXECUTE format('SET pg_flashback.debug_pg_wal_dir = %L', '/tmp/fb_empty_pg_wal_fixture');
 END;
 $$;
 
@@ -39,4 +43,10 @@ COMMIT;
 SELECT fb_scan_wal_debug(
 	'fb_wal_sources_target'::regclass,
 	(SELECT target_ts FROM fb_wal_sources_mark)
-);
+) AS summary
+\gset
+
+SELECT :'summary' LIKE '%parallel=off%' AS parallel_off,
+	   :'summary' LIKE '%prefilter=off%' AS prefilter_off,
+	   :'summary' ~ 'visited_segments=[0-9]+/[0-9]+' AS visited_seen,
+	   :'summary' LIKE '%complete=true%' AS complete_seen;

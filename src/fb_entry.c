@@ -1,38 +1,41 @@
 #include "postgres.h"
 
+#include "catalog/namespace.h"
+#include "access/heapam.h"
 #include "access/relation.h"
-#include "access/xlog.h"
-#include "access/xlog_internal.h"
-#include "access/table.h"
-#include "funcapi.h"
+#include "access/tableam.h"
+#include "executor/spi.h"
+#include "executor/tuptable.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "utils/builtins.h"
-#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/timestamp.h"
+#include "utils/varlena.h"
 
 #include "fb_apply.h"
 #include "fb_catalog.h"
-#include "fb_decode.h"
 #include "fb_entry.h"
 #include "fb_error.h"
 #include "fb_guc.h"
-#include "fb_runtime.h"
-#include "fb_replay.h"
+#include "fb_parallel.h"
+#include "fb_progress.h"
 #include "fb_reverse_ops.h"
 #include "fb_wal.h"
+
+typedef struct FbTableSinkState
+{
+	Relation rel;
+	TupleTableSlot *slot;
+	BulkInsertState bistate;
+	CommandId cid;
+} FbTableSinkState;
 
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(fb_version);
 PG_FUNCTION_INFO_V1(fb_check_relation);
-PG_FUNCTION_INFO_V1(fb_wal_source_debug);
-PG_FUNCTION_INFO_V1(fb_scan_wal_debug);
-PG_FUNCTION_INFO_V1(fb_recordref_debug);
-PG_FUNCTION_INFO_V1(fb_replay_debug);
-PG_FUNCTION_INFO_V1(fb_wal_window_debug);
-PG_FUNCTION_INFO_V1(fb_decode_insert_debug);
 PG_FUNCTION_INFO_V1(pg_flashback);
 PG_FUNCTION_INFO_V1(fb_export_undo);
 
@@ -64,48 +67,121 @@ fb_relation_tupledesc(Oid relid)
 	return tupdesc;
 }
 
-static ReturnSetInfo *
-fb_require_materialize_mode(FunctionCallInfo fcinfo)
+static Oid
+fb_resolve_relation_name(text *name_text, LOCKMODE lockmode, bool missing_ok)
 {
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	List	   *names;
+	RangeVar   *rv;
 
-	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("set-valued function called in context that cannot accept a set")));
-	if (!(rsinfo->allowedModes & SFRM_Materialize))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required")));
-
-	rsinfo->returnMode = SFRM_Materialize;
-	return rsinfo;
+	names = textToQualifiedNameList(name_text);
+	rv = makeRangeVarFromNameList(names);
+	return RangeVarGetRelid(rv, lockmode, missing_ok);
 }
 
 static char *
-fb_lsn_text(XLogRecPtr lsn)
+fb_require_result_name(text *name_text)
 {
-	return psprintf("%X/%08X", LSN_FORMAT_ARGS(lsn));
+	List	   *names = textToQualifiedNameList(name_text);
+
+	if (list_length(names) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_NAME),
+				 errmsg("flashback result relation name must be unqualified")));
+
+	return pstrdup(strVal(linitial(names)));
 }
 
-static Tuplestorestate *
-fb_begin_materialized_result(FunctionCallInfo fcinfo, TupleDesc stored_tupdesc)
+static TimestampTz
+fb_parse_target_ts_text(text *target_ts_text)
 {
-	ReturnSetInfo *rsinfo = fb_require_materialize_mode(fcinfo);
-	MemoryContext old_context;
-	MemoryContext per_query_ctx;
-	Tuplestorestate *tuplestore;
-	bool random_access;
+	char	   *target_ts_cstr = text_to_cstring(target_ts_text);
 
-	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
-	old_context = MemoryContextSwitchTo(per_query_ctx);
-	random_access = (rsinfo->allowedModes & SFRM_Materialize_Random) != 0;
-	tuplestore = tuplestore_begin_heap(random_access, false, work_mem);
-	rsinfo->setResult = tuplestore;
-	rsinfo->setDesc = stored_tupdesc;
-	MemoryContextSwitchTo(old_context);
+	return DatumGetTimestampTz(DirectFunctionCall3(timestamptz_in,
+												   CStringGetDatum(target_ts_cstr),
+												   ObjectIdGetDatum(InvalidOid),
+												   Int32GetDatum(-1)));
+}
 
-	return tuplestore;
+static char *
+fb_build_create_table_sql(const char *result_name, TupleDesc tupdesc)
+{
+	StringInfoData buf;
+	bool		first = true;
+	int			i;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "CREATE UNLOGGED TABLE %s (",
+					 quote_identifier(result_name));
+
+	for (i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+		char	   *type_sql;
+
+		if (attr->attisdropped)
+			continue;
+
+		type_sql = format_type_with_typemod(attr->atttypid, attr->atttypmod);
+		appendStringInfo(&buf, "%s%s %s",
+						 first ? "" : ", ",
+						 quote_identifier(NameStr(attr->attname)),
+						 type_sql);
+		first = false;
+	}
+
+	if (first)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("could not derive columns for flashback result table")));
+
+	appendStringInfoChar(&buf, ')');
+	return buf.data;
+}
+
+static void
+fb_table_sink_put_tuple(HeapTuple tuple, TupleDesc tupdesc, void *arg)
+{
+	FbTableSinkState *state = (FbTableSinkState *) arg;
+
+	(void) tupdesc;
+
+	ExecStoreHeapTuple(tuple, state->slot, false);
+	table_tuple_insert(state->rel, state->slot, state->cid, 0, state->bistate);
+	ExecClearTuple(state->slot);
+}
+
+static void
+fb_validate_flashback_target(Oid relid, TimestampTz target_ts,
+							  FbRelationInfo *info_out, TupleDesc *tupdesc_out)
+{
+	fb_progress_enter_stage(FB_PROGRESS_STAGE_VALIDATE, NULL);
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+	fb_require_supported_target_relation(relid, info_out);
+	*tupdesc_out = fb_relation_tupledesc(relid);
+}
+
+static void
+fb_build_flashback_reverse_ops(TimestampTz target_ts,
+							   const FbRelationInfo *info,
+							   TupleDesc tupdesc,
+							   FbReverseOpStream *reverse)
+{
+	FbWalScanContext scan_ctx;
+	FbWalRecordIndex index;
+	FbForwardOpStream forward;
+
+	fb_progress_enter_stage(FB_PROGRESS_STAGE_PREPARE_WAL, NULL);
+	fb_wal_prepare_scan_context(target_ts, &scan_ctx);
+	fb_wal_build_record_index(info, &scan_ctx, &index);
+	if (index.unsafe)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("fb does not support WAL windows containing %s operations",
+						fb_wal_unsafe_reason_name(index.unsafe_reason))));
+
+	fb_build_forward_ops(info, &index, tupdesc, &forward);
+	fb_build_reverse_ops(&forward, reverse);
 }
 
 Datum
@@ -132,166 +208,89 @@ fb_check_relation(PG_FUNCTION_ARGS)
 }
 
 Datum
-fb_wal_source_debug(PG_FUNCTION_ARGS)
-{
-	FbWalScanContext scan_ctx;
-	char *summary;
-
-	fb_require_archive_dir();
-	fb_wal_prepare_scan_context(GetCurrentTimestamp(), &scan_ctx);
-	summary = fb_wal_source_debug_summary(&scan_ctx);
-
-	PG_RETURN_TEXT_P(cstring_to_text(summary));
-}
-
-Datum
-fb_scan_wal_debug(PG_FUNCTION_ARGS)
-{
-	Oid relid = PG_GETARG_OID(0);
-	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
-	FbRelationInfo info;
-	FbWalScanContext scan_ctx;
-	char *summary;
-
-	fb_require_target_ts_not_future(target_ts);
-	fb_require_archive_dir();
-	fb_require_supported_target_relation(relid, &info);
-	fb_wal_prepare_scan_context(target_ts, &scan_ctx);
-	fb_wal_scan_relation_window(&info, &scan_ctx);
-	summary = fb_wal_debug_summary(&scan_ctx);
-
-	PG_RETURN_TEXT_P(cstring_to_text(summary));
-}
-
-Datum
-fb_recordref_debug(PG_FUNCTION_ARGS)
-{
-	Oid relid = PG_GETARG_OID(0);
-	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
-	FbRelationInfo info;
-	FbWalScanContext scan_ctx;
-	FbWalRecordIndex index;
-	char *summary;
-
-	fb_require_target_ts_not_future(target_ts);
-	fb_require_archive_dir();
-	fb_require_supported_target_relation(relid, &info);
-	fb_wal_prepare_scan_context(target_ts, &scan_ctx);
-	fb_wal_build_record_index(&info, &scan_ctx, &index);
-	summary = fb_wal_index_debug_summary(&scan_ctx, &index);
-
-	PG_RETURN_TEXT_P(cstring_to_text(summary));
-}
-
-Datum
-fb_replay_debug(PG_FUNCTION_ARGS)
-{
-	Oid relid = PG_GETARG_OID(0);
-	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
-	FbRelationInfo info;
-	FbWalScanContext scan_ctx;
-	FbWalRecordIndex index;
-	FbReplayResult replay_result;
-	char *summary;
-
-	fb_require_target_ts_not_future(target_ts);
-	fb_require_archive_dir();
-	fb_require_supported_target_relation(relid, &info);
-	fb_wal_prepare_scan_context(target_ts, &scan_ctx);
-	fb_wal_build_record_index(&info, &scan_ctx, &index);
-	if (index.unsafe)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fb does not support WAL windows containing %s operations",
-						fb_wal_unsafe_reason_name(index.unsafe_reason))));
-
-	fb_replay_execute(&info, &index, &replay_result);
-	summary = fb_replay_debug_summary(&replay_result);
-
-	PG_RETURN_TEXT_P(cstring_to_text(summary));
-}
-
-Datum
-fb_wal_window_debug(PG_FUNCTION_ARGS)
-{
-	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(0);
-	FbWalScanContext scan_ctx;
-	XLogRecPtr current_lsn;
-	TimeLineID current_tli;
-	XLogSegNo current_segno;
-	char *current_lsn_text;
-	char current_wal[MAXFNAMELEN];
-	char *start_lsn_text;
-	char *end_lsn_text;
-	char *summary;
-
-	fb_require_target_ts_not_future(target_ts);
-	fb_require_archive_dir();
-	fb_wal_prepare_scan_context(target_ts, &scan_ctx);
-
-	current_lsn = scan_ctx.end_lsn;
-	current_tli = GetWALInsertionTimeLineIfSet();
-	if (current_tli == 0)
-		current_tli = scan_ctx.timeline_id;
-
-	current_lsn_text = fb_lsn_text(current_lsn);
-	start_lsn_text = fb_lsn_text(scan_ctx.start_lsn);
-	end_lsn_text = fb_lsn_text(scan_ctx.end_lsn);
-	XLByteToSeg(current_lsn, current_segno, scan_ctx.wal_seg_size);
-	XLogFileName(current_wal, current_tli, current_segno, scan_ctx.wal_seg_size);
-
-	summary = psprintf("current_lsn=%s current_wal=%s start_lsn=%s start_wal=%s end_lsn=%s end_wal=%s",
-					   current_lsn_text,
-					   current_wal,
-					   start_lsn_text,
-					   scan_ctx.first_segment,
-					   end_lsn_text,
-					   scan_ctx.last_segment);
-
-	pfree(current_lsn_text);
-	pfree(start_lsn_text);
-	pfree(end_lsn_text);
-
-	PG_RETURN_TEXT_P(cstring_to_text(summary));
-}
-
-Datum
-fb_decode_insert_debug(PG_FUNCTION_ARGS)
-{
-	fb_raise_not_implemented("fb_decode_insert_debug forward-op debug output");
-	PG_RETURN_NULL();
-}
-
-Datum
 pg_flashback(PG_FUNCTION_ARGS)
 {
-	Oid relid = PG_GETARG_OID(0);
-	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	text	   *result_name_text = PG_GETARG_TEXT_PP(0);
+	text	   *source_name_text = PG_GETARG_TEXT_PP(1);
+	text	   *target_ts_text = PG_GETARG_TEXT_PP(2);
+	char	   *result_name;
+	Oid			source_relid;
+	TimestampTz target_ts;
 	FbRelationInfo info;
-	FbWalScanContext scan_ctx;
-	FbWalRecordIndex index;
-	FbForwardOpStream forward;
+	TupleDesc	tupdesc;
+	char	   *create_sql;
 	FbReverseOpStream reverse;
-	TupleDesc tupdesc;
-	Tuplestorestate *tuplestore;
+	Relation	result_rel;
+	TupleTableSlot *write_slot;
+	FbTableSinkState sink_state;
+	FbResultSink sink;
+	uint64		result_count;
+	bool		use_parallel = false;
 
-	fb_require_target_ts_not_future(target_ts);
-	fb_require_archive_dir();
-	fb_require_supported_target_relation(relid, &info);
-	fb_wal_prepare_scan_context(target_ts, &scan_ctx);
-	fb_wal_build_record_index(&info, &scan_ctx, &index);
-	if (index.unsafe)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fb does not support WAL windows containing %s operations",
-						fb_wal_unsafe_reason_name(index.unsafe_reason))));
+	fb_progress_begin();
 
-	tupdesc = fb_relation_tupledesc(relid);
-	BlessTupleDesc(tupdesc);
-	fb_build_forward_ops(&info, &index, tupdesc, &forward);
-	fb_build_reverse_ops(&forward, &reverse);
-	tuplestore = fb_begin_materialized_result(fcinfo, tupdesc);
-	fb_apply_reverse_ops(&info, tupdesc, &reverse, tuplestore);
+	PG_TRY();
+	{
+		result_name = fb_require_result_name(result_name_text);
+		if (fb_resolve_relation_name(result_name_text, NoLock, true) != InvalidOid)
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_TABLE),
+					 errmsg("flashback target relation \"%s\" already exists",
+							result_name)));
+
+		source_relid = fb_resolve_relation_name(source_name_text, AccessShareLock, false);
+		target_ts = fb_parse_target_ts_text(target_ts_text);
+		fb_validate_flashback_target(source_relid, target_ts, &info, &tupdesc);
+		create_sql = fb_build_create_table_sql(result_name, tupdesc);
+		fb_build_flashback_reverse_ops(target_ts, &info, tupdesc, &reverse);
+		use_parallel = fb_parallel_apply_workers() > 0;
+
+		if (use_parallel)
+			result_count = fb_parallel_apply_reverse_ops(result_name,
+														 create_sql,
+														 &info,
+														 tupdesc,
+														 &reverse);
+		else
+		{
+			if (SPI_connect() != SPI_OK_CONNECT)
+				elog(ERROR, "SPI_connect failed");
+			if (SPI_execute(create_sql, false, 0) != SPI_OK_UTILITY)
+				elog(ERROR, "CREATE UNLOGGED TABLE failed");
+			if (SPI_finish() != SPI_OK_FINISH)
+				elog(ERROR, "SPI_finish failed");
+
+			result_rel = relation_open(fb_resolve_relation_name(cstring_to_text(result_name),
+															 RowExclusiveLock,
+															 false),
+									   RowExclusiveLock);
+			write_slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
+			sink_state.rel = result_rel;
+			sink_state.slot = write_slot;
+			sink_state.bistate = GetBulkInsertState();
+			sink_state.cid = GetCurrentCommandId(true);
+			sink.put_tuple = fb_table_sink_put_tuple;
+			sink.arg = &sink_state;
+
+			result_count = fb_apply_reverse_ops(&info, tupdesc, &reverse, &sink);
+
+			table_finish_bulk_insert(result_rel, 0);
+			FreeBulkInsertState(sink_state.bistate);
+			ExecDropSingleTupleTableSlot(write_slot);
+			relation_close(result_rel, RowExclusiveLock);
+		}
+		(void) result_count;
+		fb_progress_finish();
+
+		PG_RETURN_TEXT_P(cstring_to_text(result_name));
+	}
+	PG_CATCH();
+	{
+		fb_progress_abort();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
 	PG_RETURN_NULL();
 }
 

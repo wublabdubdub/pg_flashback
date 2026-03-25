@@ -11,7 +11,8 @@ bash "$(dirname "$0")/capture_truth.sh" fb_deep_keyed_01 fb_batch_b_t0 fb_truth_
 fb_deep_psql_file "$FB_DEEP_SQL_DIR/40_batch_b_txn_workload.sql" \
 	"archive_dest=$FB_DEEP_ARCHIVE_DIR" \
 	"ckwal_dir=$FB_DEEP_CKWAL_DIR" \
-	"row_count=$FB_DEEP_ROW_COUNT"
+	"row_count=$FB_DEEP_ROW_COUNT" \
+	"op_row_count=$FB_DEEP_OPERATION_ROW_COUNT"
 fb_deep_refresh_archive_fixture
 fb_deep_psql_file "$FB_DEEP_SQL_DIR/41_batch_b_txn_validate.sql" \
 	"archive_dest=$FB_DEEP_ARCHIVE_DIR" \

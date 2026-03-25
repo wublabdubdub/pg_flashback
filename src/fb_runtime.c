@@ -3,15 +3,11 @@
 #include <unistd.h>
 
 #include "common/file_perm.h"
-#include "fmgr.h"
 #include "miscadmin.h"
 #include "port.h"
-#include "utils/builtins.h"
 #include "utils/elog.h"
 
 #include "fb_runtime.h"
-
-PG_FUNCTION_INFO_V1(fb_runtime_dir_debug);
 
 static char *
 fb_runtime_join_path(const char *suffix)
@@ -85,26 +81,4 @@ fb_runtime_ensure_initialized(void)
 	pfree(runtime_dir);
 	pfree(recovered_wal_dir);
 	pfree(meta_dir);
-}
-
-char *
-fb_runtime_debug_summary(void)
-{
-	char *base_dir;
-	char *summary;
-
-	fb_runtime_ensure_initialized();
-	base_dir = fb_runtime_base_dir();
-	summary = psprintf("base=%s runtime=true recovered=true meta=true", base_dir);
-	pfree(base_dir);
-
-	return summary;
-}
-
-Datum
-fb_runtime_dir_debug(PG_FUNCTION_ARGS)
-{
-	char *summary = fb_runtime_debug_summary();
-
-	PG_RETURN_TEXT_P(cstring_to_text(summary));
 }

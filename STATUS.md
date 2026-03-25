@@ -1,7 +1,70 @@
 # STATUS.md
 
+## 当前代码口径（2026-03-25 文档校准）
+
+- 当前安装脚本 `sql/pg_flashback--0.1.0.sql` 对外只安装：
+  - `fb_version()`
+  - `fb_check_relation(regclass)`
+  - `pg_flashback(text, text, text)`
+- `fb_export_undo()` 目前仅存在于 C 代码中，尚未写入安装 SQL，也仍是 `not implemented` 占位。
+- `fb_flashback_materialize()`、`fb_internal_flashback()` 以及旧的 scan / recordref / replay / decode 调试 SQL 入口，当前代码都没有对外安装。
+- 当前对外用户入口已收敛为：
+  - `pg_flashback(text, text, text)`
+- 当前运行时与来源解析已落地到代码：
+  - `pg_flashback.archive_dest`
+  - `pg_flashback.archive_dir`（兼容回退）
+  - `pg_flashback.debug_pg_wal_dir`
+  - `pg_flashback.memory_limit_kb`
+  - `pg_flashback.parallel_segment_scan`
+  - `pg_flashback.show_progress`
+  - `pg_flashback.parallel_apply_workers`
+  - 自动初始化 `DataDir/pg_flashback/{runtime,recovered_wal,meta}`
+- 当前 `pg_flashback()` 已新增面向 `psql` 的进度可视化：
+  - 固定 `9` 段
+  - 阶段 `3/4/5/6/7/8/9` 输出百分比
+  - 百分比输出统一按 `20%` 桶节流
+  - 第 `9` 段按结果表写入行数推进百分比
+  - 默认开启，可显式关闭
+- 当前结果输出已切到速度优先口径：
+  - 不再经过 `tuplestore -> TEMP TABLE` 二次物化
+  - 结果直接写入 `UNLOGGED heap`
+  - apply 层已新增统一 sink 边界，为后续并行 apply/write 预留扩展点
+- 真正的 `8/9` 并行 apply/write 方案已完成设计收口：
+  - 不采用 `ParallelContext`，因为 parallel worker 只支持只读
+  - 普通 bgworker 不能直接写 leader 当前事务里新建但未提交的结果表
+  - 首版真并行将收敛为：
+    - 默认仍走当前串行直写路径
+    - 显式开启 `pg_flashback.parallel_apply_workers > 0` 后，切到 bgworker 并行路径
+    - 并行路径下结果表由独立 worker 自主事务创建并提交
+    - apply workers 再并行写该 `UNLOGGED` 结果表
+    - 该并行路径的结果表生命周期不再受调用方事务回滚控制
+- `tests/deep/` 当前主线已经切到 baseline 快照恢复模型，并支持 full 模式状态文件续跑。
+
+## 进行中
+
+- deep pilot 的 batch B 页基线 blocker 收敛
+- `tests/deep/` 与当前内嵌恢复模型继续对齐
+- `fb_export_undo` 与剩余正确性问题补齐
+- `P5.9` 真并行 apply/write：
+  - 主链与文档已完成
+  - 后续只剩性能基准和更深的故障注入验证
+
+## 下一步
+
+- 继续推进 batch B / residual `missing FPI`
+- 重建开发期 `ForwardOp/ReverseOp` 调试出口
+- 开始 `P6`：`fb_export_undo`
+- 基于新维护文档继续补齐模块级注释、测试映射与故障定位样例
+- 对 `parallel_apply_workers` 做真实速度基准与故障注入补强
+
 ## 已完成
 
+- 形成源码级维护文档交付路径：
+  - 新增维护手册，覆盖主链、模块职责、关键结构体、测试面与阅读顺序
+  - 新增“代码优先”的核心入口导读，直接展示 `fb_entry` / `fb_wal` / `fb_replay` / `fb_toast` / `fb_apply_*` 的关键代码
+  - 已扩写“代码优先”的核心入口导读，覆盖“用户参数进入 -> 主链执行 -> 结果返回”的整链路，并对选取的核心代码逐行加注释
+  - 新增调试手册，覆盖排障步骤、常见错误、验证命令与 deep/回归入口
+  - 已在 `README.md` / `docs/architecture/overview.md` 增加维护文档入口
 - 确定项目主路线为 `reverse op stream`
 - 明确首版只读约束
 - 明确无主键表按 `bag/multiset` 语义处理
@@ -82,26 +145,22 @@
   - 当前表基线扫描
   - `keyed` 模式应用
   - `bag` 模式应用
-  - `pg_flashback(regclass, timestamptz)` 以 `SRF` 返回历史结果
-- 已新增用户级免列定义 helper：
-  - `fb_flashback_materialize(regclass, timestamptz, text)`
-  - 会从数据字典自动提取列定义并创建临时表 `fb_flashback_result`
+  - 真实 flashback 结果已可直接写入临时表
 - 已实现新的纯文本用户入口：
-  - `fb_create_flashback_table(result_name text, source_table text, target_ts text)`
+  - `pg_flashback(result_name text, source_table text, target_ts text)`
   - 用户可直接：
-    - `SELECT fb_create_flashback_table('fb1', 't1', '2026-03-22 10:00:00+08');`
+    - `SELECT pg_flashback('fb1', 't1', '2026-03-22 10:00:00+08');`
     - `SELECT * FROM fb1;`
-  - 默认创建 `TEMP TABLE`
+  - 默认创建速度优先的 `UNLOGGED` 结果表
   - 目标表已存在时直接报错
-  - 执行成功后输出 WAL 诊断信息：
-    - 当前时间对应的 LSN
-    - 该 LSN 所在 WAL 段
-    - 起始 WAL 段
-    - 终点 WAL 段
 - 已完成 `P5.5` 用户接口决策收口：
-  - `fb_create_flashback_table()` 被确定为首推用户入口
-  - `fb_flashback_materialize()` 作为中间层 helper 保留
-  - `pg_flashback()` 继续保留为底层能力，但不再是首推用户入口
+  - `pg_flashback()` 被确定为首推用户入口
+  - 已删除对外 `AS t(...)` 形态
+  - 已删除对外 debug SQL / `fb_internal_flashback()` / `fb_flashback_materialize()`
+  - 正式入口已统一为 `pg_flashback()`
+- 已完成公开入口换名：
+  - `fb_create_flashback_table(text, text, text)` 已从公开安装面移除
+  - 安装脚本、回归、deep 脚本和文档已统一为 `pg_flashback(text, text, text)`
 - 已完成 `P5.5` WAL 来源模型决策收口：
   - `archive_dir` 被明确固定为基线开发配置
   - 最终模型固定为 `archive_dest + pg_wal` 双来源解析
@@ -111,19 +170,25 @@
     - `pg_wal` 只承接 archive 尚未覆盖的 recent tail
   - 缺失 WAL 恢复层正式纳入路线，参考 `/root/xman` 的 `ckwal`
 - 已完成 `P5.5` 外露 `ckwal` GUC 收缩为扩展内部实现：
-  - `CREATE EXTENSION` 时自动初始化 `DataDir/pg_flashback/`
+  - 扩展库加载时自动初始化 `DataDir/pg_flashback/`
   - 固定子目录：
     - `runtime/`
     - `recovered_wal/`
     - `meta/`
   - `fb_try_ckwal_segment()` 已改为调用内嵌 `fb_ckwal`
   - 恢复后的 segment 固定写入 `recovered_wal/`
-  - 但内嵌 `fb_ckwal` 目前仍停留在骨架层，真实 segment 重建逻辑尚未完成
+  - 已移除用户侧 `pg_flashback.ckwal_restore_dir` / `pg_flashback.ckwal_command`
+  - 已新增 `fb_runtime_dir_debug()` 并有回归覆盖
+  - 当前内嵌 `fb_ckwal` 已实现：
+    - 可信 segment 的内部复制/复用
+    - 错配 `pg_wal` 段按页头识别实际 timeline/segno 并转换为 `recovered_wal/<actual-segname>`
+    - 转换结果在同一轮 resolver 中回灌为 `ckwal` 候选
+  - 当前内嵌 `fb_ckwal` 不负责凭空重建真正缺失的 WAL 段；三路来源都没有可用段时直接报错
 - 已新增并跑通回归：
   - `fb_flashback_keyed`
   - `fb_flashback_bag`
   - `fb_flashback_materialize`
-  - `fb_create_flashback_table`
+  - `pg_flashback`
 - 已完成当前 FPI / replay 热路径的效率检查：
   - FPI 在 `RecordRef` 建立时通过 `RestoreBlockImage()` 提取后即复制进内存
   - replay 阶段通过 `BlockReplayStore` 的内存 hash 维护 block 状态
@@ -142,20 +207,190 @@
 - 已新增开发期接口：
   - `fb_recordref_debug(regclass, timestamptz)`
   - `fb_replay_debug(regclass, timestamptz)`
+- 已实现 `pg_flashback()` 的客户端进度可视化：
+  - 新增 GUC `pg_flashback.show_progress`
+  - 默认 `on`
+  - 固定 `9` 段执行模型
+  - 阶段 `3/4/5/6/7/8/9` 输出百分比
+  - 百分比输出统一按 `20%` 桶节流
+  - 第 `9` 段按结果表写入行数推进百分比
+  - 新增 `fb_progress` 回归覆盖
+  - 非 progress 回归已显式关闭 `show_progress`，避免默认 `NOTICE` 污染既有 expected
+- 已完成速度优先的结果落表基础重构：
+  - `pg_flashback()` 不再走 `tuplestore -> TEMP TABLE` 二次物化
+  - 结果表默认改为 `UNLOGGED heap`
+  - keyed / bag apply 已切到统一 result sink
+  - stage `9` 已改为 apply 末尾直接写结果表
+  - `pg_flashback` 回归已增加 `relpersistence = 'u'` 覆盖
+- 已完成 opt-in 的真并行 apply/write：
+  - 新增 GUC `pg_flashback.parallel_apply_workers`
+  - 默认 `0` 保持当前串行语义
+  - `> 0` 时切到 bgworker 并行 apply/write
+  - 结果表由独立 worker 自主事务创建并提交
+  - apply worker 按 `key_identity` / `row_identity` hash 分区消费 current tuples 与 primitive reverse-op items
+  - stage `8` detail 已增加 `parallel workers=<n>`
+  - stage `9` 已改为聚合 worker 写表进度
+  - 并行路径结果表生命周期已明确独立于调用方事务回滚
+  - 新增 `fb_parallel_apply` 回归覆盖
+- 已确认真并行 apply/write 的两条实现硬约束：
+  - `ParallelContext` / parallel worker 受 PostgreSQL parallel mode 只读限制，不能直接承担结果表写入
+  - 普通 bgworker 无法直接访问 leader 当前事务里新建但未提交的结果表
 - 已删除 `fb_decode_delete_debug` 错误前提链路及其回归
 - 已将 `fb_decode_insert_debug` 熔断为显式占位，避免旧调试路径在新内核下继续误导或触发崩溃
+- 已完成 TOAST 历史值重建基础主链：
+  - TOAST relation 记录已进入同一套页级重放路径
+  - 已建立历史 TOAST chunk store
+  - 主表 row image 生成时，external toast pointer 已重定向到历史 TOAST store
+  - 重建后的历史值改为 inline datum 写回 tuple，不再依赖 `INDIRECT` 指针
+  - 小回归 `fb_toast_flashback` 已覆盖并通过
+- 已完成一轮 TOAST 规模化测试：
+  - 脚本：`tests/deep/sql/80_toast_scale.sql`
+  - 基线：`4000` 行、双 TOAST 列
+  - 工作负载：`UPDATE + DELETE + INSERT + ROLLBACK`
+  - 结果：`truth_count = 4000`、`result_count = 4000`、`diff_count = 0`
+- 已在 TOAST 收尾修复后重新跑通全量回归：
+  - `All 16 tests passed.`
+- 已在 TOAST 收尾修复后再次复跑规模化 TOAST 测试：
+  - 结果仍为 `truth_count = 4000`、`result_count = 4000`、`diff_count = 0`
+- 已将 TOAST 深测参数化为 pilot/full 双模式：
+  - 新增 `tests/deep/bin/run_toast_scale.sh`
+  - `tests/deep/sql/80_toast_scale.sql` 现已支持规模参数注入
+- 已完成 TOAST full 深测执行，并形成正式报告：
+  - `docs/reports/2026-03-23-toast-full-report.md`
+- 已在 TOAST full 深测中额外定位并修复：
+  - deep full 内存上限配置越界
+  - image-only `heap insert` / `heap2 multi_insert` 误要求 block data
+  - `HEAP_LOCK` / `HEAP2_LOCK_UPDATED` / `HEAP2_PRUNE_*` 缺页基线时过于保守的直接报错
+- 已定位并修复两类 TOAST 历史问题：
+  - 旧 TOAST chunk 会在主表 `HOT_UPDATE` 前被删除，需要保留 `retired_chunks`
+  - 规模化 `CTAS` 路径下 `INDIRECT` 指针生命周期脆弱，已改为 inline reconstructed datum
+- 已产出 TOAST 规模化测试报告：
+  - `docs/reports/2026-03-23-toast-scale-report.md`
+- 已修复一类 TOAST finalize 正确性问题：
+  - 主表只更新部分列时，未变更但仍为 live 的 external TOAST datum 可能只被历史 store 部分覆盖
+  - 当前改为：优先使用历史 TOAST store；若 chunk 不全，则按 `toastrelid + valueid` 回退抓取 live TOAST datum
+  - 已将 `fb_toast_flashback` 扩展为“双 TOAST 列、只改一列”的回归并跑通
+- 已按当前验收门槛连续两次复跑 TOAST full：
+  - 命令：`bash tests/deep/bin/bootstrap_env.sh --full && bash tests/deep/bin/run_toast_scale.sh --full`
+  - 两次结果均为：`truth_count = 25000`、`result_count = 25000`、`diff_count = 0`
+  - 这两次 fresh full 均未再出现 `missing FPI`、`missing toast chunk` 或 flashback 阶段 backend OOM blocker
+  - 运行中观测到 flashback 查询 backend RSS 峰值约 `7.2GB ~ 7.4GB`，说明 blocker 已清掉，但内存模型仍需继续收敛
+- 已完成一轮 `valgrind` / `massif` 内存分析，并形成报告：
+  - 报告：`docs/reports/2026-03-23-valgrind-memory-and-wal-coverage-report.md`
+  - `memcheck` 在通过的小 TOAST 场景中未发现扩展侧明确泄漏；唯一 `definitely lost` 为 PostgreSQL 自身 `save_ps_display_args()` 启动期 `184B`
+  - `massif` 显示当前主要不是“泄漏”，而是：
+    - WAL 索引阶段对 `main_data` / `block data` / `FPI image` 的大规模复制
+    - replay 阶段 `heap_copytuple` / `BlockReplayStore` / TOAST chunk store 的峰值工作集
+  - 同时已基于 PG18 头文件与当前 `fb_wal/fb_replay` 分支整理出 WAL record 覆盖矩阵与待办
+ - 已拍板本轮内存优化优先级：
+   - 先做 `RecordRef` payload arena，减少 `main_data / block data / FPI image` 的分散复制开销
+   - 再做 TOAST `retired_chunks` 冷数据落盘，避免历史 chunk 长驻内存
+   - 再去掉 replay -> forward op 之间的重复 `heap_copytuple`
+- 已拍板本轮 heap WAL 收口边界：
+  - `XLOG_HEAP_DELETE` with `XLH_DELETE_IS_SUPER` 纳入 page replay
+  - 但 speculative insert / super delete 不得产出用户可见 `ForwardOp`
+  - `XLOG_HEAP2_NEW_CID` 按 PG18 原生语义归类为“已识别的 redo no-op”，不作为 page mutation 缺口继续追
+- 已完成本轮内存热路径收敛首批实现：
+  - `RecordRef` 的 `main_data / block data / FPI image` 已改为 arena/顺序分配
+  - TOAST `retired_chunks` 已迁到 `runtime/` 冷数据落盘，避免历史 chunk 长驻内存
+  - replay 到 `ForwardOp` 之间的重复 `heap_copytuple` 已去掉
+- 已基于上述内存改动直接复跑 pilot `massif`：
+  - 命令：`su - 18pg -c "valgrind --tool=massif --time-unit=B --pages-as-heap=yes --massif-out-file=/tmp/pg_flashback_valgrind/massif_toast_pilot_after_memfix.out /home/18pg/local/bin/postgres --single -D /tmp/18pgdata_valgrind fb_deep_test < /tmp/pg_flashback_valgrind/massif_toast_pilot_single.sql"`
+  - 本次单机副本 + `massif` 运行已可完整走到结果阶段并以 `0` 退出，不再停在此前的 `failed to replay heap update`
+  - `massif` 峰值从旧样本的约 `837.4MB` 上升到本次的约 `1.769GB`
+  - 这说明本轮改动已经命中真实热路径，但当前端到端峰值并未收敛；更合理的解释是旧样本在更早阶段失败，导致两次峰值并非同深度直接可比
+  - 新样本中 WAL payload 热点已切换到 `fb_payload_arena_alloc() <- fb_copy_bytes()`，说明 arena 路径确实生效；下一步仍需继续压缩 `ForwardOp/ReverseOp/apply` 与 TOAST live store 的工作集
+- 已继续完成第二轮内存热点收敛：
+  - `ForwardOp` / `ReverseOp` / apply 工作集已接入统一 memory limit
+  - keyed 模式不再为 forward row 保留无用的 `row_identity`
+  - bag 模式不再保留无用的 `key_identity`
+  - apply 载入当前表和 reverse stream 时不再额外 `heap_copytuple` / `pstrdup`
+  - `fb_memory_limit` 已新增主链回归，覆盖“`RecordRef` 已过但 apply 仍应被限制”的场景
+- 已基于上述第二轮收敛再次复跑 pilot `massif`：
+  - 命令：`su - 18pg -c "valgrind --tool=massif --time-unit=B --pages-as-heap=yes --massif-out-file=/tmp/pg_flashback_valgrind/massif_toast_pilot_after_applyfix.out /home/18pg/local/bin/postgres --single -D /tmp/18pgdata_valgrind fb_deep_test < /tmp/pg_flashback_valgrind/massif_toast_pilot_single.sql"`
+  - 本次同样完整走到 `count = 4000` 并以 `0` 退出
+  - 峰值已从上一轮的约 `1.769GB` 降到约 `1.231GB`
+  - `fb_row_image_set_identities()` 与 `fb_keyed_upsert_row()` 已不再出现在 peak snapshot 的主要热点里
+  - 当前剩余头部热点已进一步收敛到：
+    - WAL payload arena / `fb_copy_bytes()`
+    - `fb_replay_get_block()` / `BlockReplayStore`
+    - TOAST store 的 `put/sync`
+    - replay 阶段剩余的 `heap_copytuple`
+- 已完成本轮 heap WAL 收口实现：
+  - `XLOG_HEAP_DELETE` with `XLH_DELETE_IS_SUPER` 已纳入 page replay
+  - `XLH_INSERT_IS_SPECULATIVE` / `XLH_DELETE_IS_SUPER` 已排除出用户可见 `ForwardOp`
+  - `XLOG_HEAP2_PRUNE_*` 已从保守 no-op 提升为对后续页状态安全的最小 page mutation
+- 已完成 WAL segment 级并行预扫描首版：
+  - 新增 GUC `pg_flashback.parallel_segment_scan`
+  - 默认 `off`，只有用户显式设置为 `on` 才启用
+  - 首版只并行做 segment 级命中预筛选
+  - 最终 `XLogReader` 解析、时间窗语义与顺序归并仍保持单线程有序执行
+  - 已为 `on/off` 行为补 `fb_wal_scan` 回归，并在隔离 temp-instance 上验证通过
+- 已完成 `pg_flashback.parallel_segment_scan` 三组速度对比：
+  - 基准函数固定为 `fb_scan_wal_debug()`
+  - `large`：`42` segments，`on` 中位数约 `7321ms`，`off` 中位数约 `110ms`
+  - `medium`：`36` segments，`on` 中位数约 `6129ms`，`off` 中位数约 `58ms`
+  - `small`：`34` segments，`on` 中位数约 `6151ms`，`off` 中位数约 `45ms`
+  - 三组结果均显示当前首版并行预筛选显著慢于直接顺序扫描
+  - 详细数据与方法见 `docs/reports/2026-03-24-parallel-segment-scan-benchmark.md`
+- 已完成 `parallel_segment_scan` 性能回归修正：
+  - 正式扫描已不再对全部 segment 细扫；`fb_wal_scan_relation_window()` 会根据预筛选结果只访问命中窗口
+  - 预筛选热路径已从旧的分块逐字节扫描收敛到 `mmap + memmem`
+  - 新增 `DataDir/pg_flashback/meta` 下的 segment prefilter file cache
+  - 新增 backend 内存态 prefilter cache，重复扫描同一组 segment 时不再重复建线程和查 meta 文件
+  - 当前真实 flashback 的 `fb_wal_build_record_index()` 已切到命中窗口访问，不再保守整窗全扫
+- 已用更新后的 `large / medium / small` 三组 snapshot 完成 steady-state 复测：
+  - `large`：`33` segments，`on` 中位数约 `50.954ms`，`off` 中位数约 `111.009ms`
+  - `medium`：`36` segments，`on` 中位数约 `28.102ms`，`off` 中位数约 `68.673ms`
+  - `small`：`34` segments，`on` 中位数约 `38.057ms`，`off` 中位数约 `47.787ms`
+  - 当前 steady-state 三组均已满足 `on < off`
+  - `large` 旧 snapshot 因 `unsafe=storage_change` 早停而失真，已用新的安全 snapshot 替换 benchmark 标记
+- 已将主表 deep `--full` runner 改为 baseline 快照恢复模式：
+  - baseline 只导入一次，完成后创建单份 PGDATA baseline 快照
+  - 后续各 batch 从同一 baseline 快照恢复，而不是重复执行 `load_baseline.sh`
+  - batch 失败时保留 baseline 快照与状态文件，支持再次执行 `--full` 时从未完成 batch 续跑
+  - baseline 快照创建前会检查磁盘水位与可用空间，避免快照本身把文件系统打满
+  - 已新增 shell 级自测 `tests/deep/bin/test_full_snapshot_resume.sh`
 
 ## 进行中
 
+- `P6`：`fb_export_undo`
+- relation 级 `standby lock / relfilenode change` 的专项 unsafe 检测与回归
+- 主表 deep full 的 `parallel_segment_scan on/off` 速度对比：
+  - 基准目标固定为新的 `--full` 语义
+  - 只测主表主链，不混入 TOAST full
+  - 执行时持续监测 `/isoTest`、`/`、`/tmp` 使用率
+  - 采用后台日志与轮询方式，避免终端长时间挂起导致连接丢失
+  - 2026-03-24 追加一次“单表 `10000000` 行 + 目标 WAL `5GB` + `off/on` 各 `3` 轮”试跑
+  - 当前未能形成正式结果，first blocker 不是正确性，而是本机 `/isoTest` 容量不足
+  - 详见：`docs/reports/2026-03-24-main-table-parallel-benchmark-blocker.md`
+  - 当前已复现一个与并行无关的 blocker：
+    - `tests/deep/bin/common.sh` 里 full 模式的 `FB_DEEP_MEMORY_LIMIT_KB=4194303`
+    - 超出 `pg_flashback.memory_limit_kb` 的合法上限 `2097151`
+    - 导致数据库级 GUC 设置时仅报 warning，实际仍退回默认 `65536KB`
+    - `batch_a` validate 因 `pg_flashback memory limit exceeded while tracking FPI image` 失败
+- 重定义 `tests/deep/` 的 `full` 语义：
+  - 删除旧的“超长时间 / 超大 WAL / 尽量一次跑完整套 workload”的 `full` 含义
+  - 新 `full` 固定为“单轮 WAL 预算约 `10GB`”的深测强度档
+  - 保持主表 `keyed/bag` 双表模型与 TOAST 表模型不变
+  - 测试期间实时监测 `/isoTest`、`/`、`/tmp` 使用率
+  - 任一文件系统使用率超过 `85%` 时，立即清理 deep 产物与 `/isoTest/18waldata`，然后 fresh 重跑当前轮次
+  - 每一轮结束后都必须清理本轮 deep 产物与 `/isoTest/18waldata`
+- 按新的验收门槛执行 fresh full 复测：
+  - 主表 deep full 需要连续两轮通过
+  - TOAST full 需要连续两轮通过
+  - 任一轮出现 blocker 时，不停留在报告层，直接沿 blocker 链持续修复直到门槛满足
 - 深度生产化测试 pilot 联调
+- 共享的按-block 更早 FPI 回溯设计与实现
 - 开发期 `ForwardOp` 调试出口重建
 - `fb_export_undo` 已明确延后到当前主线最后实现
 - 按 PG18 源码回补“可能携带 main-fork image / main-data 的 heap/heap2 record 集合”，避免当前只覆盖 `HEAP_LOCK` / `HEAP2_PRUNE_*`
 - 为 batch B 制定分层处理方案：
   - 先补足 record 集
   - 再细化 `missing FPI` 诊断
-  - 最后再评估是否必须进入“更早可恢复锚点搜索”
+  - 已正式拍板进入“共享的按-block 更早 FPI 回溯”
 - 内嵌 `fb_ckwal` + `DataDir/pg_flashback/` 私有目录已完成收口，后续进入恢复算法细化
+- `tests/deep/` 仍残留旧 `ckwal` GUC 时代的脚本约束，需要和当前内嵌恢复模型重新同步
 - 已补记 `ckwal` 当前阶段的明确收口目标：
   - 错配/覆盖的 `pg_wal` 段必须先转换为标准 `ckwal` 结果
   - 转换结果必须在同一轮 resolver 中回灌到当前候选集合
@@ -164,6 +399,66 @@
   - `pg_wal` 错配段现在会先按页头转换为标准 `recovered_wal/<actual-segname>`
   - 转换结果会在同一轮 resolver 中立即作为 `FB_WAL_SOURCE_CKWAL` 候选重新参与组合
   - `fb_wal_source_policy` 已更新为覆盖该路径
+- 已拍板新的页基线修复方向：
+  - 保留 `target_ts` 前最近 checkpoint 作为全局首锚点
+  - 当 replay 发现多个 block 缺页基线时，不逐 block 单独回扫
+  - 改为一次共享的更早 WAL 回扫，为缺基线 block 集查找可用 `FPI/INIT_PAGE`
+  - 该逻辑同时适用于主表与 TOAST relation
+  - 若共享回扫后仍没有可恢复基线，继续明确报 `missing FPI`
+- 已新增“按 block 更早 FPI 回溯”实施计划：
+  - `docs/superpowers/plans/2026-03-23-block-fpi-backtrack-plan.md`
+- 已完成共享的按-block 更早 FPI 回溯首版实现：
+  - discovery pass 会先收集本轮 replay 中全部 `missing FPI` block
+  - 对待补 block 集做一次共享的更早 `RecordRef` 回扫，查找可用 `FPI/INIT_PAGE`
+  - 主表与 TOAST relation 共用同一套补锚逻辑
+  - 最近一次复跑后，全量回归仍为 `All 16 tests passed.`
+- 已新增 residual `missing FPI` 的人工 WAL 链核查任务：
+  - 复现 full 场景中的具体主表 `heap_delete` blocker
+  - 用 `pg_waldump` 人工检查 `checkpoint -> failing record` 之间的真实 WAL 链
+  - 判断中间是否存在可复用 `FPI/INIT_PAGE`
+  - 若存在，定位为何当前 `RecordRef` / shared backtracking 没有找出来
+  - 若不存在，重新审视当前对“无-FPI delete 前应有可恢复页基线”的判断边界
+- 已完成一次人工 `pg_waldump` 核查并拿到结论：
+  - 最新复现场景的失败记录为：
+    - `kind=heap_delete`
+    - `lsn=9/5CA01320`
+    - `rel=1663/194304/1478222`
+    - `blk=45907`
+  - 对应 relation 实际是 `fb_toast_scale_src` 的 TOAST relfilenode，不是主表 relfilenode
+  - `pg_waldump` 显示在这条 `DELETE` 之前、同一 block 上存在：
+    - `rmgr: XLOG`
+    - `lsn=9/5C9FF778`
+    - `desc: FPI_FOR_HINT`
+    - `rel=1663/194304/1478222`
+    - `blk=45907`
+  - 当前 anchor checkpoint 为：
+    - `CHECKPOINT_ONLINE redo 9/27A69860`
+  - 这证明当前 residual blocker 不是“checkpoint 后完全没有可恢复页基线”
+  - 根因已收敛为：
+    - 当前 `RecordRef` / shared backtracking 尚未将 `RM_XLOG_ID` 的 `FPI/FPI_FOR_HINT` 作为目标 relation 的可复用页基线纳入
+- 已拍板下一步修复方向：
+  - 基于 PG18 源码，将 `RM_XLOG_ID` 中会为 relation block 提供页基线的记录纳入 `RecordRef`
+  - 当前明确纳入：
+    - `XLOG_FPI`
+    - `XLOG_FPI_FOR_HINT`
+  - 这类记录只用于建立/推进页基线，不生成 `ForwardOp`
+- 已完成上述接入并重新验证：
+  - `RM_XLOG_ID` 的 `XLOG_FPI` / `XLOG_FPI_FOR_HINT` 已进入 `RecordRef`
+  - replay 已将其作为“只建立页基线、不生成 `ForwardOp`”的记录处理
+  - 全量回归仍为 `All 16 tests passed.`
+  - TOAST full 不再卡在 `missing FPI`
+  - 当前新 blocker 变为：
+    - `WARNING: will not overwrite a used ItemId`
+    - `ERROR: failed to replay heap insert`
+  - 说明修复已把问题从“页基线缺失”推进到“某些 insert replay 在已有页状态上重复插入”
+- 已继续推进 TOAST full 复测并确认：
+  - 旧的 `failed to finalize toast-bearing forward row`
+  - `missing toast chunk ... in historical toast store`
+  - 已不再是 first blocker
+  - 当时 TOAST full 新 blocker 变为：
+    - flashback 阶段 backend 被系统 `OOM killer` 杀死
+    - 内核日志显示被杀 backend RSS 约 `12GB`
+    - 说明当前 `ForwardOp/ReverseOp/apply` 与 TOAST 相关内存在 full 路径上仍有未受控增长
 
 ## 新完成
 
@@ -223,6 +518,132 @@
     - `HEAP_CONFIRM` / `HEAP_INPLACE` / `HEAP2_VISIBLE` / `HEAP2_LOCK_UPDATED` 目前作为“推进页状态但不直接生成 `ForwardOp`”的记录处理
 - 已产出 pilot 报告：
   - `docs/reports/2026-03-23-deep-pilot-report.md`
+- 已新增 TOAST 规模化深测脚本：
+  - `tests/deep/sql/80_toast_scale.sql`
+
+## 最新验证
+
+- `make clean && make install`
+- `su - 18pg -c 'cd /walstorage/pg_flashback && PGPORT=5832 psql postgres -Atqc "drop database if exists contrib_regression;" && rm -rf results regression.out regression.diffs && make installcheck'`
+  - 结果：`All 16 tests passed.`
+- `bash tests/deep/bin/bootstrap_env.sh --pilot && source tests/deep/bin/common.sh && fb_deep_psql_file "$FB_DEEP_SQL_DIR/80_toast_scale.sql"`
+  - 结果：`truth_count = 4000`、`result_count = 4000`、`diff_count = 0`
+- `bash tests/deep/bin/run_toast_scale.sh --pilot`
+  - 结果：`truth_count = 4000`、`result_count = 4000`、`diff_count = 0`
+- `bash tests/deep/bin/bootstrap_env.sh --full && bash tests/deep/bin/run_toast_scale.sh --full`
+  - 连续两次 fresh full 结果均为：`truth_count = 25000`、`result_count = 25000`、`diff_count = 0`
+  - 两次运行都没有 blocker；观测到 flashback 查询 backend RSS 峰值约 `7.2GB ~ 7.4GB`
+- `su - 18pg -c 'cd /walstorage/pg_flashback && PGPORT=5832 rm -rf results regression.out regression.diffs && make installcheck REGRESS=fb_toast_flashback'`
+  - 结果：`All 1 tests passed.`
+- `su - 18pg -c 'cd /walstorage/pg_flashback && PGPORT=5832 rm -rf results regression.out regression.diffs && make installcheck'`
+  - 结果：`All 16 tests passed.`
+- `make clean && make install`
+  - 结果：编译安装通过
+- `bash tests/deep/bin/test_full_snapshot_resume.sh`
+  - 结果：`PASS: full snapshot resume helpers`
+- `bash tests/deep/bin/run_all_deep_tests.sh --full --dry-run`
+  - 结果：输出 `prepare_baseline_snapshot(once) -> restore_snapshot(batch_*)`，已切换到 baseline 快照恢复流程
+- `su - 18pg -c 'cd /walstorage/pg_flashback && PGPORT=5832 rm -rf results regression.out regression.diffs && make installcheck REGRESS="fb_recordref fb_replay fb_toast_flashback"'`
+  - 结果：`All 3 tests passed.`
+- `su - 18pg -c 'cd /walstorage/pg_flashback && PGPORT=5832 rm -rf results regression.out regression.diffs && make installcheck'`
+  - 结果：`All 16 tests passed.`
+- `su - 18pg -c "valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all --suppressions=/home/18pg/postgresql-18.0/src/tools/valgrind.supp /home/18pg/local/bin/postgres --single -D /tmp/18pgdata_valgrind fb_deep_test < /tmp/pg_flashback_valgrind/memcheck_toast_single.sql"`
+  - 结果：未发现扩展侧明确泄漏；`definitely lost = 184B`、`indirectly lost = 752B` 来自 PostgreSQL 启动期 `save_ps_display_args()`
+- `su - 18pg -c "valgrind --tool=massif --time-unit=B --massif-out-file=/tmp/pg_flashback_valgrind/massif_toast_small_heaponly.out /home/18pg/local/bin/postgres --single -D /tmp/18pgdata_valgrind fb_deep_test < /tmp/pg_flashback_valgrind/memcheck_toast_single.sql"`
+  - 结果：通过；heap-only 峰值约 `4.48MB`
+- `su - 18pg -c "valgrind --tool=massif --time-unit=B --pages-as-heap=yes --massif-out-file=/tmp/pg_flashback_valgrind/massif_toast_pilot.out /home/18pg/local/bin/postgres --single -D /tmp/18pgdata_valgrind fb_deep_test < /tmp/pg_flashback_valgrind/massif_toast_pilot_single.sql"`
+  - 结果：在单机副本 + `massif` 环境中推进到 `failed to replay heap update`
+  - 但在失败前已拿到 pilot 规模的峰值占用快照；报告中已将其只作为热点排序证据，不作为正确性通过结论
+
+## 进行中
+
+- 当前产品面收口已拍板，正在执行：
+  - 删除所有与真实 flashback 无关的 debug / 旁路 SQL 入口
+  - 删除对外 `AS t(...)` 形态及相关文档/测试暴露
+  - 并行能力只保留在真实 flashback 主路径中，不再接受“只对 scan/debug 生效”
+- 主表 `parallel_segment_scan on/off` 的真实 flashback 基准仍未完成：
+  - archive 已迁到 `/walstorage/18waldata`
+  - 现成单表夹具 `fb_parallel_speed_final.bench_main` 已满足 `10000000` 行
+  - `target_ts = 2026-03-24 13:09:29.198271+08`
+  - `pg_wal_lsn_diff(current, start_lsn) = 8264334160`，约 `7.70GB`
+  - 但直接执行 `fb_internal_flashback()` 会报：
+    - `fb does not support WAL windows containing storage_change operations`
+  - `fb_scan_wal_debug()` 也已确认：
+    - `unsafe=true`
+    - `reason=storage_change`
+  - 详情见 `docs/reports/2026-03-24-main-table-parallel-benchmark-blocker.md`
+- 用户已放宽本轮验证口径：
+  - 不再要求真实 `fb_internal_flashback()` 路径
+  - 改为“能稳定跑通、可验证并行开关效果、且横跨多个 WAL”的 3 轮对比
+  - 优先复用现成 `fb_parallel_speed_final.bench_main` 窗口跑 `fb_scan_wal_debug()` / `fb_recordref_debug()`
+  - 已完成一轮 `fb_scan_wal_debug()` 基准：
+    - 单表 `bench_main`
+    - `target_ts = 2026-03-24 13:09:29.198271+08`
+    - `WAL diff = 8264566416`，约 `7.70GB`
+    - `off` 三轮：`39010.003ms`、`31259.313ms`、`26449.008ms`
+    - `on` 三轮：`20775.765ms`、`175.014ms`、`209.356ms`
+    - `off` 访问 `1475/1475` segment
+    - `on` 命中 `734/1475`，访问 `737/1475` segment
+  - 结果已记入 `docs/reports/2026-03-24-main-table-parallel-scan-debug-benchmark.md`
+- 用户随后再次收紧要求：
+  - 必须看真实闪回结果，不接受只测 `fb_scan_wal_debug()`
+  - 因此下一轮将单独构造“无 `storage_change`、跨多个 WAL、可稳定执行 `fb_internal_flashback()`”的安全单表场景
+  - 当前已验证到的最保守结果是：
+    - `fb_parallel_flashback_update_only`
+      - 目标表仅做普通 `UPDATE`
+      - `WAL diff = 826463568`
+      - 真实 `fb_internal_flashback()` 仍报 `storage_change`
+    - `fb_parallel_flashback_noise_only`
+      - 目标表 `bench_target` 在 `target_ts` 后完全不变
+      - 仅由独立噪声表制造 `WAL diff = 409213208`
+      - 真实 `fb_internal_flashback('bench_target', target_ts)` 仍报 `storage_change`
+  - 这说明当前版本对“多 WAL 真实 flashback”仍有实现级 blocker，不是单纯 workload 选型问题
+- 最新内核级定位已确认 blocker 根因：
+  - `gdb` 断点命中 `src/fb_wal.c:2452`
+    - 即 `fb_index_record_visitor()` 的 `RM_STANDBY_ID` -> `fb_mark_unsafe(... STORAGE_CHANGE)` 路径
+    - 命中的实际 WAL 记录是目标表最初建表时的：
+      - `Standby LOCK xid 24370 db 3450922 rel 3450949`
+      - `Storage CREATE base/3450922/3450949`
+    - 这两条记录的 LSN 为：
+      - `5F/0D989960`
+    - `5F/0D989990`
+    - 而当前场景 `start_lsn = 5F/1BA70910`
+    - 即：真正触发 unsafe 的是 `target_ts` 之前、checkpoint anchor 回看区间里的建表记录，而不是 `target_ts -> now` 窗口内的新 storage change
+- 该问题已完成修复：
+  - `RM_STANDBY_ID` 命中 relation 时，不再立刻 `fb_mark_unsafe()`
+  - 改为和 `RM_SMGR_ID` 一样，先记录到 `unsafe_xids`
+  - 只在后续 `XLOG_XACT_COMMIT*` 且 `commit_ts > target_ts` 时再真正落 `unsafe`
+  - 新增回归：
+    - `fb_flashback_storage_boundary`
+    - 覆盖“target 前建表、target 后只有噪声 WAL，不应误报 storage_change”
+  - 验证结果：
+    - 新回归从红变绿
+    - 全量回归 `All 17 tests passed.`
+    - 真实场景 `fb_parallel_flashback_noise_only` 已不再报 `storage_change`
+    - 在补回 `SET pg_flashback.memory_limit_kb = '2097151'` 后，`fb_internal_flashback('bench_target', target_ts)` 返回：
+      - `count(*) = 100000`
+      - `sum(v_int) = 5000050000`
+- 当前正在基于已跑通的真实场景 `fb_parallel_flashback_noise_only` 做手工查询性能对比：
+  - 对同一条 `fb_internal_flashback('bench_target', '2026-03-24 14:21:05.452926+08')`
+  - 比较 `pg_flashback.parallel_segment_scan = off/on`
+  - 目标是给出真实查询速率差异，而不是 scan/debug 摘要
+  - 已完成 3 轮真实查询计时：
+    - `off`：`91.30s`、`98.14s`、`91.89s`
+    - `on`：`123.65s`、`118.94s`、`118.84s`
+  - 当前内核级结论是：
+    - `parallel_segment_scan` 在真实 flashback 路径上仍然更慢
+    - 根因不是“并行没开”，而是“真实 flashback 没有复用 scan/debug 的命中窗口跳段”
+    - `fb_wal_build_record_index()` 当前在 `src/fb_wal.c:2639-2640`：
+      - 只做 `fb_prepare_segment_prefilter(info, ctx);`
+      - 随后直接 `fb_wal_visit_records(ctx, fb_index_record_visitor, &state);`
+    - 这意味着真实路径仍然对 `start_lsn -> end_lsn` 整窗调用 `fb_wal_visit_window()`
+    - `segment_hit_map` 只会让 visitor 在 miss segment 上少做目标 DML 提取，但不会阻止 `XLogReadRecord()` 继续把该 segment 全部读出来
+    - 代码证据：
+      - `src/fb_wal.c:2454-2466`
+      - `src/fb_wal.c:2470-2538`
+      - `src/fb_wal.c:2639-2640`
+      - `src/fb_wal.c:2268-2310`
+
 ## 下一步
 
 - 解决 pilot 批次 B 的页基线 blocker
@@ -230,28 +651,40 @@
   - 锚点不足
   - 相关 record 已在 PG18 中存在但未被索引
   - 相关 record 已被索引但当前最小 replay 仍不足以维持页状态
-- 在 pilot 全通过后再决定是否直接进入 full 模式
-- 重新引入稳定的 `fb_decode_insert_debug` / reverse-op 调试出口
+- 为 speculative abort 场景补稳定的 isolation/regress 覆盖，避免 `XLH_INSERT_IS_SPECULATIVE` / `XLH_DELETE_IS_SUPER` 后续回退
 - 在现有 `ReverseOp` 主链之上接入 `fb_export_undo`
-- 覆盖 TOAST 与主键变更场景
-- 在当前双来源解析上补齐：
-  - 内嵌 `fb_ckwal` 的真实恢复逻辑
-  - 扩展私有目录初始化与生命周期
+- 保持 TOAST full 的稳定性：
+  - 当前已连续两次 fresh full 无 blocker
+  - 但 flashback 查询 RSS 仍可到约 `7.4GB`
+  - 后续继续补齐 `ForwardOp/ReverseOp/apply` 与 TOAST 内存限制/收敛，避免 full 再次回退成资源型 blocker
+- 按内存分析报告推进优化：
+  - 优先减少 WAL 索引阶段对 `main_data` / `block data` / `FPI image` 的全量复制
+  - 再收敛 replay 阶段 `heap_copytuple`、`ForwardOp/ReverseOp` 与 TOAST chunk store 的峰值驻留
+- 重做 `parallel_segment_scan` 的性能模型：
+  - 当前首版三组基准均显著退化
+  - 需要引入启用阈值或改成更轻量的 segment 元数据筛选
+- 继续定位主表 `10M + 7.7GB WAL` 现成夹具中的 `storage_change` 来源，优先确认能否在不重造数的前提下改用同库内更晚的安全 `target_ts`
+- 若现成窗口没有安全 `target_ts`，再重做不含 `storage_change` 的主表真实 flashback 基准
+- 按 WAL record 覆盖矩阵推进剩余接入：
+  - relation 级 `standby lock / relfilenode change` 的专项 unsafe 检测与回归
+- 当前 TOAST 深测运维约束已固定：
+  - 每次完成 TOAST 测试后，手动清空 `/isoTest/18waldata`
+- 覆盖主键变更场景
+- 继续收敛双来源解析的边界行为与诊断信息：
+  - 内嵌 `fb_ckwal` 的识别/校正/复制路径继续增强
   - 更细的 overlap/source 决策调试信息
   - 被覆盖 WAL 的恢复策略细化（参考 `/root/xman` 的 `ckwal`）
-- 为当前热路径增加内存统计与上限校验
-- 增加低内存上限触发失败的回归测试
 
 ## 当前风险
 
 - 本机默认 `pg_config` 指向 PG12，非 PG18
 - 本机默认 `psql` 为 PG10，不能代表最终目标环境
-- 当前 replay 内核只覆盖普通 heap `insert/delete/update`，`multi_insert` 仍未接入
-- `fb_decode_insert_debug` 仍为占位；此前 materialize/标量 SRF 路径会触发 backend crash，需单独重建
-- TOAST 的页级重放与逻辑值还原仍在后续阶段
-- 开发期 `fb_scan_wal_debug()` 只暴露稳定的扫描摘要，不暴露最终 reverse-op 细节
-- 当前 `ckwal` 已完成运行时目录契约、内嵌接口层、错配段转换回灌与 resolver 接入；完整缺失段重建算法仍未完成，遇到真正缺失且无法从 `archive_dest` / `pg_wal` / `recovered_wal` 取回的段，仍会报错
+- 当前 replay 内核已覆盖普通 heap `insert/delete/update` 和 `HEAP2_MULTI_INSERT`，`HEAP_LOCK` / `HEAP2_PRUNE_*` 已从纯 no-op 提升到“对页状态安全的最小 replay”，但仍未达到 PG 原生同等语义
+- 仓库里仍留有若干旧调试 SQL/历史测试文件，但安装脚本和对外用户面已经不再暴露对应入口；文档若引用这些名字，需要区分“历史文件”与“当前产品面”
+- TOAST 基础主链已可用，但 TOAST store 内存尚未纳入 `memory_limit_kb`
+- 当前 `ckwal` 已完成运行时目录契约、内嵌接口层、错配段转换回灌与 resolver 接入；能力边界已明确为“识别/校正/复制已有可用段”，当 `archive_dest` / `pg_wal` / `recovered_wal` 都拿不到可用段时直接报错
 - 当前页级重放锚点仍固定为 `target_ts` 前最近 checkpoint；尚未实现“更早的可恢复锚点搜索”
+- 共享的按-block 更早 FPI 回溯已落地，但 full 深测下仍存在 residual main-table `heap_delete` `missing FPI`
 - 当前 `RecordRef`、`FPI`、`block data`、`main data` 都常驻当前查询内存上下文；虽然已有硬上限，但仍无 spill / eviction 策略
 - 深度生产化测试已经进入 pilot 执行，但批次 B 已证实当前“最近 checkpoint 锚点”策略并不充分：
   - 存在 block 在 anchor 后首条相关记录为 `PRUNE_VACUUM_CLEANUP` / `VISIBLE` 之类无 FPI/INIT 记录
@@ -261,3 +694,4 @@
   - 当前已不再只停在 `HEAP_LOCK` / `HEAP2_PRUNE_*`
   - 但 `HEAP_LOCK` / `HEAP2_PRUNE_*` 仍是保守路径，尚未全部提升到 PG 原生同等语义
   - batch B 后续仍需先排除“页状态推进不足”，再判断是否必须进入“更早锚点搜索”
+- 2026-03-23: TOAST full current first blocker is `missing toast chunk` after the earlier main-fork `RM_XLOG_ID` FPI fix. The working hypothesis is that TOAST pages restored by image-applied `heap_insert` / `heap2_multi_insert` / new-page-image-only `heap_update` are not fully synchronized into the historical toast store; only the current offnum is captured, so later reconstruction can miss sibling chunks already present on the restored page.

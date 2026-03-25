@@ -13,6 +13,7 @@ fb_deep_psql_file "$FB_DEEP_SQL_DIR/50_batch_c_bag_workload.sql" \
 	"ckwal_dir=$FB_DEEP_CKWAL_DIR" \
 	"row_count=$FB_DEEP_ROW_COUNT" \
 	"distinct_count=$FB_DEEP_BAG_DISTINCT" \
+	"op_distinct_count=$FB_DEEP_OPERATION_BUCKET_COUNT" \
 	"insert_count=$FB_DEEP_INSERT_COUNT"
 fb_deep_refresh_archive_fixture
 fb_deep_psql_file "$FB_DEEP_SQL_DIR/51_batch_c_bag_validate.sql" \

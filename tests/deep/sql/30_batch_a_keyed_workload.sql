@@ -3,6 +3,7 @@ CREATE EXTENSION IF NOT EXISTS pg_flashback;
 SET pg_flashback.archive_dest = :'archive_dest';
 SET pg_flashback.ckwal_restore_dir = :'ckwal_dir';
 SELECT set_config('fb_deep.row_count', :'row_count', false);
+SELECT set_config('fb_deep.op_row_count', :'op_row_count', false);
 SELECT set_config('fb_deep.insert_count', :'insert_count', false);
 
 BEGIN;
@@ -14,13 +15,13 @@ UPDATE fb_deep_keyed_01
        c05 = c05 + interval '5 minutes',
        c06 = 'UPD_A01_____'
  WHERE id % 3 = 0
-   AND id <= :row_count;
+   AND id <= :op_row_count;
 COMMIT;
 
 BEGIN;
 DELETE FROM fb_deep_keyed_01
  WHERE id % 11 = 0
-   AND id <= :row_count;
+   AND id <= :op_row_count;
 COMMIT;
 
 DO $$
@@ -54,5 +55,5 @@ UPDATE fb_deep_keyed_01
    SET c01 = c01 - 5,
        c06 = 'ROLLBACK____'
  WHERE id % 19 = 0
-   AND id <= :row_count;
+   AND id <= :op_row_count;
 ROLLBACK;

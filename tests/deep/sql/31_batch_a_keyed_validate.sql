@@ -3,7 +3,7 @@ CREATE EXTENSION IF NOT EXISTS pg_flashback;
 SET pg_flashback.archive_dest = :'archive_dest';
 SET pg_flashback.ckwal_restore_dir = :'ckwal_dir';
 
-SELECT fb_create_flashback_table(
+SELECT pg_flashback(
 	:'result_table',
 	:'source_table',
 	(SELECT target_ts::text FROM fb_deep_markers WHERE label = :'marker_label')

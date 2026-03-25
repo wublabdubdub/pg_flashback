@@ -16,5 +16,7 @@ BEGIN
 	EXECUTE format('create table %I as table %I',
 				   current_setting('fb_deep.truth_table'),
 				   current_setting('fb_deep.source_table'));
+	EXECUTE format('alter table %I set (autovacuum_enabled = false, toast.autovacuum_enabled = false)',
+				   current_setting('fb_deep.truth_table'));
 END;
 $$;

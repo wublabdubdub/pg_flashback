@@ -15,6 +15,9 @@ static char *fb_archive_dir = NULL;
 static char *fb_archive_dest = NULL;
 static char *fb_debug_pg_wal_dir = NULL;
 static int fb_memory_limit_kb = 65536;
+static bool fb_parallel_segment_scan = false;
+static bool fb_show_progress = true;
+static int fb_parallel_apply_workers_count = 0;
 
 PGDLLEXPORT void _PG_init(void);
 
@@ -61,6 +64,41 @@ _PG_init(void)
 							65536,
 							1,
 							INT_MAX / 1024,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomBoolVariable("pg_flashback.parallel_segment_scan",
+							 "Enable segment-level parallel prefiltering before ordered WAL parsing.",
+							 "When on, pg_flashback performs a conservative segment hit prefilter before the final ordered XLogReader pass.",
+							 &fb_parallel_segment_scan,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("pg_flashback.show_progress",
+							 "Show pg_flashback stage progress via NOTICE messages.",
+							 "When on, pg_flashback emits client-visible stage progress and percentages for long-running flashback steps.",
+							 &fb_show_progress,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomIntVariable("pg_flashback.parallel_apply_workers",
+							"Enable opt-in background-worker parallel apply/write for pg_flashback.",
+							"When greater than zero, pg_flashback uses autonomous background workers to create and fill the result table in parallel; the result table no longer rolls back with the caller transaction.",
+							&fb_parallel_apply_workers_count,
+							0,
+							0,
+							32,
 							PGC_USERSET,
 							0,
 							NULL,
@@ -151,4 +189,22 @@ uint64
 fb_get_memory_limit_bytes(void)
 {
 	return (uint64) fb_memory_limit_kb * (uint64) 1024;
+}
+
+bool
+fb_parallel_segment_scan_enabled(void)
+{
+	return fb_parallel_segment_scan;
+}
+
+bool
+fb_show_progress_enabled(void)
+{
+	return fb_show_progress;
+}
+
+int
+fb_parallel_apply_workers(void)
+{
+	return fb_parallel_apply_workers_count;
 }

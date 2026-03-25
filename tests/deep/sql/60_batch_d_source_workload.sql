@@ -2,11 +2,12 @@
 CREATE EXTENSION IF NOT EXISTS pg_flashback;
 SET pg_flashback.archive_dest = :'archive_dest';
 SET pg_flashback.ckwal_restore_dir = :'ckwal_dir';
+SELECT set_config('fb_deep.op_row_count', :'op_row_count', false);
 
 BEGIN;
 UPDATE fb_deep_keyed_01
    SET c01 = c01 + 700,
        c06 = 'SRC_D01_____'
  WHERE id % 7 = 0
-   AND id <= :row_count;
+   AND id <= :op_row_count;
 COMMIT;

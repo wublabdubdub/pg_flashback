@@ -3,6 +3,7 @@ CREATE EXTENSION IF NOT EXISTS pg_flashback;
 SET pg_flashback.archive_dest = :'archive_dest';
 SET pg_flashback.ckwal_restore_dir = :'ckwal_dir';
 SELECT set_config('fb_deep.distinct_count', :'distinct_count', false);
+SELECT set_config('fb_deep.op_distinct_count', :'op_distinct_count', false);
 SELECT set_config('fb_deep.insert_count', :'insert_count', false);
 
 BEGIN;
@@ -12,12 +13,14 @@ UPDATE fb_deep_bag_01
        c03 = c03 + 0.55,
        c04 = NOT c04,
        c06 = 'UPD_C01_____'
- WHERE bucket % 4 = 0;
+ WHERE bucket % 4 = 0
+   AND bucket < :op_distinct_count;
 COMMIT;
 
 BEGIN;
 DELETE FROM fb_deep_bag_01
- WHERE bucket % 13 = 0;
+ WHERE bucket % 13 = 0
+   AND bucket < :op_distinct_count;
 COMMIT;
 
 DO $$
@@ -50,5 +53,6 @@ BEGIN;
 UPDATE fb_deep_bag_01
    SET c02 = c02 + 1,
        c06 = 'ROLL_C_____'
- WHERE bucket % 17 = 0;
+ WHERE bucket % 17 = 0
+   AND bucket < :op_distinct_count;
 ROLLBACK;

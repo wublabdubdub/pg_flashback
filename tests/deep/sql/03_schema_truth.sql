@@ -11,3 +11,5 @@ CREATE TABLE fb_deep_markers (
 	truth_table text NOT NULL,
 	created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
+
+ALTER TABLE fb_deep_markers SET (autovacuum_enabled = false);

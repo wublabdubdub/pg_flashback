@@ -1,4 +1,4 @@
-# ADR-0003: 最终用户入口采用创建临时结果表
+# ADR-0003: 最终用户入口采用 `pg_flashback()` 返回结果表名
 
 ## 状态
 
@@ -9,7 +9,7 @@ Accepted
 用户态主入口定为：
 
 ```sql
-SELECT fb_create_flashback_table(
+SELECT pg_flashback(
   'fb1',
   'public.t1',
   '2026-03-22 10:00:00+08'
@@ -18,39 +18,31 @@ SELECT fb_create_flashback_table(
 SELECT * FROM fb1;
 ```
 
-同时保留：
-
-- `pg_flashback(regclass, timestamptz)` 作为底层 `SRF`
-- `fb_flashback_materialize(regclass, timestamptz, text)` 作为中间层 helper
-
-三者职责固定如下：
-
-- `fb_create_flashback_table(text, text, text)`
+- `pg_flashback(text, text, text)`
   - 主用户入口
   - 纯文本参数
   - 自动解析表名和时间
   - 自动从数据字典生成列定义
-  - 创建 `TEMP TABLE`
-- `fb_flashback_materialize(regclass, timestamptz, text)`
-  - 面向熟悉 PostgreSQL 类型系统的高级用户或测试
-  - 仍然自动生成列定义
-- `pg_flashback(regclass, timestamptz)`
-  - 保留为底层能力
-  - 主要供内部调用、调试、测试和高级场景使用
-  - 不再作为首推用户入口
+  - 默认创建 `UNLOGGED` 结果表
+  - 默认走当前 backend 内串行 apply/write
+  - 显式设置 `pg_flashback.parallel_apply_workers > 0` 后，可切到 bgworker 并行 apply/write
+  - 不保留 `fb_create_flashback_table(text, text, text)` 兼容别名
 
 ## 原因
 
-- PostgreSQL 无法对运行时决定列结构的 `SETOF record` 自动展开 `SELECT *`
-- `fb_create_flashback_table()` 能消除：
+- `pg_flashback()` 能消除：
   - `::regclass`
   - `::timestamptz`
-  - `AS t(...)`
-- `TEMP TABLE` 结果最符合“闪回后直接查”的使用习惯
-- 保留底层 `SRF` 仍然有利于回归测试、内核验证和高级调试
+- 用户不应接触内部 `SETOF record` / `AS t(...)` 形态
+- 开发期 debug/旁路 SQL 入口会稀释产品边界，也会误导性能判断
+- 结果直接落表并返回表名，仍然保留“先调用，再查询结果表”的使用习惯
+- 默认 `UNLOGGED` 结果表比旧的 `tuplestore -> TEMP TABLE` 路径更符合当前速度优先目标
+- 并行 apply/write 只能安全落在共享 `UNLOGGED` 结果表上，不能继续要求 `TEMP TABLE` 语义
+- 若显式开启并行路径，结果表由独立 worker 自主事务创建并提交，因此不再跟随调用方事务回滚
 
 ## 明确不做
 
-- 不把 `pg_flashback(regclass, timestamptz)` 改造成唯一用户入口
+- 不对用户暴露内部 `SETOF record` / `AS t(...)` 形态
+- 不把开发期 debug/旁路 SQL 入口保留为产品能力
 - 不为首版引入解析器级语法扩展
 - 不自动覆盖已存在的目标结果表

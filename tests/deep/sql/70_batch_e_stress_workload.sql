@@ -3,6 +3,7 @@ CREATE EXTENSION IF NOT EXISTS pg_flashback;
 SET pg_flashback.archive_dest = :'archive_dest';
 SET pg_flashback.ckwal_restore_dir = :'ckwal_dir';
 SELECT set_config('fb_deep.row_count', :'row_count', false);
+SELECT set_config('fb_deep.op_row_count', :'op_row_count', false);
 SELECT set_config('fb_deep.insert_count', :'insert_count', false);
 SELECT set_config('fb_deep.stress_rounds', :'stress_rounds', false);
 
@@ -26,12 +27,12 @@ BEGIN
 			i,
 			rpad('STRESS' || i::text, 12, '_'),
 			i % 5,
-			current_setting('fb_deep.row_count'));
+			current_setting('fb_deep.op_row_count'));
 
 		EXECUTE format(
 			'delete from fb_deep_keyed_01 where id %% 31 = %s and id <= %s',
 			i % 31,
-			current_setting('fb_deep.row_count'));
+			current_setting('fb_deep.op_row_count'));
 
 		select_list := 'g';
 		FOR colno IN 1..63 LOOP

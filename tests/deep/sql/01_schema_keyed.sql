@@ -24,5 +24,6 @@ BEGIN
 	END LOOP;
 
 	EXECUTE format('create table fb_deep_keyed_01 (%s)', cols);
+	EXECUTE 'alter table fb_deep_keyed_01 set (autovacuum_enabled = false, toast.autovacuum_enabled = false)';
 END;
 $$;

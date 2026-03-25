@@ -12,6 +12,18 @@
 
 因此需要把“缺失/错配 WAL 恢复”收回到扩展内部。
 
+当前代码已完成其中一部分：
+
+- 已移除用户侧 `ckwal` GUC
+- 已自动初始化 `DataDir/pg_flashback/{runtime,recovered_wal,meta}`
+- 已实现对可信 segment 的复制/复用
+- 已实现对错配 `pg_wal` 段按页头识别实际 timeline/segno 后的转换与回灌
+
+当前仍未完成的是：
+
+- 对识别、校正、复制、回灌路径继续增强
+- 当 `archive_dest` / `pg_wal` / `recovered_wal` 都没有可直接复制的可信源时，直接报 `WAL not complete`
+
 ## 目标
 
 将 `/root/xman` 中 `ckwal` 的核心思路内嵌进 `pg_flashback`，形成以下产品语义：
@@ -19,7 +31,7 @@
 - 用户只需要关心 `archive_dest`
 - 用户不再配置任何 `ckwal` 相关参数
 - `CREATE EXTENSION pg_flashback` 时自动初始化扩展私有工作目录
-- 运行时若发现 `pg_wal` segment 错配或被覆盖，扩展自动恢复所需 segment
+- 运行时若发现 `pg_wal` segment 错配或被覆盖，扩展自动校正或提取仍可用的 segment
 - 恢复出的 segment 进入扩展私有目录，再继续后续 WAL 回放
 
 ## 非目标
@@ -58,13 +70,13 @@ DataDir/pg_flashback/
 
 ### 2. 创建时机
 
-在 `CREATE EXTENSION pg_flashback` 时立即：
+当前代码是在扩展库加载时立即：
 
 - 创建 `DataDir/pg_flashback/`
 - 创建三个子目录
 - 校验存在性与可写性
 
-若失败，`CREATE EXTENSION` 直接失败。
+若失败，扩展初始化直接失败。
 
 这样可以尽早暴露权限或路径问题，而不是等到第一次 flashback 查询时再失败。
 
@@ -91,7 +103,7 @@ DataDir/pg_flashback/
 - 并入当前查询的 `resolved_segments`
 - 后续继续 WAL 扫描和回放
 
-只有在恢复仍失败时，才报真正的：
+只有在三处都拿不到可用段、校正/复制仍失败时，才报真正的：
 
 - `WAL not complete`
 
@@ -160,7 +172,7 @@ DataDir/pg_flashback/
 
 一次查询的相关流程变为：
 
-1. 用户调用 `fb_create_flashback_table()` 或底层 `pg_flashback()`
+1. 用户调用 `pg_flashback()`
 2. resolver 收集 `archive_dest + pg_wal`
 3. 对 `pg_wal` segment 做 header / `pageaddr` / timeline 校验
 4. 若发现 mismatch / recycled：
@@ -215,4 +227,4 @@ DataDir/pg_flashback/
 2. GUC 收缩，去除用户侧 `ckwal` 参数
 3. 内嵌 `fb_ckwal` 接口骨架
 4. `fb_wal` 切换到内嵌恢复
-5. 再移植 `/root/xman` 的核心恢复逻辑
+5. 再移植 `/root/xman` 的核心识别/校正思路，增强已有可用段的自动恢复

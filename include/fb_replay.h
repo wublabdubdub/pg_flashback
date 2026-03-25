@@ -27,6 +27,5 @@ void fb_replay_build_forward_ops(const FbRelationInfo *info,
 								 TupleDesc tupdesc,
 								 FbReplayResult *result,
 								 FbForwardOpStream *stream);
-char *fb_replay_debug_summary(const FbReplayResult *result);
 
 #endif

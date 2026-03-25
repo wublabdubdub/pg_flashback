@@ -4,9 +4,7 @@ SET pg_flashback.archive_dest = :'archive_dest';
 SET pg_flashback.ckwal_restore_dir = :'ckwal_dir';
 SET pg_flashback.debug_pg_wal_dir = :'debug_pg_wal_dir';
 
-SELECT fb_wal_source_debug();
-
-SELECT fb_create_flashback_table(
+SELECT pg_flashback(
 	:'result_table',
 	:'source_table',
 	(SELECT target_ts::text FROM fb_deep_markers WHERE label = :'marker_label')

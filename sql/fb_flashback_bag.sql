@@ -6,6 +6,7 @@ BEGIN
 END;
 $$;
 CREATE EXTENSION pg_flashback;
+SET pg_flashback.show_progress = off;
 
 DO $$
 BEGIN
@@ -40,9 +41,12 @@ WHERE ctid = (
 	LIMIT 1
 );
 
+SELECT pg_flashback(
+	'fb_flashback_bag_result',
+	'fb_flashback_bag_target',
+	(SELECT target_ts::text FROM fb_flashback_bag_mark)
+);
+
 SELECT *
-FROM pg_flashback(
-	'fb_flashback_bag_target'::regclass,
-	(SELECT target_ts FROM fb_flashback_bag_mark)
-) AS t(id integer, payload text)
+FROM fb_flashback_bag_result
 ORDER BY 1, 2;

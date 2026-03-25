@@ -56,6 +56,8 @@ typedef struct FbForwardOpStream
 	FbForwardOp *ops;
 	uint32 count;
 	uint32 capacity;
+	uint64 tracked_bytes;
+	uint64 memory_limit_bytes;
 } FbForwardOpStream;
 
 typedef struct FbReverseOpStream
@@ -63,6 +65,8 @@ typedef struct FbReverseOpStream
 	FbReverseOp *ops;
 	uint32 count;
 	uint32 capacity;
+	uint64 tracked_bytes;
+	uint64 memory_limit_bytes;
 } FbReverseOpStream;
 
 void fb_build_forward_ops(const FbRelationInfo *info,

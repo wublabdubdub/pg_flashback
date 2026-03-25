@@ -20,7 +20,8 @@
 - 时间窗内 DDL / rewrite 直接报错
 - TOAST 首版支持，重建失败直接报错
 - 开发阶段文档用中文，代码标识符用英文
-- 函数名前缀统一用 `fb`
+- 代码与内部标识符前缀统一用 `fb`
+- 公开用户 SQL 主入口保留为 `pg_flashback(...)`
 
 ## 总体架构
 
@@ -28,8 +29,7 @@
 
 对外暴露 SQL 接口：
 
-- `pg_flashback(regclass, timestamptz)`：返回历史结果集
-- `fb_flashback_materialize(regclass, timestamptz, text)`：自动从数据字典生成列定义并物化临时结果表
+- `pg_flashback(text, text, text)`：自动从数据字典生成列定义并创建速度优先的历史结果表
 - `fb_export_undo(regclass, timestamptz)`：导出 undo SQL / reverse op
 - `fb_version()`：返回扩展版本
 
@@ -60,14 +60,14 @@
 当前已经确认：
 
 - 仅凭 `pg_flashback(regclass, timestamptz)` 这一类动态 `SETOF record` 函数，无法让 PostgreSQL 解析器在 `SELECT * FROM pg_flashback(...)` 时自动推断表结构
-- 因此当前阶段的免列定义方案不是“修改同一个 SRF 的返回方式”，而是新增：
-  - `fb_flashback_materialize(regclass, timestamptz, text)`
+- 因此当前阶段的免列定义方案不是继续公开该 SRF，而是改为文本参数入口：
+  - `pg_flashback(text, text, text)`
   - 由它从数据字典提取列定义并创建临时表
 
 新增已拍板用户接口：
 
 ```sql
-SELECT fb_create_flashback_table(
+SELECT pg_flashback(
   'fb1',
   'fb_live_minute_test',
   '2026-03-23 08:09:30.676307+08'
@@ -79,14 +79,17 @@ SELECT * FROM fb1;
 其设计约束为：
 
 - 参数全部为 `text`
-- 默认创建 `TEMP TABLE`
+- 默认创建 `UNLOGGED` 结果表
+- 默认仍走当前 backend 内的串行直写
+- 若显式设置 `pg_flashback.parallel_apply_workers > 0`，则切到 bgworker 并行 apply/write
+- 并行路径下结果表由独立 worker 事务创建并提交，不再跟随调用方事务回滚
 - 目标表已存在时直接报错
 
 最终用户接口分层也已拍板：
 
-- 主用户入口：`fb_create_flashback_table(text, text, text)`
-- 中间层 helper：`fb_flashback_materialize(regclass, timestamptz, text)`
-- 底层能力：`pg_flashback(regclass, timestamptz)`
+- 主用户入口：`pg_flashback(text, text, text)`
+- `fb_flashback_materialize(regclass, timestamptz, text)` / `fb_internal_flashback(regclass, timestamptz)` 当前不对外安装
+- `pg_flashback(regclass, timestamptz)` 不再作为公开用户入口
 
 ## keyed 模式
 

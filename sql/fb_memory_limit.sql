@@ -6,6 +6,7 @@ BEGIN
 END;
 $$;
 CREATE EXTENSION pg_flashback;
+SET pg_flashback.show_progress = off;
 
 DO $$
 BEGIN
@@ -34,7 +35,39 @@ INSERT INTO fb_memory_limit_target VALUES (1, 'alpha');
 UPDATE fb_memory_limit_target SET payload = 'alpha-updated' WHERE id = 1;
 DELETE FROM fb_memory_limit_target WHERE id = 0;
 
-SELECT fb_recordref_debug(
-	'fb_memory_limit_target'::regclass,
-	(SELECT target_ts FROM fb_memory_limit_mark)
+SELECT pg_flashback(
+	'fb_memory_limit_result',
+	'fb_memory_limit_target',
+	(SELECT target_ts::text FROM fb_memory_limit_mark)
+);
+
+SET pg_flashback.memory_limit_kb = 2048;
+
+CREATE TABLE fb_memory_limit_apply_target (
+	id integer PRIMARY KEY,
+	payload text
+);
+
+INSERT INTO fb_memory_limit_apply_target
+SELECT i, repeat(md5(i::text), 8)
+FROM generate_series(1, 4000) AS g(i);
+
+CHECKPOINT;
+
+CREATE TABLE fb_memory_limit_apply_mark (
+	target_ts timestamptz NOT NULL
+);
+
+INSERT INTO fb_memory_limit_apply_mark VALUES (clock_timestamp());
+
+UPDATE fb_memory_limit_apply_target
+SET payload = payload || 'x'
+WHERE id = 1;
+
+SET client_min_messages = warning;
+
+SELECT pg_flashback(
+	'fb_memory_limit_apply_result',
+	'fb_memory_limit_apply_target',
+	(SELECT target_ts::text FROM fb_memory_limit_apply_mark)
 );
