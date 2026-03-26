@@ -1,8 +1,18 @@
+/*
+ * fb_error.c
+ *    Shared error reporting helpers.
+ */
+
 #include "postgres.h"
 
 #include "utils/elog.h"
 
 #include "fb_error.h"
+
+/*
+ * fb_raise_not_implemented
+ *    Error entry point.
+ */
 
 void
 fb_raise_not_implemented(const char *feature_name)
@@ -11,6 +21,11 @@ fb_raise_not_implemented(const char *feature_name)
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("%s is not implemented yet", feature_name)));
 }
+
+/*
+ * fb_raise_unsupported_relation
+ *    Error entry point.
+ */
 
 void
 fb_raise_unsupported_relation(const char *reason)

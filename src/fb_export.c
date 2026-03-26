@@ -1,3 +1,8 @@
+/*
+ * fb_export.c
+ *    Undo export support.
+ */
+
 #include "postgres.h"
 
 /*

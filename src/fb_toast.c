@@ -1,28 +1,59 @@
+/*
+ * fb_toast.c
+ *    Historical TOAST reconstruction.
+ */
+
 #include "postgres.h"
 
 #include <unistd.h>
 
-#include "access/detoast.h"
 #include "access/genam.h"
 #include "access/sdir.h"
 #include "access/stratnum.h"
 #include "access/table.h"
+#if PG_VERSION_NUM >= 130000
+#include "access/detoast.h"
 #include "access/toast_internals.h"
+#else
+#include "access/tuptoaster.h"
+#endif
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#if PG_VERSION_NUM >= 170000
 #include "utils/wait_event_types.h"
+#elif PG_VERSION_NUM >= 140000
+#include "utils/wait_event.h"
+#else
+#include "pgstat.h"
+#endif
 #include "utils/hsearch.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 #include "fb_runtime.h"
 #include "fb_toast.h"
+
+#ifndef VARATT_EXTERNAL_GET_EXTSIZE
+#define VARATT_EXTERNAL_GET_EXTSIZE(toast_pointer) ((toast_pointer).va_extsize)
+#endif
+
+/*
+ * FbToastChunkKey
+ *    Private toast structure.
+ */
 
 typedef struct FbToastChunkKey
 {
 	Oid valueid;
 	int32 chunk_seq;
 } FbToastChunkKey;
+
+/*
+ * FbToastChunkEntry
+ *    Stores one toast chunk entry.
+ */
 
 typedef struct FbToastChunkEntry
 {
@@ -32,6 +63,11 @@ typedef struct FbToastChunkEntry
 	bool spilled;
 	off_t spill_offset;
 } FbToastChunkEntry;
+
+/*
+ * FbToastStore
+ *    Private toast structure.
+ */
 
 struct FbToastStore
 {
@@ -43,6 +79,26 @@ struct FbToastStore
 };
 
 static uint64 fb_toast_spill_counter = 0;
+
+/*
+ * fb_toast_scan_snapshot
+ *    TOAST helper.
+ */
+
+static Snapshot
+fb_toast_scan_snapshot(void)
+{
+#if PG_VERSION_NUM >= 180000
+	return get_toast_snapshot();
+#else
+	return GetLatestSnapshot();
+#endif
+}
+
+/*
+ * fb_toast_create_chunk_hash
+ *    TOAST helper.
+ */
 
 static HTAB *
 fb_toast_create_chunk_hash(void)
@@ -58,6 +114,11 @@ fb_toast_create_chunk_hash(void)
 					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
+/*
+ * fb_toast_store_create
+ *    TOAST entry point.
+ */
+
 FbToastStore *
 fb_toast_store_create(void)
 {
@@ -68,6 +129,11 @@ fb_toast_store_create(void)
 	store->spill_file = -1;
 	return store;
 }
+
+/*
+ * fb_toast_close_spill_file
+ *    TOAST helper.
+ */
 
 static void
 fb_toast_close_spill_file(FbToastStore *store)
@@ -89,6 +155,11 @@ fb_toast_close_spill_file(FbToastStore *store)
 	}
 }
 
+/*
+ * fb_toast_store_destroy
+ *    TOAST entry point.
+ */
+
 void
 fb_toast_store_destroy(FbToastStore *store)
 {
@@ -97,6 +168,11 @@ fb_toast_store_destroy(FbToastStore *store)
 
 	fb_toast_close_spill_file(store);
 }
+
+/*
+ * fb_toast_ensure_spill_file
+ *    TOAST helper.
+ */
 
 static void
 fb_toast_ensure_spill_file(FbToastStore *store)
@@ -123,6 +199,11 @@ fb_toast_ensure_spill_file(FbToastStore *store)
 				 errdetail("path=%s: %m", store->spill_path)));
 }
 
+/*
+ * fb_toast_spill_chunk
+ *    TOAST helper.
+ */
+
 static void
 fb_toast_spill_chunk(FbToastStore *store,
 					 FbToastChunkEntry *entry,
@@ -147,6 +228,11 @@ fb_toast_spill_chunk(FbToastStore *store,
 	store->spill_size += len;
 }
 
+/*
+ * fb_toast_read_spilled_chunk
+ *    TOAST helper.
+ */
+
 static char *
 fb_toast_read_spilled_chunk(FbToastStore *store, const FbToastChunkEntry *entry)
 {
@@ -170,6 +256,11 @@ fb_toast_read_spilled_chunk(FbToastStore *store, const FbToastChunkEntry *entry)
 
 	return data;
 }
+
+/*
+ * fb_toast_extract_chunk
+ *    TOAST helper.
+ */
 
 static bool
 fb_toast_extract_chunk(TupleDesc toast_tupdesc,
@@ -208,6 +299,11 @@ fb_toast_extract_chunk(TupleDesc toast_tupdesc,
 	return true;
 }
 
+/*
+ * fb_toast_lookup_chunk_in_hash
+ *    TOAST helper.
+ */
+
 static FbToastChunkEntry *
 fb_toast_lookup_chunk_in_hash(HTAB *hash, Oid valueid, int32 chunk_seq)
 {
@@ -223,6 +319,11 @@ fb_toast_lookup_chunk_in_hash(HTAB *hash, Oid valueid, int32 chunk_seq)
 	return (FbToastChunkEntry *) hash_search(hash, &key, HASH_FIND, NULL);
 }
 
+/*
+ * fb_toast_lookup_chunk
+ *    TOAST helper.
+ */
+
 static FbToastChunkEntry *
 fb_toast_lookup_chunk(FbToastStore *store, Oid valueid, int32 chunk_seq)
 {
@@ -237,6 +338,11 @@ fb_toast_lookup_chunk(FbToastStore *store, Oid valueid, int32 chunk_seq)
 
 	return fb_toast_lookup_chunk_in_hash(store->retired_chunks, valueid, chunk_seq);
 }
+
+/*
+ * fb_toast_get_chunk_bytes
+ *    TOAST helper.
+ */
 
 static const char *
 fb_toast_get_chunk_bytes(FbToastStore *store,
@@ -263,6 +369,11 @@ fb_toast_get_chunk_bytes(FbToastStore *store,
 
 	return NULL;
 }
+
+/*
+ * fb_toast_fetch_live_datum
+ *    TOAST helper.
+ */
 
 static struct varlena *
 fb_toast_fetch_live_datum(const struct varatt_external *toast_pointer)
@@ -293,7 +404,7 @@ fb_toast_fetch_live_datum(const struct varatt_external *toast_pointer)
 				BTEqualStrategyNumber,
 				F_OIDEQ,
 				ObjectIdGetDatum(toast_pointer->va_valueid));
-	scan = systable_beginscan_ordered(toast_rel, toast_idx, get_toast_snapshot(),
+	scan = systable_beginscan_ordered(toast_rel, toast_idx, fb_toast_scan_snapshot(),
 									  1, &key);
 
 	while ((tuple = systable_getnext_ordered(scan, ForwardScanDirection)) != NULL)
@@ -346,6 +457,11 @@ fb_toast_fetch_live_datum(const struct varatt_external *toast_pointer)
 	return reconstructed;
 }
 
+/*
+ * fb_toast_chunk_presence_summary
+ *    TOAST helper.
+ */
+
 static char *
 fb_toast_chunk_presence_summary(FbToastStore *store, Oid valueid)
 {
@@ -380,6 +496,11 @@ fb_toast_chunk_presence_summary(FbToastStore *store, Oid valueid)
 
 	return buf.data;
 }
+
+/*
+ * fb_toast_store_put_tuple
+ *    TOAST entry point.
+ */
 
 void
 fb_toast_store_put_tuple(FbToastStore *store,
@@ -418,6 +539,11 @@ fb_toast_store_put_tuple(FbToastStore *store,
 	entry->spill_offset = 0;
 	memcpy(entry->data, chunk_data, chunk_len);
 }
+
+/*
+ * fb_toast_store_remove_tuple
+ *    TOAST entry point.
+ */
 
 void
 fb_toast_store_remove_tuple(FbToastStore *store,
@@ -468,6 +594,11 @@ fb_toast_store_remove_tuple(FbToastStore *store,
 	}
 }
 
+/*
+ * fb_toast_store_sync_page
+ *    TOAST entry point.
+ */
+
 void
 fb_toast_store_sync_page(FbToastStore *store,
 						 TupleDesc toast_tupdesc,
@@ -499,6 +630,11 @@ fb_toast_store_sync_page(FbToastStore *store,
 		fb_toast_store_put_tuple(store, toast_tupdesc, &tuple);
 	}
 }
+
+/*
+ * fb_toast_reconstruct_datum
+ *    TOAST helper.
+ */
 
 static struct varlena *
 fb_toast_reconstruct_datum(FbToastStore *store,
@@ -578,6 +714,11 @@ fb_toast_reconstruct_datum(FbToastStore *store,
 	return reconstructed;
 }
 
+/*
+ * fb_toast_rewrite_tuple
+ *    TOAST entry point.
+ */
+
 HeapTuple
 fb_toast_rewrite_tuple(FbToastStore *store,
 					   TupleDesc tupdesc,
@@ -625,6 +766,11 @@ fb_toast_rewrite_tuple(FbToastStore *store,
 	rewritten->t_self = tuple->t_self;
 	return rewritten;
 }
+
+/*
+ * fb_toast_tuple_uses_external
+ *    TOAST entry point.
+ */
 
 bool
 fb_toast_tuple_uses_external(TupleDesc tupdesc, HeapTuple tuple)

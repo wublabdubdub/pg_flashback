@@ -1,3 +1,8 @@
+/*
+ * fb_wal.h
+ *    WAL scan and record index interfaces.
+ */
+
 #ifndef FB_WAL_H
 #define FB_WAL_H
 
@@ -14,6 +19,11 @@ typedef enum FbWalUnsafeReason
 	FB_WAL_UNSAFE_REWRITE,
 	FB_WAL_UNSAFE_STORAGE_CHANGE
 } FbWalUnsafeReason;
+
+/*
+ * FbWalScanContext
+ *    Tracks WAL scan context.
+ */
 
 typedef struct FbWalScanContext
 {
@@ -83,6 +93,11 @@ typedef enum FbWalXidStatus
 	FB_WAL_XID_ABORTED
 } FbWalXidStatus;
 
+/*
+ * FbRecordBlockRef
+ *    WAL structure.
+ */
+
 typedef struct FbRecordBlockRef
 {
 	bool in_use;
@@ -102,6 +117,11 @@ typedef struct FbRecordBlockRef
 
 #define FB_WAL_MAX_BLOCK_REFS 2
 
+/*
+ * FbRecordRef
+ *    WAL structure.
+ */
+
 typedef struct FbRecordRef
 {
 	FbWalRecordKind kind;
@@ -120,6 +140,11 @@ typedef struct FbRecordRef
 	char *main_data;
 	Size main_data_len;
 } FbRecordRef;
+
+/*
+ * FbWalRecordIndex
+ *    WAL structure.
+ */
 
 typedef struct FbWalRecordIndex
 {
@@ -148,18 +173,53 @@ typedef struct FbWalRecordIndex
 
 typedef bool (*FbWalRecordVisitor) (XLogReaderState *reader, void *arg);
 
+/*
+ * fb_require_archive_has_wal_segments
+ *    WAL API.
+ */
+
 void fb_require_archive_has_wal_segments(void);
+/*
+ * fb_wal_prepare_scan_context
+ *    WAL API.
+ */
+
 void fb_wal_prepare_scan_context(TimestampTz target_ts, FbWalScanContext *ctx);
+/*
+ * fb_wal_scan_relation_window
+ *    WAL API.
+ */
+
 void fb_wal_scan_relation_window(const FbRelationInfo *info, FbWalScanContext *ctx);
+/*
+ * fb_wal_build_record_index
+ *    WAL API.
+ */
+
 void fb_wal_build_record_index(const FbRelationInfo *info,
 							   FbWalScanContext *ctx,
 							   FbWalRecordIndex *index);
+/*
+ * fb_wal_lookup_xid_status
+ *    WAL API.
+ */
+
 bool fb_wal_lookup_xid_status(const FbWalRecordIndex *index,
 							  TransactionId xid,
 							  FbWalXidStatus *status,
 							  TimestampTz *commit_ts);
+/*
+ * fb_wal_visit_records
+ *    WAL API.
+ */
+
 void fb_wal_visit_records(FbWalScanContext *ctx, FbWalRecordVisitor visitor,
 						  void *arg);
+/*
+ * fb_wal_unsafe_reason_name
+ *    WAL API.
+ */
+
 const char *fb_wal_unsafe_reason_name(FbWalUnsafeReason reason);
 
 #endif

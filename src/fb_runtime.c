@@ -1,3 +1,8 @@
+/*
+ * fb_runtime.c
+ *    Runtime directory initialization helpers.
+ */
+
 #include "postgres.h"
 
 #include <unistd.h>
@@ -9,11 +14,21 @@
 
 #include "fb_runtime.h"
 
+/*
+ * fb_runtime_join_path
+ *    Runtime helper.
+ */
+
 static char *
 fb_runtime_join_path(const char *suffix)
 {
 	return psprintf("%s/pg_flashback/%s", DataDir, suffix);
 }
+
+/*
+ * fb_runtime_base_dir
+ *    Runtime entry point.
+ */
 
 char *
 fb_runtime_base_dir(void)
@@ -21,11 +36,21 @@ fb_runtime_base_dir(void)
 	return psprintf("%s/pg_flashback", DataDir);
 }
 
+/*
+ * fb_runtime_runtime_dir
+ *    Runtime entry point.
+ */
+
 char *
 fb_runtime_runtime_dir(void)
 {
 	return fb_runtime_join_path("runtime");
 }
+
+/*
+ * fb_runtime_recovered_wal_dir
+ *    Runtime entry point.
+ */
 
 char *
 fb_runtime_recovered_wal_dir(void)
@@ -33,11 +58,21 @@ fb_runtime_recovered_wal_dir(void)
 	return fb_runtime_join_path("recovered_wal");
 }
 
+/*
+ * fb_runtime_meta_dir
+ *    Runtime entry point.
+ */
+
 char *
 fb_runtime_meta_dir(void)
 {
 	return fb_runtime_join_path("meta");
 }
+
+/*
+ * fb_runtime_ensure_directory
+ *    Runtime helper.
+ */
 
 static void
 fb_runtime_ensure_directory(const char *path, const char *label)
@@ -58,6 +93,11 @@ fb_runtime_ensure_directory(const char *path, const char *label)
 				 errmsg("pg_flashback %s directory is not writable", label),
 				 errdetail("path=%s: %m", path)));
 }
+
+/*
+ * fb_runtime_ensure_initialized
+ *    Runtime entry point.
+ */
 
 void
 fb_runtime_ensure_initialized(void)

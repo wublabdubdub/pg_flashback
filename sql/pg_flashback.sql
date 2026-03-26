@@ -40,20 +40,16 @@ DELETE FROM pg_flashback_target WHERE id = 2;
 
 SET client_min_messages = warning;
 
-SELECT pg_flashback(
-	'fb_created',
-	'pg_flashback_target',
+SELECT *
+FROM pg_flashback(
+	NULL::public.pg_flashback_target,
 	(SELECT target_ts::text FROM pg_flashback_mark)
-);
+)
+ORDER BY id;
 
-SELECT relpersistence
-FROM pg_class
-WHERE oid = 'fb_created'::regclass;
-
-SELECT * FROM fb_created;
-
-SELECT pg_flashback(
-	'fb_created',
-	'pg_flashback_target',
+SELECT count(*) AS rerun_count,
+	   sum(amount)::bigint AS rerun_sum
+FROM pg_flashback(
+	NULL::public.pg_flashback_target,
 	(SELECT target_ts::text FROM pg_flashback_mark)
 );

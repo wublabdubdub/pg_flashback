@@ -1,3 +1,8 @@
+/*
+ * fb_export.h
+ *    Undo export interfaces.
+ */
+
 #ifndef FB_EXPORT_H
 #define FB_EXPORT_H
 

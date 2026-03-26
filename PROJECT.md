@@ -4,10 +4,26 @@
 
 `pg_flashback` 是一个 PostgreSQL 扩展，提供只读历史查询与反向操作导出能力。
 
+当前产品文档交付策略补充为：
+
+- `README.md` 面向客户使用与运维
+- 开发交接、实验细节、实现路线保留在仓库内部维护文档
+
+当前版本支持策略补充为：
+
+- 目标支持版本：`PG10-18`
+- 当前本机可执行验证矩阵：`PG12-18`
+- `PG10/11` 在本轮按源码兼容收敛，但需待补环境做正式复验
+
 当前代码已安装的用户接口：
 
-- `SELECT pg_flashback('fb1', 'public.t1', '2026-03-22 10:00:00+08');`
-- `SELECT * FROM fb1;`
+```sql
+SELECT *
+FROM pg_flashback(
+  NULL::public.t1,
+  '2026-03-22 10:00:00+08'
+);
+```
 
 规划中但当前未对外安装的接口：
 
@@ -65,28 +81,33 @@
 - 当前安装脚本对外只暴露：
   - `fb_version()`
   - `fb_check_relation(regclass)`
-  - `pg_flashback(text, text, text)`
+  - `pg_flashback(anyelement, text)`
 - 当前主链已落地：
   - `checkpoint -> RecordRef -> BlockReplayStore -> heap redo`
   - 从页级重放提取 `ForwardOp`
   - 从 `ForwardOp` 构建 `ReverseOp`
   - `keyed` 与 `bag` 两种查询执行模型
-  - `pg_flashback(text, text, text)` 真实 flashback 用户入口
+  - `pg_flashback(anyelement, text)` 真实 flashback 用户入口
 - 当前运行时已落地：
   - `archive_dest + pg_wal + recovered_wal` 三路来源解析
   - 内嵌 `fb_ckwal`
   - 查询级 `memory_limit_kb`
   - `parallel_segment_scan`
-  - opt-in 的 `parallel_apply_workers`
   - 扩展私有目录自动初始化
+- 当前已经补齐：
+  - `fb_compat` 跨版本兼容层
+  - 去除默认 `PG18` 绑定构建入口
+  - `PG12-18` 本机编译矩阵
 - 当前 deep full 已切到 baseline 快照恢复模式，并带状态文件续跑
 
 当前未完成：
 
+- `PG10/11` 的环境级正式复验
 - `fb_export_undo`（明确放到当前主线最后实现）
 - batch B / residual `missing FPI` 收敛
 - TOAST store 的内存上限覆盖
 - 主键变更与更多正确性覆盖
+- 大时间窗变化集继续向 bounded spill 演进
 - `parallel_segment_scan` 在真实 flashback 主路径上的端到端收益仍需继续验证/收敛
 - 双来源解析的诊断与边界行为还可继续增强：
   - 内嵌 `fb_ckwal` 的识别/校正/复制能力继续增强
@@ -126,6 +147,12 @@
 
 ## 当前验证状态
 
+- 当前版本兼容验证策略：
+  - 本机能测什么就测什么
+  - 当前已确认存在本地 toolchain：`PG12-18`
+  - 当前本机没有 `PG10/11` 本地 `pg_config`
+- 当前已完成：
+  - `PG12-18` 本机编译矩阵通过
 - 当前 `Makefile` 中登记的回归集包含：
   - `fb_smoke`
   - `fb_relation_gate`
@@ -139,7 +166,6 @@
   - `fb_memory_limit`
   - `fb_toast_flashback`
   - `fb_progress`
-  - `fb_parallel_apply`
 - deep 侧当前已具备：
   - TOAST 规模化脚本 `tests/deep/sql/80_toast_scale.sql`
   - TOAST deep 入口 `tests/deep/bin/run_toast_scale.sh`
@@ -150,7 +176,7 @@
 当前代码已实际收口为：
 
 - 对外只保留真实 flashback 用户入口：
-  - `pg_flashback(text, text, text)`
+  - `pg_flashback(anyelement, text)`
 - `fb_export_undo()` 当前尚未对外安装
 - `fb_flashback_materialize()` / `fb_internal_flashback()` 当前未对外安装
 - 用户不需要手写 `AS t(...)`
@@ -160,29 +186,29 @@
 当前可用入口是：
 
 ```sql
-SELECT pg_flashback(
-  'fb1',
-  'fb_live_minute_test',
+SELECT *
+FROM pg_flashback(
+  NULL::public.fb_live_minute_test,
   '2026-03-23 08:09:30.676307+08'
 );
-
-SELECT * FROM fb1;
 ```
 
 约束如下：
 
-- 第一个参数：结果表名，`text`
-- 第二个参数：源表名，`text`
-- 第三个参数：目标时间点，`text`
+- 第一个参数：目标表复合类型锚点，典型写法 `NULL::schema.table`
+- 第二个参数：目标时间点，`text`
 - 用户不再需要手写：
+  - `AS t(...)`
   - `::regclass`
   - `::timestamptz`
-- 当前结果对象正在向“速度优先”口径调整：
-  - 默认路径已经去掉 `tuplestore -> TEMP TABLE` 二次物化
-  - 默认结果直接落为 `UNLOGGED heap` 结果表
-  - 显式设置 `pg_flashback.parallel_apply_workers > 0` 后，会切到 bgworker 并行 apply/write
-  - 并行路径下结果表由独立 worker 自主事务创建，因此不再跟随调用方事务回滚
-- 如果目标表名已存在：直接报错，不自动覆盖
+- 当前结果对象不落盘：
+  - 不创建结果表
+  - 不经过 `tuplestore`
+  - 直接作为结果集逐行返回
+- 当前 apply 小内存口径为：
+  - keyed 内存与变化 key 集规模相关
+  - bag 内存与变化 row identity 集规模相关
+  - 不再因 12GB 当前表而构造 12GB 级 apply 工作集
 
 ## 运行时前置配置
 
@@ -228,11 +254,6 @@ SELECT * FROM fb1;
   - 达到上限时直接报错，不做静默降级
   - 该上限当前是“热路径已跟踪内存”的硬限制，不等价于整个 backend 的总内存
   - 后续若引入 spool / spill，则该 GUC 仍作为“内存层”上限保留
-- `pg_flashback.parallel_apply_workers`
-  - 默认 `0`
-  - `> 0` 时显式开启 bgworker 并行 apply/write
-  - 并行路径会把结果表创建和写入移到独立 worker 事务中完成
-  - 因此结果表生命周期独立于调用方事务回滚
 
 ## 外部参考
 

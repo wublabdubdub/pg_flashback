@@ -1,3 +1,8 @@
+/*
+ * fb_common.h
+ *    Common relation metadata and shared flashback types.
+ */
+
 #ifndef FB_COMMON_H
 #define FB_COMMON_H
 
@@ -7,14 +12,20 @@
 #include "access/itup.h"
 #include "catalog/pg_type_d.h"
 #include "fmgr.h"
-#include "storage/relfilelocator.h"
 #include "utils/timestamp.h"
+
+#include "fb_compat.h"
 
 typedef enum FbApplyMode
 {
 	FB_APPLY_KEYED = 1,
 	FB_APPLY_BAG = 2
 } FbApplyMode;
+
+/*
+ * FbRelationInfo
+ *    Describes relation metadata.
+ */
 
 typedef struct FbRelationInfo
 {

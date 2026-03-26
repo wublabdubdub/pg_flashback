@@ -40,16 +40,13 @@ UPDATE fb_toast_flashback_target
 SET payload = repeat('B', 12000)
 WHERE id = 1;
 
-SELECT pg_flashback(
-	'fb_toast_flashback_result',
-	'fb_toast_flashback_target',
-	(SELECT target_ts::text FROM fb_toast_flashback_mark)
-);
-
 SELECT id,
 	   left(payload, 4) AS prefix,
 	   left(payload_keep, 4) AS keep_prefix,
 	   length(payload) AS payload_len,
 	   length(payload_keep) AS keep_len
-FROM fb_toast_flashback_result
+FROM pg_flashback(
+	NULL::public.fb_toast_flashback_target,
+	(SELECT target_ts::text FROM fb_toast_flashback_mark)
+)
 ORDER BY 1;

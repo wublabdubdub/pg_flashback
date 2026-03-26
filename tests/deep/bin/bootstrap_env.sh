@@ -33,7 +33,6 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 	fb_deep_log "database=${FB_DEEP_DBNAME}"
 	fb_deep_log "mode=${FB_DEEP_MODE}"
 	fb_deep_log "archive_dir=${FB_DEEP_ARCHIVE_DIR}"
-	fb_deep_log "ckwal_dir=${FB_DEEP_CKWAL_DIR}"
 	fb_deep_log "fake_pg_wal_dir=${FB_DEEP_FAKE_PGWAL_DIR}"
 	fb_deep_log "row_count=${FB_DEEP_ROW_COUNT}"
 	fb_deep_log "insert_count=${FB_DEEP_INSERT_COUNT}"

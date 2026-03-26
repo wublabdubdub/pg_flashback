@@ -1,17 +1,17 @@
 \set ON_ERROR_STOP on
 CREATE EXTENSION IF NOT EXISTS pg_flashback;
 SET pg_flashback.archive_dest = :'archive_dest';
-SET pg_flashback.ckwal_restore_dir = :'ckwal_dir';
 
-SELECT pg_flashback(
-	:'result_table',
-	:'source_table',
-	(SELECT target_ts::text FROM fb_deep_markers WHERE label = :'marker_label')
-);
-
-WITH result_grouped AS (
+WITH flashback_rows AS MATERIALIZED (
+	SELECT *
+	  FROM pg_flashback(
+		NULL:::source_table,
+		(SELECT target_ts::text FROM fb_deep_markers WHERE label = :'marker_label')
+	  )
+),
+result_grouped AS (
 	SELECT to_jsonb(t) AS row_doc, count(*) AS cnt
-	  FROM :"result_table" t
+	  FROM flashback_rows t
 	 GROUP BY 1
 ),
 truth_grouped AS (
@@ -30,7 +30,7 @@ missing AS (
 	SELECT * FROM result_grouped
 )
 SELECT
-	(SELECT count(*) FROM :"result_table") AS flashback_rows,
+	(SELECT count(*) FROM flashback_rows) AS flashback_rows,
 	(SELECT count(*) FROM :"truth_table") AS truth_rows,
 	(SELECT count(*) FROM extra) AS extra_count,
 	(SELECT count(*) FROM missing) AS missing_count,

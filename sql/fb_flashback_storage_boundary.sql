@@ -55,15 +55,12 @@ BEGIN
 END;
 $$;
 
-SELECT pg_flashback(
-	'fb_storage_boundary_result',
-	'fb_storage_boundary_target',
-	(SELECT target_ts::text FROM fb_storage_boundary_mark)
-);
-
 SELECT count(*) AS result_count,
 	   sum(v_int)::bigint AS result_sum
-FROM fb_storage_boundary_result;
+FROM pg_flashback(
+	NULL::public.fb_storage_boundary_target,
+	(SELECT target_ts::text FROM fb_storage_boundary_mark)
+);
 
 SELECT base_sum
 FROM fb_storage_boundary_mark;

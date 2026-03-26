@@ -1,165 +1,165 @@
 # pg_flashback 设计规格
 
-## 背景
+## 产品目标
 
-`pg_flashback` 的目标是提供类似 Oracle Flashback Query 的只读历史查询能力，但不依赖长期维护页级历史副本，也不走“当前文件物理倒放”路线。
+`pg_flashback` 提供类似 Oracle Flashback Query 的只读历史查询能力：
 
-经过多轮方案比较，最终选定：
+- 输入当前表的复合类型锚点与目标时间点
+- 从 WAL 重建 `target_ts` 时刻的逻辑结果
+- 直接返回结果集
+- 不落最终结果表
 
-- 以当前表数据为逻辑基线
-- 从 WAL 中抽取目标时间窗内已提交 DML
-- 构建结构化 `reverse op stream`
-- 在扩展内部应用反向操作得到 `target_ts` 历史结果
+当前用户入口固定为：
+
+```sql
+SELECT *
+FROM pg_flashback(
+  NULL::public.t1,
+  '2026-03-22 10:00:00+08'
+);
+```
 
 ## 已确认约束
 
 - 首版严格只读
-- 需要同时支持历史结果查询和 undo SQL / reverse op 导出
+- 同时支持历史结果查询与 undo SQL / reverse op 导出
 - 无主键表按 `bag/multiset` 语义处理
-- `target_ts -> query_now_ts` 归档 WAL 必须完整
-- 时间窗内 DDL / rewrite 直接报错
-- TOAST 首版支持，重建失败直接报错
-- 开发阶段文档用中文，代码标识符用英文
-- 代码与内部标识符前缀统一用 `fb`
-- 公开用户 SQL 主入口保留为 `pg_flashback(...)`
+- `target_ts -> query_now_ts` 期间 WAL 必须完整
+- 时间窗内若检测到 DDL / rewrite / truncate / relfilenode 变化，直接报错
+- TOAST 首版支持，但重建失败直接报错
+- 开发文档用中文，代码标识符用英文
+- 代码与内部标识符统一前缀 `fb`
+- 公开 SQL 主入口保留为 `pg_flashback(...)`
+
+## 当前接口面
+
+当前安装 SQL 只对外安装：
+
+- `fb_version()`
+- `fb_check_relation(regclass)`
+- `pg_flashback(anyelement, text)`
+
+当前未对外安装：
+
+- `fb_export_undo(regclass, timestamptz)`
+- `fb_internal_flashback(...)`
+- `fb_flashback_materialize(...)`
+- 旧的 scan / replay / decode 调试 SQL 入口
+
+## 为什么采用 `anyelement`
+
+PostgreSQL 无法对通用 `SETOF record` 自动推断“任意表”的返回列定义；如果直接公开 `SETOF record`，调用侧通常必须写：
+
+```sql
+SELECT *
+FROM pg_flashback(...)
+AS t(col1 type1, col2 type2, ...);
+```
+
+这在大宽表上不可接受。
+
+因此当前接口固定为：
+
+```sql
+SELECT *
+FROM pg_flashback(NULL::schema.table, target_ts_text);
+```
+
+这里的 `NULL::schema.table` 是“表的复合类型锚点”，用于让 PostgreSQL 在执行前就确定返回行类型。
 
 ## 总体架构
 
-### Facade 层
+主链固定为：
 
-对外暴露 SQL 接口：
+1. relation gate
+2. WAL 时间窗扫描与 `RecordRef` 索引
+3. `checkpoint + FPI + block redo`
+4. 从页级重放提取 `ForwardOp`
+5. `ForwardOp -> ReverseOp`
+6. keyed / bag 流式 apply
+7. 逐行返回结果集
 
-- `pg_flashback(text, text, text)`：自动从数据字典生成列定义并创建速度优先的历史结果表
-- `fb_export_undo(regclass, timestamptz)`：导出 undo SQL / reverse op
-- `fb_version()`：返回扩展版本
-
-### Engine 层
-
-分成五部分：
-
-1. relation 校验与模式选择
-2. WAL 时间窗扫描与事务边界提取
-3. 行像解码与 `ForwardOp`
-4. `ForwardOp -> ReverseOp` 转换
-5. 反向应用与结果输出
+实现上仍以 `reverse op stream` 作为查询/导出逻辑层，但它的来源已经固定为页级重放内核，而不是“直接从 WAL 行像拼 old row”。
 
 ## 查询执行流程
 
-1. 建立 `FlashbackQueryContext`
-2. 校验 relation、TOAST、执行模式
-3. 固定 `query_now_ts`
-4. 扫描 `(target_ts, query_now_ts]` 归档 WAL
-5. 提取目标表相关已提交 DML
-6. 生成 `reverse op stream`
-7. 以当前表数据为基线应用反向操作
-8. 返回历史结果集
-9. 如用户请求导出，同步渲染 undo SQL / reverse op 日志
+一次 `pg_flashback()` 查询的当前实现流程为：
 
-## 用户接口约束
+1. 从第一个参数解析目标 relation row type
+2. 解析第二个参数 `target_ts`
+3. 进行 relation / runtime / archive gate
+4. 建立 WAL 扫描上下文
+5. 扫描 WAL 并构建目标 relation 的 `RecordRef` 索引
+6. 根据 `checkpoint + FPI + block redo` 重建相关历史页状态
+7. 生成 `ForwardOp`
+8. 构建按时间逆序的 `ReverseOp`
+9. 按 relation 模式执行流式 apply，并逐行返回
 
-当前已经确认：
+## 输出模型
 
-- 仅凭 `pg_flashback(regclass, timestamptz)` 这一类动态 `SETOF record` 函数，无法让 PostgreSQL 解析器在 `SELECT * FROM pg_flashback(...)` 时自动推断表结构
-- 因此当前阶段的免列定义方案不是继续公开该 SRF，而是改为文本参数入口：
-  - `pg_flashback(text, text, text)`
-  - 由它从数据字典提取列定义并创建临时表
+当前输出模型已经固定为：
 
-新增已拍板用户接口：
+- 不创建结果表
+- 不走 `tuplestore`
+- 不保留“返回结果表名”的公开入口
+- 查询结束后即结束，不保留最终结果副本
 
-```sql
-SELECT pg_flashback(
-  'fb1',
-  'fb_live_minute_test',
-  '2026-03-23 08:09:30.676307+08'
-);
+## 内存模型
 
-SELECT * FROM fb1;
-```
+当前内存设计分两层理解：
 
-其设计约束为：
+### apply 层
 
-- 参数全部为 `text`
-- 默认创建 `UNLOGGED` 结果表
-- 默认仍走当前 backend 内的串行直写
-- 若显式设置 `pg_flashback.parallel_apply_workers > 0`，则切到 bgworker 并行 apply/write
-- 并行路径下结果表由独立 worker 事务创建并提交，不再跟随调用方事务回滚
-- 目标表已存在时直接报错
+- keyed：只维护“变化 key 集”
+- bag：只维护“变化 row identity 集”
+- 不再因当前表大小而构造整表工作集
 
-最终用户接口分层也已拍板：
+### 整体查询链路
 
-- 主用户入口：`pg_flashback(text, text, text)`
-- `fb_flashback_materialize(regclass, timestamptz, text)` / `fb_internal_flashback(regclass, timestamptz)` 当前不对外安装
-- `pg_flashback(regclass, timestamptz)` 不再作为公开用户入口
+- 仍存在 `RecordRef` / FPI / block data / replay state 等 query 级内存消耗
+- 这些结构受 `pg_flashback.memory_limit_kb` 约束
+- 当前尚未把 WAL 索引 / replay 主链全部改为 spill 模型
+- 因此当前“小内存”首先保证的是 apply 不按整表大小线性膨胀，而不是“整条链路任何阶段都只占极小内存”
 
-## keyed 模式
+## keyed / bag 语义
 
-适用于有主键或稳定唯一键的表。
+### keyed
 
-核心结构：
+- 适用于存在主键或稳定唯一键的表
+- 只跟踪时间窗内发生变化的 key
+- 扫描当前表时：
+  - 未命中变化 key 的行直接返回
+  - 命中变化 key 的行按反向动作链计算历史行
+- 扫描结束后补发“当前已不存在、但历史上存在”的 residual 行
 
-```text
-RowKey -> ReverseOpList
-```
+### bag
 
-执行方式：
+- 适用于无主键表
+- 使用 `row_identity -> delta_count` 模型
+- 扫描当前表时吞掉需要抵消的当前行
+- 扫描结束后按剩余正 delta 补发行
 
-- 扫描当前表
-- 按 key 匹配反向操作链
-- 依次应用 `REMOVE / REPLACE / ADD`
-- 对当前已不存在、但历史上存在的行再补回
+## 运行时前提
 
-## bag 模式
+- 首选 WAL 来源为 `pg_flashback.archive_dest`
+- `pg_flashback.archive_dir` 仅保留为兼容回退配置
+- `pg_wal` 只补 archive 尚未覆盖的 recent tail
+- 发生 `pg_wal` 错配时，转入扩展内部 `recovered_wal/`
+- 扩展自动维护 `DataDir/pg_flashback/{runtime,recovered_wal,meta}`
 
-适用于无主键表。
-
-核心结构：
-
-```text
-CurrentRowBag: RowImage -> count
-DeltaBag: RowImage -> delta_count
-FinalRowBag: RowImage -> final_count
-```
-
-执行方式：
-
-- 当前表扫描构建 `CurrentRowBag`
-- 反向流聚合成 `DeltaBag`
-- 最终合并得到 `FinalRowBag`
-- 按次数展开结果
-
-## 风险处理
+## 不支持场景
 
 以下情况直接报错，不返回部分结果：
 
 - WAL 不完整
-- 检测到 DDL / rewrite / truncate
-- TOAST 值无法重建
+- 时间窗内检测到 DDL / rewrite / truncate / storage change
 - relation 类型不支持
-- 关键元数据无法确认
+- TOAST 历史值无法重建
+- 超出查询级 `memory_limit_kb`
 
-## WAL 来源模型的后续修正
+## 当前仍在推进
 
-当前基线实现仍使用单目录 `archive_dir`。  
-后续要升级为：
-
-- `archive_dest` 作为主配置语义
-- 同时判断需要的 WAL 当前位于：
-  - `pg_wal`
-  - `archive_dest`
-  - 或两者都不完整
-- segment 选择规则：
-  - recent WAL 优先 `pg_wal`
-  - 历史 WAL 优先 `archive_dest`
-  - 两端同时存在时做一致性校验
-- 对 `pg_wal` 中已被覆盖的 segment，引入缺失 WAL 恢复层
-- 这一层将参考 `/root/xman` 中的 `ckwal`
-
-## 首个可交付目标
-
-先完成 PG18 基线最小骨架：
-
-- 扩展可编译、可安装
-- 核心接口占位完成
-- 文档与任务体系稳定
-- 回归测试入口存在
-- 为后续实现 WAL decode core 做准备
+- `fb_export_undo`
+- batch B / residual `missing FPI` 收敛
+- 更多 PG18 heap WAL 正确性补齐
+- WAL 索引 / replay 主链继续向 bounded spill 演进

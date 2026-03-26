@@ -1,42 +1,68 @@
+/*
+ * fb_apply_keyed.c
+ *    Keyed streaming reverse-op application helpers.
+ */
+
 #include "postgres.h"
 
-#include "access/relation.h"
-#include "access/tableam.h"
-#include "common/hashfn.h"
-#include "executor/tuptable.h"
+#include "access/hash.h"
+#include "lib/stringinfo.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
-#include "utils/snapmgr.h"
 
 #include "fb_apply.h"
 #include "fb_memory.h"
-#include "fb_progress.h"
 
-typedef struct FbKeyBucket
+typedef enum FbKeyedActionType
+{
+	FB_KEYED_ACTION_REMOVE = 1,
+	FB_KEYED_ACTION_ADD
+} FbKeyedActionType;
+
+typedef struct FbKeyedBucket
 {
 	uint32 hash;
 	void *head;
-} FbKeyBucket;
+} FbKeyedBucket;
 
-typedef struct FbKeyedRow
+typedef struct FbKeyedAction
+{
+	FbKeyedActionType type;
+	HeapTuple tuple;
+	struct FbKeyedAction *next;
+} FbKeyedAction;
+
+typedef struct FbKeyedEntry
 {
 	char *key_identity;
-	HeapTuple tuple;
-	struct FbKeyedRow *next;
-} FbKeyedRow;
+	bool current_seen;
+	FbKeyedAction *actions_head;
+	FbKeyedAction *actions_tail;
+	struct FbKeyedEntry *bucket_next;
+	struct FbKeyedEntry *all_next;
+} FbKeyedEntry;
 
-struct FbKeyedState
+typedef struct FbKeyedApplyState
 {
 	const FbRelationInfo *info;
 	TupleDesc tupdesc;
-	HTAB *rows;
+	HTAB *buckets;
+	FbKeyedEntry *entries_head;
+	FbKeyedEntry *entries_tail;
+	FbKeyedEntry *residual_cursor;
+	uint64 residual_total;
 	uint64 tracked_bytes;
 	uint64 memory_limit_bytes;
-};
+} FbKeyedApplyState;
+
+/*
+ * fb_keyed_charge_bytes
+ *    Keyed apply helper.
+ */
 
 static void
-fb_keyed_charge_bytes(FbKeyedState *state, Size bytes, const char *what)
+fb_keyed_charge_bytes(FbKeyedApplyState *state, Size bytes, const char *what)
 {
 	if (state == NULL)
 		return;
@@ -47,6 +73,11 @@ fb_keyed_charge_bytes(FbKeyedState *state, Size bytes, const char *what)
 						   what);
 }
 
+/*
+ * fb_apply_create_bucket_hash
+ *    Keyed apply helper.
+ */
+
 static HTAB *
 fb_apply_create_bucket_hash(const char *name)
 {
@@ -54,11 +85,16 @@ fb_apply_create_bucket_hash(const char *name)
 
 	MemSet(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(uint32);
-	ctl.entrysize = sizeof(FbKeyBucket);
+	ctl.entrysize = sizeof(FbKeyedBucket);
 	ctl.hcxt = CurrentMemoryContext;
 
 	return hash_create(name, 128, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
+
+/*
+ * fb_apply_hash_identity
+ *    Apply entry point.
+ */
 
 uint32
 fb_apply_hash_identity(const char *identity)
@@ -69,6 +105,11 @@ fb_apply_hash_identity(const char *identity)
 	return DatumGetUInt32(hash_any((const unsigned char *) identity,
 								   strlen(identity)));
 }
+
+/*
+ * fb_apply_tuple_identity
+ *    Keyed apply helper.
+ */
 
 static char *
 fb_apply_tuple_identity(HeapTuple tuple, TupleDesc tupdesc,
@@ -136,96 +177,10 @@ fb_apply_tuple_identity(HeapTuple tuple, TupleDesc tupdesc,
 	return buf.data;
 }
 
-static FbKeyedRow *
-fb_keyed_find_row(HTAB *hash, const char *identity)
-{
-	FbKeyBucket *bucket;
-	FbKeyedRow *row;
-	uint32 hash_value;
-
-	hash_value = fb_apply_hash_identity(identity);
-	bucket = (FbKeyBucket *) hash_search(hash, &hash_value, HASH_FIND, NULL);
-	if (bucket == NULL)
-		return NULL;
-
-	for (row = (FbKeyedRow *) bucket->head; row != NULL; row = row->next)
-	{
-		if (strcmp(row->key_identity, identity) == 0)
-			return row;
-	}
-
-	return NULL;
-}
-
-static void
-fb_keyed_upsert_row(FbKeyedState *state,
-					const char *identity,
-					HeapTuple tuple,
-					bool identity_owned,
-					bool tuple_owned)
-{
-	FbKeyBucket *bucket;
-	FbKeyedRow *row;
-	uint32 hash_value;
-	bool found;
-
-	row = fb_keyed_find_row(state->rows, identity);
-	if (row != NULL)
-	{
-		if (tuple != NULL)
-			row->tuple = tuple;
-		if (identity_owned)
-			pfree((char *) identity);
-		return;
-	}
-
-	hash_value = fb_apply_hash_identity(identity);
-	bucket = (FbKeyBucket *) hash_search(state->rows, &hash_value, HASH_ENTER, &found);
-	if (!found)
-		bucket->head = NULL;
-
-	row = palloc0(sizeof(*row));
-	fb_keyed_charge_bytes(state, sizeof(*row), "apply keyed row state");
-	row->key_identity = (char *) identity;
-	row->tuple = tuple;
-	if (identity_owned)
-		fb_keyed_charge_bytes(state,
-							  fb_memory_cstring_bytes(identity),
-							  "apply keyed row identity");
-	if (tuple_owned)
-		fb_keyed_charge_bytes(state,
-							  fb_memory_heaptuple_bytes(tuple),
-							  "apply keyed tuple");
-	row->next = (FbKeyedRow *) bucket->head;
-	bucket->head = row;
-}
-
-static void
-fb_keyed_remove_row(HTAB *hash, const char *identity)
-{
-	FbKeyBucket *bucket;
-	FbKeyedRow *row;
-	FbKeyedRow *prev = NULL;
-	uint32 hash_value;
-
-	hash_value = fb_apply_hash_identity(identity);
-	bucket = (FbKeyBucket *) hash_search(hash, &hash_value, HASH_FIND, NULL);
-	if (bucket == NULL)
-		return;
-
-	for (row = (FbKeyedRow *) bucket->head; row != NULL; row = row->next)
-	{
-		if (strcmp(row->key_identity, identity) == 0)
-		{
-			if (prev == NULL)
-				bucket->head = row->next;
-			else
-				prev->next = row->next;
-			return;
-		}
-		prev = row;
-	}
-}
+/*
+ * fb_apply_build_key_identity
+ *    Apply entry point.
+ */
 
 char *
 fb_apply_build_key_identity(const FbRelationInfo *info,
@@ -238,202 +193,145 @@ fb_apply_build_key_identity(const FbRelationInfo *info,
 								   info->key_natts);
 }
 
+/*
+ * fb_keyed_find_entry
+ *    Keyed apply helper.
+ */
+
+static FbKeyedEntry *
+fb_keyed_find_entry(HTAB *hash, const char *identity)
+{
+	FbKeyedBucket *bucket;
+	FbKeyedEntry *entry;
+	uint32 hash_value;
+
+	hash_value = fb_apply_hash_identity(identity);
+	bucket = (FbKeyedBucket *) hash_search(hash, &hash_value, HASH_FIND, NULL);
+	if (bucket == NULL)
+		return NULL;
+
+	for (entry = (FbKeyedEntry *) bucket->head;
+		 entry != NULL;
+		 entry = entry->bucket_next)
+	{
+		if (strcmp(entry->key_identity, identity) == 0)
+			return entry;
+	}
+
+	return NULL;
+}
+
+/*
+ * fb_keyed_get_or_create_entry
+ *    Keyed apply helper.
+ */
+
+static FbKeyedEntry *
+fb_keyed_get_or_create_entry(FbKeyedApplyState *state, const char *identity)
+{
+	FbKeyedBucket *bucket;
+	FbKeyedEntry *entry;
+	uint32 hash_value;
+	bool found;
+
+	entry = fb_keyed_find_entry(state->buckets, identity);
+	if (entry != NULL)
+		return entry;
+
+	hash_value = fb_apply_hash_identity(identity);
+	bucket = (FbKeyedBucket *) hash_search(state->buckets, &hash_value, HASH_ENTER, &found);
+	if (!found)
+		bucket->head = NULL;
+
+	entry = palloc0(sizeof(*entry));
+	fb_keyed_charge_bytes(state, sizeof(*entry), "apply keyed changed-key entry");
+	entry->key_identity = pstrdup(identity);
+	fb_keyed_charge_bytes(state,
+						  fb_memory_cstring_bytes(entry->key_identity),
+						  "apply keyed changed-key identity");
+	entry->bucket_next = (FbKeyedEntry *) bucket->head;
+	bucket->head = entry;
+
+	if (state->entries_tail == NULL)
+		state->entries_head = entry;
+	else
+		state->entries_tail->all_next = entry;
+	state->entries_tail = entry;
+
+	return entry;
+}
+
+/*
+ * fb_keyed_append_action
+ *    Keyed apply helper.
+ */
+
 static void
-fb_result_sink_put_tuple(const FbResultSink *sink, HeapTuple tuple, TupleDesc tupdesc)
+fb_keyed_append_action(FbKeyedApplyState *state,
+					   const char *identity,
+					   FbKeyedActionType type,
+					   HeapTuple tuple)
 {
-	if (sink == NULL || sink->put_tuple == NULL)
-		elog(ERROR, "fb result sink must not be NULL");
+	FbKeyedEntry *entry;
+	FbKeyedAction *action;
 
-	sink->put_tuple(tuple, tupdesc, sink->arg);
+	if (identity == NULL)
+		return;
+
+	entry = fb_keyed_get_or_create_entry(state, identity);
+	action = palloc0(sizeof(*action));
+	fb_keyed_charge_bytes(state, sizeof(*action), "apply keyed action");
+	action->type = type;
+	action->tuple = tuple;
+
+	if (entry->actions_tail == NULL)
+		entry->actions_head = action;
+	else
+		entry->actions_tail->next = action;
+	entry->actions_tail = action;
 }
 
-static void
-fb_keyed_load_current_tuple(HeapTuple tuple, TupleDesc tupdesc, void *arg)
-{
-	(void) tupdesc;
-	fb_keyed_state_add_current_tuple((FbKeyedState *) arg, tuple);
-}
+/*
+ * fb_keyed_apply_actions
+ *    Keyed apply helper.
+ */
 
-void
-fb_apply_scan_current_relation(Oid relid, FbCurrentTupleVisitor visitor, void *arg,
-								const char *progress_detail)
+static HeapTuple
+fb_keyed_apply_actions(FbKeyedEntry *entry, HeapTuple current_tuple)
 {
-	Relation rel;
-	Snapshot snapshot;
-	bool pushed_snapshot = false;
-	TableScanDesc scan;
-	TupleTableSlot *slot;
-	double estimated_rows;
-	uint64 scanned = 0;
+	HeapTuple state = current_tuple;
+	FbKeyedAction *action;
 
-	rel = relation_open(relid, AccessShareLock);
-	estimated_rows = rel->rd_rel->reltuples;
-	snapshot = GetActiveSnapshot();
-	if (snapshot == NULL)
+	for (action = entry->actions_head; action != NULL; action = action->next)
 	{
-		PushActiveSnapshot(GetLatestSnapshot());
-		snapshot = GetActiveSnapshot();
-		pushed_snapshot = true;
+		if (action->type == FB_KEYED_ACTION_REMOVE)
+			state = NULL;
+		else
+			state = action->tuple;
 	}
 
-	scan = table_beginscan(rel, snapshot, 0, NULL);
-	slot = table_slot_create(rel, NULL);
-
-	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
-	{
-		HeapTuple tuple = ExecCopySlotHeapTuple(slot);
-
-		visitor(tuple, RelationGetDescr(rel), arg);
-		scanned++;
-		if (estimated_rows > 0)
-		{
-			uint32 percent = fb_progress_map_subrange(0, 40,
-													  scanned,
-													  (uint64) estimated_rows);
-			fb_progress_update_percent(FB_PROGRESS_STAGE_APPLY,
-									   percent,
-									   progress_detail);
-		}
-		ExecClearTuple(slot);
-	}
-
-	fb_progress_update_percent(FB_PROGRESS_STAGE_APPLY, 40, progress_detail);
-
-	ExecDropSingleTupleTableSlot(slot);
-	table_endscan(scan);
-	relation_close(rel, AccessShareLock);
-
-	if (pushed_snapshot)
-		PopActiveSnapshot();
-}
-
-static uint64
-fb_keyed_count_rows(HTAB *rows)
-{
-	HASH_SEQ_STATUS seq;
-	FbKeyBucket *bucket;
-	uint64 total = 0;
-
-	hash_seq_init(&seq, rows);
-	while ((bucket = (FbKeyBucket *) hash_seq_search(&seq)) != NULL)
-	{
-		FbKeyedRow *row;
-
-		for (row = (FbKeyedRow *) bucket->head; row != NULL; row = row->next)
-			total++;
-	}
-
-	return total;
-}
-
-FbKeyedState *
-fb_keyed_state_create(const FbRelationInfo *info,
-					   TupleDesc tupdesc,
-					   uint64 tracked_bytes,
-					   uint64 memory_limit_bytes)
-{
-	FbKeyedState *state = palloc0(sizeof(*state));
-
-	state->info = info;
-	state->tupdesc = tupdesc;
-	state->rows = fb_apply_create_bucket_hash("fb keyed rows");
-	state->tracked_bytes = tracked_bytes;
-	state->memory_limit_bytes = memory_limit_bytes;
 	return state;
 }
 
-void
-fb_keyed_state_add_current_tuple(FbKeyedState *state, HeapTuple tuple)
-{
-	char *identity;
+/*
+ * fb_keyed_apply_begin
+ *    Keyed apply entry point.
+ */
 
-	identity = fb_apply_build_key_identity(state->info, tuple, state->tupdesc);
-	fb_keyed_upsert_row(state, identity, tuple, true, true);
-}
-
-void
-fb_keyed_state_apply_add_tuple(FbKeyedState *state, HeapTuple tuple)
-{
-	char *identity;
-
-	identity = fb_apply_build_key_identity(state->info, tuple, state->tupdesc);
-	fb_keyed_upsert_row(state, identity, tuple, true, true);
-}
-
-void
-fb_keyed_state_apply_remove_identity(FbKeyedState *state, const char *identity)
-{
-	if (identity != NULL)
-		fb_keyed_remove_row(state->rows, identity);
-}
-
-void
-fb_keyed_state_apply_remove_tuple(FbKeyedState *state, HeapTuple tuple)
-{
-	char *identity;
-
-	identity = fb_apply_build_key_identity(state->info, tuple, state->tupdesc);
-	fb_keyed_remove_row(state->rows, identity);
-	pfree(identity);
-}
-
-uint64
-fb_keyed_state_count_rows(FbKeyedState *state)
-{
-	return fb_keyed_count_rows(state->rows);
-}
-
-uint64
-fb_keyed_state_emit_rows(FbKeyedState *state,
-						  TupleDesc tupdesc,
-						  const FbResultSink *sink)
-{
-	HASH_SEQ_STATUS seq;
-	FbKeyBucket *bucket;
-	uint64 emitted = 0;
-	uint64 total_rows;
-
-	total_rows = fb_keyed_state_count_rows(state);
-	if (total_rows == 0)
-		return 0;
-
-	hash_seq_init(&seq, state->rows);
-	while ((bucket = (FbKeyBucket *) hash_seq_search(&seq)) != NULL)
-	{
-		FbKeyedRow *row;
-
-		for (row = (FbKeyedRow *) bucket->head; row != NULL; row = row->next)
-		{
-			fb_result_sink_put_tuple(sink, row->tuple, tupdesc);
-			emitted++;
-		}
-	}
-
-	return emitted;
-}
-
-uint64
-fb_apply_keyed_mode(const FbRelationInfo *info,
+void *
+fb_keyed_apply_begin(const FbRelationInfo *info,
 					 TupleDesc tupdesc,
-					 const FbReverseOpStream *stream,
-					 const FbResultSink *sink)
+					 const FbReverseOpStream *stream)
 {
-	FbKeyedState *state;
+	FbKeyedApplyState *state;
 	uint32 i;
-	uint64 emitted;
-	uint64 total_rows;
 
-	state = fb_keyed_state_create(info,
-								  tupdesc,
-								  stream->tracked_bytes,
-								  stream->memory_limit_bytes);
-
-	fb_apply_scan_current_relation(info->relid,
-								   fb_keyed_load_current_tuple,
-								   state,
-								   NULL);
-	if (stream->count == 0)
-		fb_progress_update_percent(FB_PROGRESS_STAGE_APPLY, 100, NULL);
+	state = palloc0(sizeof(*state));
+	state->info = info;
+	state->tupdesc = tupdesc;
+	state->buckets = fb_apply_create_bucket_hash("fb keyed changed keys");
+	state->tracked_bytes = stream->tracked_bytes;
+	state->memory_limit_bytes = stream->memory_limit_bytes;
 
 	for (i = 0; i < stream->count; i++)
 	{
@@ -442,72 +340,133 @@ fb_apply_keyed_mode(const FbRelationInfo *info,
 		switch (op->type)
 		{
 			case FB_REVERSE_REMOVE:
-				if (op->new_row.key_identity != NULL)
-					fb_keyed_state_apply_remove_identity(state,
-														 op->new_row.key_identity);
+				fb_keyed_append_action(state,
+									   op->new_row.key_identity,
+									   FB_KEYED_ACTION_REMOVE,
+									   NULL);
 				break;
 			case FB_REVERSE_ADD:
-				if (op->old_row.tuple != NULL)
-					fb_keyed_state_apply_add_tuple(state, op->old_row.tuple);
+				fb_keyed_append_action(state,
+									   op->old_row.key_identity,
+									   FB_KEYED_ACTION_ADD,
+									   op->old_row.tuple);
 				break;
 			case FB_REVERSE_REPLACE:
-				if (op->new_row.key_identity != NULL)
-					fb_keyed_state_apply_remove_identity(state,
-														 op->new_row.key_identity);
-				if (op->old_row.tuple != NULL)
-					fb_keyed_state_apply_add_tuple(state, op->old_row.tuple);
+				fb_keyed_append_action(state,
+									   op->new_row.key_identity,
+									   FB_KEYED_ACTION_REMOVE,
+									   NULL);
+				fb_keyed_append_action(state,
+									   op->old_row.key_identity,
+									   FB_KEYED_ACTION_ADD,
+									   op->old_row.tuple);
 				break;
 		}
-
-		fb_progress_update_percent(FB_PROGRESS_STAGE_APPLY,
-								   fb_progress_map_subrange(40, 60,
-															(uint64) i + 1,
-															stream->count),
-								   NULL);
 	}
 
-	total_rows = fb_keyed_state_count_rows(state);
-	fb_progress_enter_stage(FB_PROGRESS_STAGE_MATERIALIZE, NULL);
-	if (total_rows == 0)
-	{
-		fb_progress_update_percent(FB_PROGRESS_STAGE_MATERIALIZE, 100, NULL);
-		return 0;
-	}
-
-	emitted = 0;
-	{
-		HASH_SEQ_STATUS seq;
-		FbKeyBucket *bucket;
-
-		hash_seq_init(&seq, state->rows);
-		while ((bucket = (FbKeyBucket *) hash_seq_search(&seq)) != NULL)
-		{
-			FbKeyedRow *row;
-
-			for (row = (FbKeyedRow *) bucket->head; row != NULL; row = row->next)
-			{
-				fb_result_sink_put_tuple(sink, row->tuple, tupdesc);
-				emitted++;
-				fb_progress_update_fraction(FB_PROGRESS_STAGE_MATERIALIZE,
-											 emitted,
-											 total_rows,
-											 NULL);
-			}
-		}
-	}
-
-	return emitted;
+	return state;
 }
 
-uint64
-fb_apply_reverse_ops(const FbRelationInfo *info,
-					  TupleDesc tupdesc,
-					  const FbReverseOpStream *stream,
-					  const FbResultSink *sink)
-{
-	fb_progress_enter_stage(FB_PROGRESS_STAGE_APPLY, NULL);
-	if (info->mode == FB_APPLY_KEYED)
-		return fb_apply_keyed_mode(info, tupdesc, stream, sink);
+/*
+ * fb_keyed_apply_process_current
+ *    Keyed apply entry point.
+ */
 
-	return fb_apply_bag_mode(info, tupdesc, stream, sink);
+HeapTuple
+fb_keyed_apply_process_current(void *arg, HeapTuple tuple)
+{
+	FbKeyedApplyState *state = (FbKeyedApplyState *) arg;
+	FbKeyedEntry *entry;
+	char *identity;
+	HeapTuple result;
+
+	identity = fb_apply_build_key_identity(state->info, tuple, state->tupdesc);
+	entry = fb_keyed_find_entry(state->buckets, identity);
+	pfree(identity);
+
+	if (entry == NULL)
+		return tuple;
+
+	if (entry->current_seen)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("fb keyed apply saw duplicate current row for one key")));
+
+	entry->current_seen = true;
+	result = fb_keyed_apply_actions(entry, tuple);
+	if (result != tuple)
+		heap_freetuple(tuple);
+	return result;
+}
+
+/*
+ * fb_keyed_apply_finish_scan
+ *    Keyed apply entry point.
+ */
+
+void
+fb_keyed_apply_finish_scan(void *arg)
+{
+	FbKeyedApplyState *state = (FbKeyedApplyState *) arg;
+	FbKeyedEntry *entry;
+
+	state->residual_total = 0;
+	for (entry = state->entries_head; entry != NULL; entry = entry->all_next)
+	{
+		if (!entry->current_seen && fb_keyed_apply_actions(entry, NULL) != NULL)
+			state->residual_total++;
+	}
+
+	state->residual_cursor = state->entries_head;
+}
+
+/*
+ * fb_keyed_apply_residual_total
+ *    Keyed apply entry point.
+ */
+
+uint64
+fb_keyed_apply_residual_total(void *arg)
+{
+	FbKeyedApplyState *state = (FbKeyedApplyState *) arg;
+
+	return state->residual_total;
+}
+
+/*
+ * fb_keyed_apply_next_residual
+ *    Keyed apply entry point.
+ */
+
+HeapTuple
+fb_keyed_apply_next_residual(void *arg)
+{
+	FbKeyedApplyState *state = (FbKeyedApplyState *) arg;
+
+	while (state->residual_cursor != NULL)
+	{
+		FbKeyedEntry *entry = state->residual_cursor;
+		HeapTuple result;
+
+		state->residual_cursor = entry->all_next;
+		if (entry->current_seen)
+			continue;
+
+		result = fb_keyed_apply_actions(entry, NULL);
+		if (result != NULL)
+			return result;
+	}
+
+	return NULL;
+}
+
+/*
+ * fb_keyed_apply_end
+ *    Keyed apply entry point.
+ */
+
+void
+fb_keyed_apply_end(void *arg)
+{
+	(void) arg;
 }

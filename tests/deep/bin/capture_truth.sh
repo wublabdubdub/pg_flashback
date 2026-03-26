@@ -15,7 +15,6 @@ TRUTH_TABLE="$3"
 fb_deep_psql_sql "CHECKPOINT;"
 fb_deep_psql_file "$FB_DEEP_SQL_DIR/20_capture_truth.sql" \
 	"archive_dest=$FB_DEEP_ARCHIVE_DIR" \
-	"ckwal_dir=$FB_DEEP_CKWAL_DIR" \
 	"source_table=$SOURCE_TABLE" \
 	"marker_label=$MARKER_LABEL" \
 	"truth_table=$TRUTH_TABLE"

@@ -15,5 +15,5 @@ BEGIN
 	EXECUTE format('SET pg_flashback.archive_dir = %L', current_setting('data_directory') || '/pg_wal');
 END;
 $$;
-SELECT pg_flashback('fb_smoke_result', 'fb_smoke_tbl', now()::text);
-TABLE fb_smoke_result;
+SELECT *
+FROM pg_flashback(NULL::public.fb_smoke_tbl, now()::text);

@@ -41,12 +41,9 @@ WHERE ctid = (
 	LIMIT 1
 );
 
-SELECT pg_flashback(
-	'fb_flashback_bag_result',
-	'fb_flashback_bag_target',
-	(SELECT target_ts::text FROM fb_flashback_bag_mark)
-);
-
 SELECT *
-FROM fb_flashback_bag_result
+FROM pg_flashback(
+	NULL::public.fb_flashback_bag_target,
+	(SELECT target_ts::text FROM fb_flashback_bag_mark)
+)
 ORDER BY 1, 2;

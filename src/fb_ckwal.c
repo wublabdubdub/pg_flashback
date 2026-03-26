@@ -1,3 +1,8 @@
+/*
+ * fb_ckwal.c
+ *    Embedded ckwal recovery helpers.
+ */
+
 #include "postgres.h"
 
 #include <sys/stat.h>
@@ -13,23 +18,48 @@
 #include "fb_guc.h"
 #include "fb_runtime.h"
 
+/*
+ * fb_ckwal_read_segment_header
+ *    ckwal helper.
+ */
+
 static bool fb_ckwal_read_segment_header(const char *path,
 										  TimeLineID *timeline_id,
 										  XLogSegNo *segno,
 										  int wal_seg_size);
+/*
+ * fb_ckwal_find_segment_in_directory
+ *    ckwal helper.
+ */
+
 static bool fb_ckwal_find_segment_in_directory(const char *directory,
 											   TimeLineID timeline_id,
 											   XLogSegNo segno,
 											   int wal_seg_size,
 											   char *candidate_path,
 											   Size candidate_path_len);
+/*
+ * fb_ckwal_copy_file
+ *    ckwal helper.
+ */
+
 static bool fb_ckwal_copy_file(const char *src_path, const char *dst_path);
+/*
+ * fb_ckwal_materialize_segment
+ *    ckwal helper.
+ */
+
 static bool fb_ckwal_materialize_segment(const char *src_path,
 										 int wal_seg_size,
 										 TimeLineID *timeline_id,
 										 XLogSegNo *segno,
 										 char *out_path,
 										 Size out_path_len);
+
+/*
+ * fb_ckwal_read_segment_header
+ *    ckwal helper.
+ */
 
 static bool
 fb_ckwal_read_segment_header(const char *path,
@@ -65,6 +95,11 @@ fb_ckwal_read_segment_header(const char *path,
 
 	return true;
 }
+
+/*
+ * fb_ckwal_find_segment_in_directory
+ *    ckwal helper.
+ */
 
 static bool
 fb_ckwal_find_segment_in_directory(const char *directory,
@@ -111,6 +146,11 @@ fb_ckwal_find_segment_in_directory(const char *directory,
 	return false;
 }
 
+/*
+ * fb_ckwal_copy_file
+ *    ckwal helper.
+ */
+
 static bool
 fb_ckwal_copy_file(const char *src_path, const char *dst_path)
 {
@@ -131,6 +171,11 @@ fb_ckwal_copy_file(const char *src_path, const char *dst_path)
 
 	return true;
 }
+
+/*
+ * fb_ckwal_materialize_segment
+ *    ckwal helper.
+ */
 
 static bool
 fb_ckwal_materialize_segment(const char *src_path,
@@ -174,6 +219,11 @@ fb_ckwal_materialize_segment(const char *src_path,
 		*segno = actual_segno;
 	return true;
 }
+
+/*
+ * fb_ckwal_restore_segment
+ *    ckwal entry point.
+ */
 
 bool
 fb_ckwal_restore_segment(TimeLineID timeline_id,
@@ -251,6 +301,11 @@ fb_ckwal_restore_segment(TimeLineID timeline_id,
 		pfree(recovered_search_dir);
 	return true;
 }
+
+/*
+ * fb_ckwal_convert_mismatched_segment
+ *    ckwal entry point.
+ */
 
 bool
 fb_ckwal_convert_mismatched_segment(const char *src_path,

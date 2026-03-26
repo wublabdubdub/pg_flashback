@@ -1,7 +1,6 @@
 \set ON_ERROR_STOP on
 CREATE EXTENSION IF NOT EXISTS pg_flashback;
 SET pg_flashback.archive_dest = :'archive_dest';
-SET pg_flashback.ckwal_restore_dir = :'ckwal_dir';
 SELECT set_config('fb_deep.source_table', :'source_table', false);
 SELECT set_config('fb_deep.truth_table', :'truth_table', false);
 

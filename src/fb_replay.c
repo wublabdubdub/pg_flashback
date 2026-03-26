@@ -1,9 +1,14 @@
+/*
+ * fb_replay.c
+ *    Page replay and forward-op extraction.
+ */
+
 #include "postgres.h"
 
 #include "access/heapam.h"
+#include "lib/stringinfo.h"
 #include "access/relation.h"
 #include "access/heapam_xlog.h"
-#include "access/heaptoast.h"
 #include "storage/bufpage.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
@@ -16,12 +21,22 @@
 #include "fb_replay.h"
 #include "fb_toast.h"
 
+/*
+ * FbReplayBlockKey
+ *    Private replay structure.
+ */
+
 typedef struct FbReplayBlockKey
 {
 	RelFileLocator locator;
 	ForkNumber forknum;
 	BlockNumber blkno;
 } FbReplayBlockKey;
+
+/*
+ * FbReplayBlockState
+ *    Tracks replay block state.
+ */
 
 typedef struct FbReplayBlockState
 {
@@ -30,6 +45,11 @@ typedef struct FbReplayBlockState
 	char page[BLCKSZ];
 	XLogRecPtr page_lsn;
 } FbReplayBlockState;
+
+/*
+ * FbReplayStore
+ *    Private replay structure.
+ */
 
 typedef struct FbReplayStore
 {
@@ -43,6 +63,11 @@ typedef enum FbReplayPhase
 	FB_REPLAY_PHASE_FINAL
 } FbReplayPhase;
 
+/*
+ * FbReplayMissingBlock
+ *    Private replay structure.
+ */
+
 typedef struct FbReplayMissingBlock
 {
 	FbReplayBlockKey key;
@@ -51,6 +76,11 @@ typedef struct FbReplayMissingBlock
 	bool anchor_found;
 } FbReplayMissingBlock;
 
+/*
+ * FbReplayControl
+ *    Private replay structure.
+ */
+
 typedef struct FbReplayControl
 {
 	FbReplayPhase phase;
@@ -58,6 +88,11 @@ typedef struct FbReplayControl
 	uint32 round_no;
 	HTAB *missing_blocks;
 } FbReplayControl;
+
+/*
+ * fb_replay_progress_stage
+ *    Replay helper.
+ */
 
 static FbProgressStage
 fb_replay_progress_stage(FbReplayPhase phase)
@@ -76,6 +111,11 @@ fb_replay_progress_stage(FbReplayPhase phase)
 	return FB_PROGRESS_STAGE_REPLAY_FINAL;
 }
 
+/*
+ * fb_replay_progress_detail
+ *    Replay helper.
+ */
+
 static char *
 fb_replay_progress_detail(FbReplayControl *control)
 {
@@ -84,6 +124,11 @@ fb_replay_progress_detail(FbReplayControl *control)
 
 	return psprintf("round=%u", control->round_no);
 }
+
+/*
+ * fb_replay_progress_enter
+ *    Replay helper.
+ */
 
 static void
 fb_replay_progress_enter(FbReplayControl *control)
@@ -98,6 +143,11 @@ fb_replay_progress_enter(FbReplayControl *control)
 	if (detail != NULL)
 		pfree(detail);
 }
+
+/*
+ * fb_replay_progress_update
+ *    Replay helper.
+ */
 
 static void
 fb_replay_progress_update(FbReplayControl *control, uint32 current, uint32 total)
@@ -116,9 +166,19 @@ fb_replay_progress_update(FbReplayControl *control, uint32 current, uint32 total
 		pfree(detail);
 }
 
+/*
+ * fb_replay_missing_fpi_error
+ *    Replay helper.
+ */
+
 static void fb_replay_missing_fpi_error(const FbRecordRef *record,
 										const FbRecordBlockRef *block_ref,
 										bool allow_init);
+
+/*
+ * fb_replay_charge_bytes
+ *    Replay helper.
+ */
 
 static void
 fb_replay_charge_bytes(FbReplayResult *result, Size bytes, const char *what)
@@ -131,6 +191,11 @@ fb_replay_charge_bytes(FbReplayResult *result, Size bytes, const char *what)
 						   bytes,
 						   what);
 }
+
+/*
+ * fb_replay_create_block_hash
+ *    Replay helper.
+ */
 
 static HTAB *
 fb_replay_create_block_hash(void)
@@ -146,6 +211,11 @@ fb_replay_create_block_hash(void)
 					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
+/*
+ * fb_replay_create_missing_block_hash
+ *    Replay helper.
+ */
+
 static HTAB *
 fb_replay_create_missing_block_hash(void)
 {
@@ -159,6 +229,11 @@ fb_replay_create_missing_block_hash(void)
 	return hash_create("fb replay missing blocks", 64, &ctl,
 					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
+
+/*
+ * fb_fix_infomask_from_infobits
+ *    Replay helper.
+ */
 
 static void
 fb_fix_infomask_from_infobits(uint8 infobits, uint16 *infomask, uint16 *infomask2)
@@ -178,6 +253,11 @@ fb_fix_infomask_from_infobits(uint8 infobits, uint16 *infomask, uint16 *infomask
 	if (infobits & XLHL_KEYS_UPDATED)
 		*infomask2 |= HEAP_KEYS_UPDATED;
 }
+
+/*
+ * fb_tuple_identity
+ *    Replay helper.
+ */
 
 static char *
 fb_tuple_identity(HeapTuple tuple, TupleDesc tupdesc,
@@ -245,6 +325,11 @@ fb_tuple_identity(HeapTuple tuple, TupleDesc tupdesc,
 	return buf.data;
 }
 
+/*
+ * fb_copy_page_tuple
+ *    Replay helper.
+ */
+
 static HeapTuple
 fb_copy_page_tuple(Page page, BlockNumber blkno, OffsetNumber offnum)
 {
@@ -266,6 +351,11 @@ fb_copy_page_tuple(Page page, BlockNumber blkno, OffsetNumber offnum)
 	return heap_copytuple(&local_tuple);
 }
 
+/*
+ * fb_record_is_speculative_insert
+ *    Replay helper.
+ */
+
 static bool
 fb_record_is_speculative_insert(const FbRecordRef *record)
 {
@@ -279,6 +369,11 @@ fb_record_is_speculative_insert(const FbRecordRef *record)
 	return (xlrec->flags & XLH_INSERT_IS_SPECULATIVE) != 0;
 }
 
+/*
+ * fb_record_is_super_delete
+ *    Replay helper.
+ */
+
 static bool
 fb_record_is_super_delete(const FbRecordRef *record)
 {
@@ -291,6 +386,11 @@ fb_record_is_super_delete(const FbRecordRef *record)
 	xlrec = (const xl_heap_delete *) record->main_data;
 	return (xlrec->flags & XLH_DELETE_IS_SUPER) != 0;
 }
+
+/*
+ * fb_page_prune_execute
+ *    Replay helper.
+ */
 
 static void
 fb_page_prune_execute(Page page, bool lp_truncate_only,
@@ -334,6 +434,11 @@ fb_page_prune_execute(Page page, bool lp_truncate_only,
 		PageRepairFragmentation(page);
 }
 
+/*
+ * fb_row_image_set_identities
+ *    Replay helper.
+ */
+
 static void
 fb_row_image_set_identities(const FbRelationInfo *info,
 							TupleDesc tupdesc,
@@ -367,6 +472,11 @@ fb_row_image_set_identities(const FbRelationInfo *info,
 	}
 }
 
+/*
+ * fb_prepare_historical_visible_tuple
+ *    Replay helper.
+ */
+
 static HeapTuple
 fb_prepare_historical_visible_tuple(const FbRelationInfo *info,
 									FbToastStore *toast_store,
@@ -382,6 +492,11 @@ fb_prepare_historical_visible_tuple(const FbRelationInfo *info,
 
 	return tuple;
 }
+
+/*
+ * fb_forward_stream_finalize
+ *    Replay helper.
+ */
 
 static void
 fb_forward_stream_finalize(const FbRelationInfo *info,
@@ -585,6 +700,11 @@ fb_forward_stream_finalize(const FbRelationInfo *info,
 	}
 }
 
+/*
+ * fb_forward_stream_append
+ *    Replay helper.
+ */
+
 static void
 fb_forward_stream_append(FbForwardOpStream *stream,
 						 const FbForwardOp *op,
@@ -616,6 +736,11 @@ fb_forward_stream_append(FbForwardOpStream *stream,
 	stream->ops[stream->count++] = *op;
 }
 
+/*
+ * fb_replay_find_existing_block
+ *    Replay helper.
+ */
+
 static FbReplayBlockState *
 fb_replay_find_existing_block(FbReplayStore *store,
 							  const FbRecordBlockRef *block_ref)
@@ -629,6 +754,11 @@ fb_replay_find_existing_block(FbReplayStore *store,
 
 	return (FbReplayBlockState *) hash_search(store->blocks, &key, HASH_FIND, NULL);
 }
+
+/*
+ * fb_replay_get_block
+ *    Replay helper.
+ */
 
 static FbReplayBlockState *
 fb_replay_get_block(FbReplayStore *store,
@@ -661,6 +791,11 @@ fb_replay_get_block(FbReplayStore *store,
 	return state;
 }
 
+/*
+ * fb_replay_block_key_from_ref
+ *    Replay helper.
+ */
+
 static FbReplayBlockKey
 fb_replay_block_key_from_ref(const FbRecordBlockRef *block_ref)
 {
@@ -672,6 +807,11 @@ fb_replay_block_key_from_ref(const FbRecordBlockRef *block_ref)
 	key.blkno = block_ref->blkno;
 	return key;
 }
+
+/*
+ * fb_replay_note_missing_block
+ *    Replay helper.
+ */
 
 static void
 fb_replay_note_missing_block(FbReplayControl *control,
@@ -697,6 +837,11 @@ fb_replay_note_missing_block(FbReplayControl *control,
 		entry->first_record_index = control->record_index;
 }
 
+/*
+ * fb_record_allows_init_for_block
+ *    Replay helper.
+ */
+
 static bool
 fb_record_allows_init_for_block(const FbRecordRef *record, int block_index)
 {
@@ -715,6 +860,11 @@ fb_record_allows_init_for_block(const FbRecordRef *record, int block_index)
 	}
 }
 
+/*
+ * fb_replay_find_missing_block
+ *    Replay helper.
+ */
+
 static FbReplayMissingBlock *
 fb_replay_find_missing_block(HTAB *missing_blocks,
 							 const FbRecordBlockRef *block_ref)
@@ -728,6 +878,11 @@ fb_replay_find_missing_block(HTAB *missing_blocks,
 	return (FbReplayMissingBlock *) hash_search(missing_blocks, &key,
 												HASH_FIND, NULL);
 }
+
+/*
+ * fb_replay_missing_block_count
+ *    Replay helper.
+ */
 
 static uint32
 fb_replay_missing_block_count(HTAB *missing_blocks)
@@ -745,6 +900,11 @@ fb_replay_missing_block_count(HTAB *missing_blocks)
 
 	return count;
 }
+
+/*
+ * fb_replay_merge_missing_blocks
+ *    Replay helper.
+ */
 
 static void
 fb_replay_merge_missing_blocks(HTAB *dest, HTAB *src)
@@ -775,6 +935,11 @@ fb_replay_merge_missing_blocks(HTAB *dest, HTAB *src)
 		}
 	}
 }
+
+/*
+ * fb_replay_resolve_missing_anchors
+ *    Replay helper.
+ */
 
 static void
 fb_replay_resolve_missing_anchors(const FbWalRecordIndex *index,
@@ -813,6 +978,11 @@ fb_replay_resolve_missing_anchors(const FbWalRecordIndex *index,
 	}
 }
 
+/*
+ * fb_replay_min_anchor_index
+ *    Replay helper.
+ */
+
 static uint32
 fb_replay_min_anchor_index(HTAB *missing_blocks)
 {
@@ -831,6 +1001,11 @@ fb_replay_min_anchor_index(HTAB *missing_blocks)
 
 	return min_index;
 }
+
+/*
+ * fb_replay_raise_unresolved_missing_fpi
+ *    Replay helper.
+ */
 
 static void
 fb_replay_raise_unresolved_missing_fpi(const FbWalRecordIndex *index,
@@ -857,6 +1032,11 @@ fb_replay_raise_unresolved_missing_fpi(const FbWalRecordIndex *index,
 	}
 }
 
+/*
+ * fb_record_should_apply_for_backtrack
+ *    Replay helper.
+ */
+
 static bool
 fb_record_should_apply_for_backtrack(const FbRecordRef *record,
 									 HTAB *missing_blocks,
@@ -881,6 +1061,11 @@ fb_record_should_apply_for_backtrack(const FbRecordRef *record,
 
 	return touches_backtracked;
 }
+
+/*
+ * fb_replay_missing_fpi_error
+ *    Replay helper.
+ */
 
 static void
 fb_replay_missing_fpi_error(const FbRecordRef *record,
@@ -943,9 +1128,9 @@ fb_replay_missing_fpi_error(const FbRecordRef *record,
 			 errdetail("kind=%s lsn=%X/%08X rel=%u/%u/%u fork=%u blk=%u allow_init=%s has_image=%s apply_image=%s has_data=%s init_page=%s toast=%s",
 					   kind,
 					   LSN_FORMAT_ARGS(record->lsn),
-					   block_ref->locator.spcOid,
-					   block_ref->locator.dbOid,
-					   block_ref->locator.relNumber,
+					   FB_LOCATOR_SPCOID(block_ref->locator),
+					   FB_LOCATOR_DBOID(block_ref->locator),
+					   FB_LOCATOR_RELNUMBER(block_ref->locator),
 					   (unsigned int) block_ref->forknum,
 					   block_ref->blkno,
 					   allow_init ? "true" : "false",
@@ -955,6 +1140,11 @@ fb_replay_missing_fpi_error(const FbRecordRef *record,
 					   record->init_page ? "true" : "false",
 					   block_ref->is_toast_relation ? "true" : "false")));
 }
+
+/*
+ * fb_replay_ensure_block_ready
+ *    Replay helper.
+ */
 
 static void
 fb_replay_ensure_block_ready(FbReplayStore *store,
@@ -1012,6 +1202,11 @@ fb_replay_ensure_block_ready(FbReplayStore *store,
 		*ready = true;
 }
 
+/*
+ * fb_append_forward_insert
+ *    Replay helper.
+ */
+
 static void
 fb_append_forward_insert(const FbRelationInfo *info, TupleDesc tupdesc,
 						 FbToastStore *toast_store,
@@ -1034,6 +1229,11 @@ fb_append_forward_insert(const FbRelationInfo *info, TupleDesc tupdesc,
 	fb_forward_stream_append(stream, &op, result);
 }
 
+/*
+ * fb_append_forward_delete
+ *    Replay helper.
+ */
+
 static void
 fb_append_forward_delete(const FbRelationInfo *info, TupleDesc tupdesc,
 						 FbToastStore *toast_store,
@@ -1055,6 +1255,11 @@ fb_append_forward_delete(const FbRelationInfo *info, TupleDesc tupdesc,
 						   "forward row tuple");
 	fb_forward_stream_append(stream, &op, result);
 }
+
+/*
+ * fb_append_forward_update
+ *    Replay helper.
+ */
 
 static void
 fb_append_forward_update(const FbRelationInfo *info, TupleDesc tupdesc,
@@ -1083,6 +1288,11 @@ fb_append_forward_update(const FbRelationInfo *info, TupleDesc tupdesc,
 	fb_forward_stream_append(stream, &op, result);
 }
 
+/*
+ * fb_toast_store_put_from_tuple
+ *    Replay helper.
+ */
+
 static void
 fb_toast_store_put_from_tuple(FbToastStore *toast_store,
 							  TupleDesc toast_tupdesc,
@@ -1094,6 +1304,11 @@ fb_toast_store_put_from_tuple(FbToastStore *toast_store,
 	fb_toast_store_put_tuple(toast_store, toast_tupdesc, tuple);
 }
 
+/*
+ * fb_toast_store_remove_from_tuple
+ *    Replay helper.
+ */
+
 static void
 fb_toast_store_remove_from_tuple(FbToastStore *toast_store,
 								 TupleDesc toast_tupdesc,
@@ -1104,6 +1319,11 @@ fb_toast_store_remove_from_tuple(FbToastStore *toast_store,
 
 	fb_toast_store_remove_tuple(toast_store, toast_tupdesc, tuple);
 }
+
+/*
+ * fb_replay_sync_toast_page_if_image
+ *    Replay helper.
+ */
 
 static void
 fb_replay_sync_toast_page_if_image(const FbRecordBlockRef *block_ref,
@@ -1122,6 +1342,11 @@ fb_replay_sync_toast_page_if_image(const FbRecordBlockRef *block_ref,
 	fb_toast_store_sync_page(toast_store, toast_tupdesc, page, block_ref->blkno);
 }
 
+/*
+ * fb_replay_get_tuple_from_page
+ *    Replay helper.
+ */
+
 static HeapTupleHeader
 fb_replay_get_tuple_from_page(Page page, OffsetNumber offnum, uint32 *tuple_len)
 {
@@ -1138,6 +1363,11 @@ fb_replay_get_tuple_from_page(Page page, OffsetNumber offnum, uint32 *tuple_len)
 		*tuple_len = ItemIdGetLength(lp);
 	return (HeapTupleHeader) PageGetItem(page, lp);
 }
+
+/*
+ * fb_replay_heap_insert
+ *    Replay helper.
+ */
 
 static void
 fb_replay_heap_insert(const FbRelationInfo *info,
@@ -1208,9 +1438,9 @@ fb_replay_heap_insert(const FbRelationInfo *info,
 					 errmsg("failed to replay heap insert"),
 					 errdetail("lsn=%X/%08X rel=%u/%u/%u blk=%u off=%u image=%s apply_image=%s data=%s init_page=%s maxoff=%u has_item=%s",
 							   LSN_FORMAT_ARGS(record->lsn),
-							   block_ref->locator.spcOid,
-							   block_ref->locator.dbOid,
-							   block_ref->locator.relNumber,
+							   FB_LOCATOR_SPCOID(block_ref->locator),
+							   FB_LOCATOR_DBOID(block_ref->locator),
+							   FB_LOCATOR_RELNUMBER(block_ref->locator),
 							   block_ref->blkno,
 							   xlrec->offnum,
 							   block_ref->has_image ? "true" : "false",
@@ -1251,6 +1481,11 @@ fb_replay_heap_insert(const FbRelationInfo *info,
 									result, stream);
 	}
 }
+
+/*
+ * fb_replay_heap_delete
+ *    Replay helper.
+ */
 
 static void
 fb_replay_heap_delete(const FbRelationInfo *info,
@@ -1328,6 +1563,11 @@ fb_replay_heap_delete(const FbRelationInfo *info,
 	if (old_toast_tuple != NULL)
 		fb_toast_store_remove_from_tuple(toast_store, toast_tupdesc, old_toast_tuple);
 }
+
+/*
+ * fb_replay_heap_update
+ *    Replay helper.
+ */
 
 static void
 fb_replay_heap_update(const FbRelationInfo *info,
@@ -1562,6 +1802,11 @@ fb_replay_heap_update(const FbRelationInfo *info,
 	}
 }
 
+/*
+ * fb_replay_heap_lock
+ *    Replay helper.
+ */
+
 static void
 fb_replay_heap_lock(const FbRecordRef *record,
 					FbReplayStore *store,
@@ -1609,12 +1854,17 @@ fb_replay_heap_lock(const FbRecordRef *record,
 		HeapTupleHeaderClearHotUpdated(htup);
 		ItemPointerSet(&htup->t_ctid, block_ref->blkno, xlrec->offnum);
 	}
-	HeapTupleHeaderSetXmax(htup, xlrec->xmax);
+	HeapTupleHeaderSetXmax(htup, FB_XL_HEAP_LOCK_XMAX(xlrec));
 	HeapTupleHeaderSetCmax(htup, FirstCommandId, false);
 
 	state->page_lsn = record->end_lsn;
 	result->records_replayed++;
 }
+
+/*
+ * fb_replay_heap2_prune
+ *    Replay helper.
+ */
 
 static void
 fb_replay_heap2_prune(const FbRecordRef *record,
@@ -1622,6 +1872,7 @@ fb_replay_heap2_prune(const FbRecordRef *record,
 					  FbReplayControl *control,
 					  FbReplayResult *result)
 {
+#if PG_VERSION_NUM >= 170000
 	xl_heap_prune xlrec;
 	FbReplayBlockState *state;
 	FbRecordBlockRef *block_ref = (FbRecordBlockRef *) &record->blocks[0];
@@ -1702,7 +1953,42 @@ fb_replay_heap2_prune(const FbRecordRef *record,
 
 	state->page_lsn = record->end_lsn;
 	result->records_replayed++;
+#else
+	FbReplayBlockState *state;
+	FbRecordBlockRef *block_ref = (FbRecordBlockRef *) &record->blocks[0];
+	bool ready;
+
+	if (!block_ref->has_image && !record->init_page)
+	{
+		state = fb_replay_find_existing_block(store, block_ref);
+		if (state == NULL || !state->initialized)
+		{
+			result->records_replayed++;
+			return;
+		}
+	}
+	else
+		fb_replay_ensure_block_ready(store, block_ref, record, false,
+									 control, result, &state, &ready);
+	if (block_ref->has_image || record->init_page)
+	{
+		if (!ready)
+			return;
+	}
+
+	/*
+	 * PG12-16 use older prune record layouts. Keep them as the existing
+	 * conservative no-op until those versions get dedicated minimal replay.
+	 */
+	state->page_lsn = record->end_lsn;
+	result->records_replayed++;
+#endif
 }
+
+/*
+ * fb_replay_heap_confirm
+ *    Replay helper.
+ */
 
 static void
 fb_replay_heap_confirm(const FbRecordRef *record,
@@ -1732,6 +2018,11 @@ fb_replay_heap_confirm(const FbRecordRef *record,
 	state->page_lsn = record->end_lsn;
 	result->records_replayed++;
 }
+
+/*
+ * fb_replay_heap_inplace
+ *    Replay helper.
+ */
 
 static void
 fb_replay_heap_inplace(const FbRecordRef *record,
@@ -1773,6 +2064,11 @@ fb_replay_heap_inplace(const FbRecordRef *record,
 	result->records_replayed++;
 }
 
+/*
+ * fb_replay_heap2_visible
+ *    Replay helper.
+ */
+
 static void
 fb_replay_heap2_visible(const FbRecordRef *record,
 						FbReplayStore *store,
@@ -1793,6 +2089,11 @@ fb_replay_heap2_visible(const FbRecordRef *record,
 	state->page_lsn = record->end_lsn;
 	result->records_replayed++;
 }
+
+/*
+ * fb_replay_heap2_lock_updated
+ *    Replay helper.
+ */
 
 static void
 fb_replay_heap2_lock_updated(const FbRecordRef *record,
@@ -1841,6 +2142,11 @@ fb_replay_heap2_lock_updated(const FbRecordRef *record,
 	result->records_replayed++;
 }
 
+/*
+ * fb_replay_xlog_fpi
+ *    Replay helper.
+ */
+
 static void
 fb_replay_xlog_fpi(const FbRecordRef *record,
 				   FbReplayStore *store,
@@ -1869,6 +2175,11 @@ fb_replay_xlog_fpi(const FbRecordRef *record,
 
 	result->records_replayed++;
 }
+
+/*
+ * fb_replay_heap2_multi_insert
+ *    Replay helper.
+ */
 
 static void
 fb_replay_heap2_multi_insert(const FbRelationInfo *info,
@@ -1989,7 +2300,7 @@ fb_replay_heap2_multi_insert(const FbRelationInfo *info,
 
 	if (xlrec->flags & XLH_INSERT_ALL_VISIBLE_CLEARED)
 		PageClearAllVisible(page);
-	if (xlrec->flags & XLH_INSERT_ALL_FROZEN_SET)
+	if (xlrec->flags & FB_XLH_INSERT_ALL_FROZEN_SET)
 		PageSetAllVisible(page);
 
 	state->page_lsn = record->end_lsn;
@@ -1997,6 +2308,11 @@ fb_replay_heap2_multi_insert(const FbRelationInfo *info,
 	if (record->committed_after_target && block_ref->is_main_relation)
 		result->target_insert_count += xlrec->ntuples;
 }
+
+/*
+ * fb_replay_run_pass
+ *    Replay helper.
+ */
 
 static void
 fb_replay_run_pass(const FbRelationInfo *info,
@@ -2083,6 +2399,11 @@ fb_replay_run_pass(const FbRelationInfo *info,
 	}
 }
 
+/*
+ * fb_replay_warm_store
+ *    Replay helper.
+ */
+
 static void
 fb_replay_warm_store(const FbRelationInfo *info,
 					 const FbWalRecordIndex *index,
@@ -2119,6 +2440,11 @@ fb_replay_warm_store(const FbRelationInfo *info,
 	fb_progress_update_percent(FB_PROGRESS_STAGE_REPLAY_WARM, 100, NULL);
 }
 
+/*
+ * fb_replay_init_result
+ *    Replay helper.
+ */
+
 static void
 fb_replay_init_result(const FbWalRecordIndex *index,
 					  FbReplayResult *result)
@@ -2127,6 +2453,11 @@ fb_replay_init_result(const FbWalRecordIndex *index,
 	result->tracked_bytes = index->tracked_bytes;
 	result->memory_limit_bytes = index->memory_limit_bytes;
 }
+
+/*
+ * fb_replay_execute_internal
+ *    Replay helper.
+ */
 
 static void
 fb_replay_execute_internal(const FbRelationInfo *info,
@@ -2260,6 +2591,11 @@ fb_replay_execute_internal(const FbRelationInfo *info,
 			fb_toast_store_destroy(toast_store);
 	}
 
+/*
+ * fb_replay_execute
+ *    Replay entry point.
+ */
+
 void
 fb_replay_execute(const FbRelationInfo *info,
 				  const FbWalRecordIndex *index,
@@ -2267,6 +2603,11 @@ fb_replay_execute(const FbRelationInfo *info,
 {
 	fb_replay_execute_internal(info, index, NULL, result, NULL);
 }
+
+/*
+ * fb_replay_build_forward_ops
+ *    Replay entry point.
+ */
 
 void
 fb_replay_build_forward_ops(const FbRelationInfo *info,

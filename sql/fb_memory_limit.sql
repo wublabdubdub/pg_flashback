@@ -35,9 +35,9 @@ INSERT INTO fb_memory_limit_target VALUES (1, 'alpha');
 UPDATE fb_memory_limit_target SET payload = 'alpha-updated' WHERE id = 1;
 DELETE FROM fb_memory_limit_target WHERE id = 0;
 
-SELECT pg_flashback(
-	'fb_memory_limit_result',
-	'fb_memory_limit_target',
+SELECT *
+FROM pg_flashback(
+	NULL::public.fb_memory_limit_target,
 	(SELECT target_ts::text FROM fb_memory_limit_mark)
 );
 
@@ -64,10 +64,18 @@ UPDATE fb_memory_limit_apply_target
 SET payload = payload || 'x'
 WHERE id = 1;
 
+SET pg_flashback.memory_limit_kb = 2048;
 SET client_min_messages = warning;
 
-SELECT pg_flashback(
-	'fb_memory_limit_apply_result',
-	'fb_memory_limit_apply_target',
-	(SELECT target_ts::text FROM fb_memory_limit_apply_mark)
-);
+WITH flashback AS (
+	SELECT *
+	FROM pg_flashback(
+		NULL::public.fb_memory_limit_apply_target,
+		(SELECT target_ts::text FROM fb_memory_limit_apply_mark)
+	)
+)
+SELECT count(*) AS result_count,
+	   min(id) AS min_id,
+	   max(id) AS max_id,
+	   max(payload) FILTER (WHERE id = 1) = repeat(md5('1'), 8) AS restored_seed
+FROM flashback;

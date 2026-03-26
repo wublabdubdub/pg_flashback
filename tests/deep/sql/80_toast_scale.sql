@@ -23,7 +23,6 @@
 CREATE EXTENSION IF NOT EXISTS pg_flashback;
 SELECT set_config('pg_flashback.archive_dir', current_setting('data_directory') || '/pg_wal', false);
 
-DROP TABLE IF EXISTS fb_toast_scale_result;
 DROP TABLE IF EXISTS fb_toast_scale_mark;
 DROP TABLE IF EXISTS fb_toast_scale_truth;
 DROP TABLE IF EXISTS fb_toast_scale_src CASCADE;
@@ -86,12 +85,6 @@ WHERE id BETWEEN ((:toast_row_count * 3) / 4) - (:toast_rollback_count / 2)
             AND ((:toast_row_count * 3) / 4) - (:toast_rollback_count / 2) + :toast_rollback_count - 1;
 ROLLBACK;
 
-SELECT pg_flashback(
-	'fb_toast_scale_result',
-	'public.fb_toast_scale_src',
-	(SELECT target_ts::text FROM fb_toast_scale_mark)
-);
-
 WITH truth_rows AS (
 	SELECT id,
 		   md5(payload_a) AS digest_a,
@@ -108,7 +101,10 @@ result_rows AS (
 		   length(payload_a) AS len_a,
 		   length(payload_b) AS len_b,
 		   note
-	FROM fb_toast_scale_result
+	FROM pg_flashback(
+		NULL::public.fb_toast_scale_src,
+		(SELECT target_ts::text FROM fb_toast_scale_mark)
+	)
 ),
 diff_rows AS (
 	(SELECT * FROM truth_rows EXCEPT SELECT * FROM result_rows)
@@ -117,11 +113,14 @@ diff_rows AS (
 )
 SELECT
 	(SELECT count(*) FROM fb_toast_scale_truth) AS truth_count,
-	(SELECT count(*) FROM fb_toast_scale_result) AS result_count,
+	(SELECT count(*) FROM result_rows) AS result_count,
 	(SELECT count(*) FROM diff_rows) AS diff_count;
 
 SELECT id, left(payload_a, 4) AS prefix_a, left(payload_b, 4) AS prefix_b, note
-FROM fb_toast_scale_result
+FROM pg_flashback(
+	NULL::public.fb_toast_scale_src,
+	(SELECT target_ts::text FROM fb_toast_scale_mark)
+)
 WHERE id IN (
 	1,
 	GREATEST(1, :toast_row_count / 3),

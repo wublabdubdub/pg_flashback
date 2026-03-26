@@ -1,9 +1,19 @@
+/*
+ * fb_memory.h
+ *    Inline helpers for query memory accounting.
+ */
+
 #ifndef FB_MEMORY_H
 #define FB_MEMORY_H
 
 #include "postgres.h"
 
 #include "access/htup_details.h"
+
+/*
+ * fb_memory_charge_bytes
+ *    Memory accounting inline helper.
+ */
 
 static inline void
 fb_memory_charge_bytes(uint64 *tracked_bytes,
@@ -27,6 +37,11 @@ fb_memory_charge_bytes(uint64 *tracked_bytes,
 	*tracked_bytes += (uint64) bytes;
 }
 
+/*
+ * fb_memory_cstring_bytes
+ *    Memory accounting inline helper.
+ */
+
 static inline Size
 fb_memory_cstring_bytes(const char *value)
 {
@@ -35,6 +50,11 @@ fb_memory_cstring_bytes(const char *value)
 
 	return strlen(value) + 1;
 }
+
+/*
+ * fb_memory_heaptuple_bytes
+ *    Memory accounting inline helper.
+ */
 
 static inline Size
 fb_memory_heaptuple_bytes(HeapTuple tuple)

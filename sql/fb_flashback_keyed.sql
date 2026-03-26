@@ -33,12 +33,9 @@ INSERT INTO fb_flashback_keyed_target VALUES (1, 'alpha');
 UPDATE fb_flashback_keyed_target SET payload = 'alpha-updated' WHERE id = 1;
 DELETE FROM fb_flashback_keyed_target WHERE id = 0;
 
-SELECT pg_flashback(
-	'fb_flashback_keyed_result',
-	'fb_flashback_keyed_target',
-	(SELECT target_ts::text FROM fb_flashback_keyed_mark)
-);
-
 SELECT *
-FROM fb_flashback_keyed_result
+FROM pg_flashback(
+	NULL::public.fb_flashback_keyed_target,
+	(SELECT target_ts::text FROM fb_flashback_keyed_mark)
+)
 ORDER BY 1, 2;

@@ -15,6 +15,8 @@ SELECT to_regprocedure('fb_runtime_dir_debug()') IS NULL AS no_runtime_debug,
 	   to_regprocedure('fb_replay_debug(regclass,timestamptz)') IS NULL AS no_replay_debug,
 	   to_regprocedure('fb_wal_window_debug(timestamptz)') IS NULL AS no_window_debug,
 	   to_regprocedure('fb_decode_insert_debug(regclass,timestamptz)') IS NULL AS no_decode_debug,
+	   to_regprocedure('pg_flashback(anyelement,text)') IS NOT NULL AS has_query_entry,
+	   to_regprocedure('pg_flashback(text,text,text)') IS NULL AS no_result_table_entry,
 	   to_regprocedure('fb_flashback_materialize(regclass,timestamptz,text)') IS NULL AS no_materialize_helper,
 	   to_regprocedure('fb_internal_flashback(regclass,timestamptz)') IS NULL AS no_internal_srf;
 
@@ -47,12 +49,9 @@ SET payload = 'updated-later',
 WHERE id = 1;
 DELETE FROM fb_user_surface_target WHERE id = 2;
 
-SELECT pg_flashback(
-	'fb_user_surface_result',
-	'fb_user_surface_target',
-	(SELECT target_ts::text FROM fb_user_surface_mark)
-);
-
 SELECT *
-FROM fb_user_surface_result
+FROM pg_flashback(
+	NULL::public.fb_user_surface_target,
+	(SELECT target_ts::text FROM fb_user_surface_mark)
+)
 ORDER BY id;

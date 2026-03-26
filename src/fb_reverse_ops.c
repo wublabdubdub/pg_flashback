@@ -1,3 +1,8 @@
+/*
+ * fb_reverse_ops.c
+ *    Forward-op to reverse-op conversion.
+ */
+
 #include "postgres.h"
 
 #include "utils/builtins.h"
@@ -6,6 +11,11 @@
 #include "fb_progress.h"
 #include "fb_replay.h"
 #include "fb_reverse_ops.h"
+
+/*
+ * fb_reverse_stream_append
+ *    Reverse-op helper.
+ */
 
 static void
 fb_reverse_stream_append(FbReverseOpStream *stream, const FbReverseOp *op)
@@ -34,6 +44,11 @@ fb_reverse_stream_append(FbReverseOpStream *stream, const FbReverseOp *op)
 	stream->ops[stream->count++] = *op;
 }
 
+/*
+ * fb_reverse_op_cmp
+ *    Reverse-op helper.
+ */
+
 static int
 fb_reverse_op_cmp(const void *lhs, const void *rhs)
 {
@@ -51,6 +66,11 @@ fb_reverse_op_cmp(const void *lhs, const void *rhs)
 	return 0;
 }
 
+/*
+ * fb_build_forward_ops
+ *    Reverse-op entry point.
+ */
+
 void
 fb_build_forward_ops(const FbRelationInfo *info,
 					 const FbWalRecordIndex *index,
@@ -63,6 +83,11 @@ fb_build_forward_ops(const FbRelationInfo *info,
 	stream->tracked_bytes = replay_result.tracked_bytes;
 	stream->memory_limit_bytes = replay_result.memory_limit_bytes;
 }
+
+/*
+ * fb_build_reverse_ops
+ *    Reverse-op entry point.
+ */
 
 void
 fb_build_reverse_ops(const FbForwardOpStream *forward,
@@ -117,11 +142,21 @@ fb_build_reverse_ops(const FbForwardOpStream *forward,
 	fb_progress_update_percent(FB_PROGRESS_STAGE_BUILD_REVERSE, 100, NULL);
 }
 
+/*
+ * fb_forward_ops_debug_summary
+ *    Reverse-op entry point.
+ */
+
 char *
 fb_forward_ops_debug_summary(const FbForwardOpStream *stream)
 {
 	return psprintf("forward_ops=%u", stream->count);
 }
+
+/*
+ * fb_reverse_ops_debug_summary
+ *    Reverse-op entry point.
+ */
 
 char *
 fb_reverse_ops_debug_summary(const FbReverseOpStream *stream)

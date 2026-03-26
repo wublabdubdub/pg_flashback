@@ -37,20 +37,18 @@ UPDATE fb_progress_target
 SET note = 'after-target'
 WHERE id = 1;
 
-SELECT pg_flashback(
-	'fb_progress_result_on',
-	'fb_progress_target',
+SELECT *
+FROM pg_flashback(
+	NULL::public.fb_progress_target,
 	(SELECT target_ts::text FROM fb_progress_mark)
-);
-
-SELECT * FROM fb_progress_result_on ORDER BY id;
+)
+ORDER BY id;
 
 SET pg_flashback.show_progress = off;
 
-SELECT pg_flashback(
-	'fb_progress_result_off',
-	'fb_progress_target',
+SELECT *
+FROM pg_flashback(
+	NULL::public.fb_progress_target,
 	(SELECT target_ts::text FROM fb_progress_mark)
-);
-
-SELECT * FROM fb_progress_result_off ORDER BY id;
+)
+ORDER BY id;

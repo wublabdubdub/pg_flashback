@@ -1,3 +1,8 @@
+/*
+ * fb_catalog.c
+ *    Relation catalog checks and apply-mode selection.
+ */
+
 #include "postgres.h"
 
 #include "access/genam.h"
@@ -12,6 +17,11 @@
 
 #include "fb_catalog.h"
 #include "fb_error.h"
+
+/*
+ * fb_catalog_find_stable_unique_key
+ *    Catalog helper.
+ */
 
 static bool
 fb_catalog_find_stable_unique_key(Relation rel, FbRelationInfo *info)
@@ -39,7 +49,7 @@ fb_catalog_find_stable_unique_key(Relation rel, FbRelationInfo *info)
 			int i;
 
 			found = true;
-			info->key_natts = index_form->indnkeyatts;
+			info->key_natts = FB_INDEX_NKEYATTS(index_form);
 			for (i = 0; i < info->key_natts; i++)
 				info->key_attnums[i] = index_rel->rd_index->indkey.values[i];
 			index_close(index_rel, AccessShareLock);
@@ -54,6 +64,11 @@ fb_catalog_find_stable_unique_key(Relation rel, FbRelationInfo *info)
 	return found;
 }
 
+/*
+ * fb_catalog_choose_mode
+ *    Catalog helper.
+ */
+
 static FbApplyMode
 fb_catalog_choose_mode(Relation rel, FbRelationInfo *info)
 {
@@ -62,6 +77,11 @@ fb_catalog_choose_mode(Relation rel, FbRelationInfo *info)
 
 	return FB_APPLY_BAG;
 }
+
+/*
+ * fb_catalog_require_supported_relation
+ *    Catalog helper.
+ */
 
 static void
 fb_catalog_require_supported_relation(Relation rel)
@@ -85,6 +105,11 @@ fb_catalog_require_supported_relation(Relation rel)
 		fb_raise_unsupported_relation("this relation kind");
 }
 
+/*
+ * fb_catalog_load_relation_info
+ *    Catalog entry point.
+ */
+
 void
 fb_catalog_load_relation_info(Oid relid, FbRelationInfo *info)
 {
@@ -104,14 +129,14 @@ fb_catalog_load_relation_info(Oid relid, FbRelationInfo *info)
 
 	info->relid = relid;
 	info->toast_relid = rel->rd_rel->reltoastrelid;
-	info->locator = rel->rd_locator;
+	info->locator = FB_RELATION_LOCATOR(rel);
 	info->mode = mode;
 	info->mode_name = (mode == FB_APPLY_KEYED) ? "keyed" : "bag";
 
 	if (OidIsValid(info->toast_relid))
 	{
 		toast_rel = relation_open(info->toast_relid, AccessShareLock);
-		info->toast_locator = toast_rel->rd_locator;
+		info->toast_locator = FB_RELATION_LOCATOR(toast_rel);
 		info->has_toast_locator = true;
 		relation_close(toast_rel, AccessShareLock);
 	}

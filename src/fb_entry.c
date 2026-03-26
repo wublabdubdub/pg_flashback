@@ -1,14 +1,18 @@
+/*
+ * fb_entry.c
+ *    SQL entry points and direct-query orchestration.
+ */
+
 #include "postgres.h"
 
-#include "catalog/namespace.h"
-#include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/relation.h"
-#include "access/tableam.h"
-#include "executor/spi.h"
-#include "executor/tuptable.h"
+#include "executor/executor.h"
 #include "fmgr.h"
-#include "miscadmin.h"
-#include "nodes/makefuncs.h"
+#include "funcapi.h"
+#include "lib/stringinfo.h"
+#include "nodes/execnodes.h"
+#include "parser/parse_type.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
 #include "utils/timestamp.h"
@@ -19,18 +23,24 @@
 #include "fb_entry.h"
 #include "fb_error.h"
 #include "fb_guc.h"
-#include "fb_parallel.h"
 #include "fb_progress.h"
 #include "fb_reverse_ops.h"
 #include "fb_wal.h"
 
-typedef struct FbTableSinkState
+/*
+ * FbFlashbackQueryState
+ *    Tracks one SRF execution state.
+ */
+
+typedef struct FbFlashbackQueryState
 {
-	Relation rel;
-	TupleTableSlot *slot;
-	BulkInsertState bistate;
-	CommandId cid;
-} FbTableSinkState;
+	FbRelationInfo info;
+	TupleDesc tupdesc;
+	FbReverseOpStream reverse;
+	FbApplyContext *apply;
+	ExprContext *econtext;
+	bool cleanup_registered;
+} FbFlashbackQueryState;
 
 PG_MODULE_MAGIC;
 
@@ -38,6 +48,11 @@ PG_FUNCTION_INFO_V1(fb_version);
 PG_FUNCTION_INFO_V1(fb_check_relation);
 PG_FUNCTION_INFO_V1(pg_flashback);
 PG_FUNCTION_INFO_V1(fb_export_undo);
+
+/*
+ * fb_require_target_ts_not_future
+ *    SQL entry helper.
+ */
 
 static void
 fb_require_target_ts_not_future(TimestampTz target_ts)
@@ -48,11 +63,21 @@ fb_require_target_ts_not_future(TimestampTz target_ts)
 				 errmsg("target timestamp is in the future")));
 }
 
+/*
+ * fb_require_supported_target_relation
+ *    SQL entry helper.
+ */
+
 static void
 fb_require_supported_target_relation(Oid relid, FbRelationInfo *info)
 {
 	fb_catalog_load_relation_info(relid, info);
 }
+
+/*
+ * fb_relation_tupledesc
+ *    SQL entry helper.
+ */
 
 static TupleDesc
 fb_relation_tupledesc(Oid relid)
@@ -61,40 +86,21 @@ fb_relation_tupledesc(Oid relid)
 	TupleDesc tupdesc;
 
 	rel = relation_open(relid, AccessShareLock);
-	tupdesc = CreateTupleDescCopy(RelationGetDescr(rel));
+	tupdesc = BlessTupleDesc(CreateTupleDescCopy(RelationGetDescr(rel)));
 	relation_close(rel, AccessShareLock);
 
 	return tupdesc;
 }
 
-static Oid
-fb_resolve_relation_name(text *name_text, LOCKMODE lockmode, bool missing_ok)
-{
-	List	   *names;
-	RangeVar   *rv;
-
-	names = textToQualifiedNameList(name_text);
-	rv = makeRangeVarFromNameList(names);
-	return RangeVarGetRelid(rv, lockmode, missing_ok);
-}
-
-static char *
-fb_require_result_name(text *name_text)
-{
-	List	   *names = textToQualifiedNameList(name_text);
-
-	if (list_length(names) != 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_NAME),
-				 errmsg("flashback result relation name must be unqualified")));
-
-	return pstrdup(strVal(linitial(names)));
-}
+/*
+ * fb_parse_target_ts_text
+ *    SQL entry helper.
+ */
 
 static TimestampTz
 fb_parse_target_ts_text(text *target_ts_text)
 {
-	char	   *target_ts_cstr = text_to_cstring(target_ts_text);
+	char *target_ts_cstr = text_to_cstring(target_ts_text);
 
 	return DatumGetTimestampTz(DirectFunctionCall3(timestamptz_in,
 												   CStringGetDatum(target_ts_cstr),
@@ -102,57 +108,41 @@ fb_parse_target_ts_text(text *target_ts_text)
 												   Int32GetDatum(-1)));
 }
 
-static char *
-fb_build_create_table_sql(const char *result_name, TupleDesc tupdesc)
+/*
+ * fb_resolve_target_type_relid
+ *    SQL entry helper.
+ */
+
+static Oid
+fb_resolve_target_type_relid(FunctionCallInfo fcinfo)
 {
-	StringInfoData buf;
-	bool		first = true;
-	int			i;
+	Oid type_oid;
+	Oid relid;
 
-	initStringInfo(&buf);
-	appendStringInfo(&buf, "CREATE UNLOGGED TABLE %s (",
-					 quote_identifier(result_name));
-
-	for (i = 0; i < tupdesc->natts; i++)
-	{
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
-		char	   *type_sql;
-
-		if (attr->attisdropped)
-			continue;
-
-		type_sql = format_type_with_typemod(attr->atttypid, attr->atttypmod);
-		appendStringInfo(&buf, "%s%s %s",
-						 first ? "" : ", ",
-						 quote_identifier(NameStr(attr->attname)),
-						 type_sql);
-		first = false;
-	}
-
-	if (first)
+	type_oid = get_fn_expr_argtype(fcinfo->flinfo, 0);
+	if (!OidIsValid(type_oid))
 		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-				 errmsg("could not derive columns for flashback result table")));
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("pg_flashback target type could not be resolved")));
 
-	appendStringInfoChar(&buf, ')');
-	return buf.data;
+	relid = typeidTypeRelid(type_oid);
+	if (!OidIsValid(relid))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("pg_flashback target must be a table row type"),
+				 errhint("Call pg_flashback as SELECT * FROM pg_flashback(NULL::schema.table, target_ts_text).")));
+
+	return relid;
 }
 
-static void
-fb_table_sink_put_tuple(HeapTuple tuple, TupleDesc tupdesc, void *arg)
-{
-	FbTableSinkState *state = (FbTableSinkState *) arg;
-
-	(void) tupdesc;
-
-	ExecStoreHeapTuple(tuple, state->slot, false);
-	table_tuple_insert(state->rel, state->slot, state->cid, 0, state->bistate);
-	ExecClearTuple(state->slot);
-}
+/*
+ * fb_validate_flashback_target
+ *    SQL entry helper.
+ */
 
 static void
 fb_validate_flashback_target(Oid relid, TimestampTz target_ts,
-							  FbRelationInfo *info_out, TupleDesc *tupdesc_out)
+							 FbRelationInfo *info_out, TupleDesc *tupdesc_out)
 {
 	fb_progress_enter_stage(FB_PROGRESS_STAGE_VALIDATE, NULL);
 	fb_require_target_ts_not_future(target_ts);
@@ -160,6 +150,11 @@ fb_validate_flashback_target(Oid relid, TimestampTz target_ts,
 	fb_require_supported_target_relation(relid, info_out);
 	*tupdesc_out = fb_relation_tupledesc(relid);
 }
+
+/*
+ * fb_build_flashback_reverse_ops
+ *    SQL entry helper.
+ */
 
 static void
 fb_build_flashback_reverse_ops(TimestampTz target_ts,
@@ -184,11 +179,57 @@ fb_build_flashback_reverse_ops(TimestampTz target_ts,
 	fb_build_reverse_ops(&forward, reverse);
 }
 
+/*
+ * fb_flashback_cleanup_callback
+ *    SQL entry helper.
+ */
+
+static void
+fb_flashback_cleanup_callback(Datum arg)
+{
+	FbFlashbackQueryState *state = (FbFlashbackQueryState *) DatumGetPointer(arg);
+
+	if (state != NULL && state->apply != NULL)
+	{
+		fb_apply_end(state->apply);
+		state->apply = NULL;
+	}
+
+	fb_progress_abort();
+}
+
+/*
+ * fb_unregister_flashback_cleanup
+ *    SQL entry helper.
+ */
+
+static void
+fb_unregister_flashback_cleanup(FbFlashbackQueryState *state)
+{
+	if (state == NULL || !state->cleanup_registered || state->econtext == NULL)
+		return;
+
+	UnregisterExprContextCallback(state->econtext,
+								  fb_flashback_cleanup_callback,
+								  PointerGetDatum(state));
+	state->cleanup_registered = false;
+}
+
+/*
+ * fb_version
+ *    SQL entry point.
+ */
+
 Datum
 fb_version(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_TEXT_P(cstring_to_text("0.1.0-dev"));
 }
+
+/*
+ * fb_check_relation
+ *    SQL entry point.
+ */
 
 Datum
 fb_check_relation(PG_FUNCTION_ARGS)
@@ -207,92 +248,110 @@ fb_check_relation(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }
 
+/*
+ * pg_flashback
+ *    SQL entry point.
+ */
+
 Datum
 pg_flashback(PG_FUNCTION_ARGS)
 {
-	text	   *result_name_text = PG_GETARG_TEXT_PP(0);
-	text	   *source_name_text = PG_GETARG_TEXT_PP(1);
-	text	   *target_ts_text = PG_GETARG_TEXT_PP(2);
-	char	   *result_name;
-	Oid			source_relid;
-	TimestampTz target_ts;
-	FbRelationInfo info;
-	TupleDesc	tupdesc;
-	char	   *create_sql;
-	FbReverseOpStream reverse;
-	Relation	result_rel;
-	TupleTableSlot *write_slot;
-	FbTableSinkState sink_state;
-	FbResultSink sink;
-	uint64		result_count;
-	bool		use_parallel = false;
+	FuncCallContext *funcctx;
+	FbFlashbackQueryState *state;
 
-	fb_progress_begin();
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext oldcontext;
+		ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+		Oid source_relid;
+		TimestampTz target_ts;
+
+		if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("pg_flashback must be called in a set-returning context")));
+
+		if ((rsinfo->allowedModes & SFRM_ValuePerCall) == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("pg_flashback requires value-per-call SRF mode")));
+
+		if (rsinfo->econtext == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("pg_flashback is missing executor expression context")));
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+		state = palloc0(sizeof(*state));
+		funcctx->user_fctx = state;
+
+		fb_progress_begin();
+		state->econtext = rsinfo->econtext;
+		RegisterExprContextCallback(rsinfo->econtext,
+									fb_flashback_cleanup_callback,
+									PointerGetDatum(state));
+		state->cleanup_registered = true;
+
+		PG_TRY();
+		{
+			source_relid = fb_resolve_target_type_relid(fcinfo);
+			target_ts = fb_parse_target_ts_text(PG_GETARG_TEXT_PP(1));
+			fb_validate_flashback_target(source_relid, target_ts, &state->info, &state->tupdesc);
+			fb_build_flashback_reverse_ops(target_ts, &state->info, state->tupdesc, &state->reverse);
+			state->apply = fb_apply_begin(&state->info,
+										 state->tupdesc,
+										 &state->reverse);
+		}
+		PG_CATCH();
+		{
+			fb_flashback_cleanup_callback(PointerGetDatum(state));
+			MemoryContextSwitchTo(oldcontext);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	state = (FbFlashbackQueryState *) funcctx->user_fctx;
 
 	PG_TRY();
 	{
-		result_name = fb_require_result_name(result_name_text);
-		if (fb_resolve_relation_name(result_name_text, NoLock, true) != InvalidOid)
-			ereport(ERROR,
-					(errcode(ERRCODE_DUPLICATE_TABLE),
-					 errmsg("flashback target relation \"%s\" already exists",
-							result_name)));
+		HeapTuple tuple;
+		Datum result;
 
-		source_relid = fb_resolve_relation_name(source_name_text, AccessShareLock, false);
-		target_ts = fb_parse_target_ts_text(target_ts_text);
-		fb_validate_flashback_target(source_relid, target_ts, &info, &tupdesc);
-		create_sql = fb_build_create_table_sql(result_name, tupdesc);
-		fb_build_flashback_reverse_ops(target_ts, &info, tupdesc, &reverse);
-		use_parallel = fb_parallel_apply_workers() > 0;
-
-		if (use_parallel)
-			result_count = fb_parallel_apply_reverse_ops(result_name,
-														 create_sql,
-														 &info,
-														 tupdesc,
-														 &reverse);
-		else
+		tuple = fb_apply_next(state->apply);
+		if (tuple != NULL)
 		{
-			if (SPI_connect() != SPI_OK_CONNECT)
-				elog(ERROR, "SPI_connect failed");
-			if (SPI_execute(create_sql, false, 0) != SPI_OK_UTILITY)
-				elog(ERROR, "CREATE UNLOGGED TABLE failed");
-			if (SPI_finish() != SPI_OK_FINISH)
-				elog(ERROR, "SPI_finish failed");
-
-			result_rel = relation_open(fb_resolve_relation_name(cstring_to_text(result_name),
-															 RowExclusiveLock,
-															 false),
-									   RowExclusiveLock);
-			write_slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
-			sink_state.rel = result_rel;
-			sink_state.slot = write_slot;
-			sink_state.bistate = GetBulkInsertState();
-			sink_state.cid = GetCurrentCommandId(true);
-			sink.put_tuple = fb_table_sink_put_tuple;
-			sink.arg = &sink_state;
-
-			result_count = fb_apply_reverse_ops(&info, tupdesc, &reverse, &sink);
-
-			table_finish_bulk_insert(result_rel, 0);
-			FreeBulkInsertState(sink_state.bistate);
-			ExecDropSingleTupleTableSlot(write_slot);
-			relation_close(result_rel, RowExclusiveLock);
+			result = heap_copy_tuple_as_datum(tuple, state->tupdesc);
+			SRF_RETURN_NEXT(funcctx, result);
 		}
-		(void) result_count;
-		fb_progress_finish();
 
-		PG_RETURN_TEXT_P(cstring_to_text(result_name));
+		if (state->apply != NULL)
+		{
+			fb_apply_end(state->apply);
+			state->apply = NULL;
+		}
+
+		fb_unregister_flashback_cleanup(state);
+		fb_progress_finish();
 	}
 	PG_CATCH();
 	{
-		fb_progress_abort();
+		fb_flashback_cleanup_callback(PointerGetDatum(state));
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
-	PG_RETURN_NULL();
+	SRF_RETURN_DONE(funcctx);
 }
+
+/*
+ * fb_export_undo
+ *    SQL entry point.
+ */
 
 Datum
 fb_export_undo(PG_FUNCTION_ARGS)

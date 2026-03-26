@@ -1,13 +1,18 @@
+/*
+ * fb_apply_bag.c
+ *    Bag-semantic streaming reverse-op application helpers.
+ */
+
 #include "postgres.h"
 
-#include "common/hashfn.h"
+#include "access/hash.h"
+#include "lib/stringinfo.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 
 #include "fb_apply.h"
 #include "fb_memory.h"
-#include "fb_progress.h"
 
 typedef struct FbBagBucket
 {
@@ -15,24 +20,35 @@ typedef struct FbBagBucket
 	void *head;
 } FbBagBucket;
 
-typedef struct FbBagRow
+typedef struct FbBagEntry
 {
 	char *row_identity;
+	int64 delta;
 	HeapTuple tuple;
-	int64 count;
-	struct FbBagRow *next;
-} FbBagRow;
+	struct FbBagEntry *bucket_next;
+	struct FbBagEntry *all_next;
+} FbBagEntry;
 
-struct FbBagState
+typedef struct FbBagApplyState
 {
 	TupleDesc tupdesc;
-	HTAB *rows;
+	HTAB *buckets;
+	FbBagEntry *entries_head;
+	FbBagEntry *entries_tail;
+	FbBagEntry *residual_cursor;
+	int64 residual_repeat;
+	uint64 residual_total;
 	uint64 tracked_bytes;
 	uint64 memory_limit_bytes;
-};
+} FbBagApplyState;
+
+/*
+ * fb_bag_charge_bytes
+ *    Bag apply helper.
+ */
 
 static void
-fb_bag_charge_bytes(FbBagState *state, Size bytes, const char *what)
+fb_bag_charge_bytes(FbBagApplyState *state, Size bytes, const char *what)
 {
 	if (state == NULL)
 		return;
@@ -42,6 +58,11 @@ fb_bag_charge_bytes(FbBagState *state, Size bytes, const char *what)
 						   bytes,
 						   what);
 }
+
+/*
+ * fb_bag_create_bucket_hash
+ *    Bag apply helper.
+ */
 
 static HTAB *
 fb_bag_create_bucket_hash(void)
@@ -53,18 +74,14 @@ fb_bag_create_bucket_hash(void)
 	ctl.entrysize = sizeof(FbBagBucket);
 	ctl.hcxt = CurrentMemoryContext;
 
-	return hash_create("fb bag rows", 128, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	return hash_create("fb bag changed rows", 128, &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
-static uint32
-fb_bag_hash_identity(const char *identity)
-{
-	if (identity == NULL)
-		return 0;
-
-	return DatumGetUInt32(hash_any((const unsigned char *) identity,
-								   strlen(identity)));
-}
+/*
+ * fb_apply_build_row_identity
+ *    Apply entry point.
+ */
 
 char *
 fb_apply_build_row_identity(HeapTuple tuple, TupleDesc tupdesc)
@@ -113,222 +130,116 @@ fb_apply_build_row_identity(HeapTuple tuple, TupleDesc tupdesc)
 	return buf.data;
 }
 
-static FbBagRow *
-fb_bag_find_row(HTAB *hash, const char *identity)
+/*
+ * fb_bag_find_entry
+ *    Bag apply helper.
+ */
+
+static FbBagEntry *
+fb_bag_find_entry(HTAB *hash, const char *identity)
 {
 	FbBagBucket *bucket;
-	FbBagRow *row;
+	FbBagEntry *entry;
 	uint32 hash_value;
 
-	hash_value = fb_bag_hash_identity(identity);
+	hash_value = fb_apply_hash_identity(identity);
 	bucket = (FbBagBucket *) hash_search(hash, &hash_value, HASH_FIND, NULL);
 	if (bucket == NULL)
 		return NULL;
 
-	for (row = (FbBagRow *) bucket->head; row != NULL; row = row->next)
+	for (entry = (FbBagEntry *) bucket->head;
+		 entry != NULL;
+		 entry = entry->bucket_next)
 	{
-		if (strcmp(row->row_identity, identity) == 0)
-			return row;
+		if (strcmp(entry->row_identity, identity) == 0)
+			return entry;
 	}
 
 	return NULL;
 }
 
-static void
-fb_bag_adjust_row(FbBagState *state,
-				  const char *identity,
-				  HeapTuple tuple,
-				  int64 delta,
-				  bool identity_owned,
-				  bool tuple_owned)
+/*
+ * fb_bag_get_or_create_entry
+ *    Bag apply helper.
+ */
+
+static FbBagEntry *
+fb_bag_get_or_create_entry(FbBagApplyState *state, const char *identity)
 {
 	FbBagBucket *bucket;
-	FbBagRow *row;
+	FbBagEntry *entry;
 	uint32 hash_value;
 	bool found;
 
-	row = fb_bag_find_row(state->rows, identity);
-	if (row == NULL)
-	{
-		hash_value = fb_bag_hash_identity(identity);
-		bucket = (FbBagBucket *) hash_search(state->rows, &hash_value, HASH_ENTER, &found);
-		if (!found)
-			bucket->head = NULL;
+	entry = fb_bag_find_entry(state->buckets, identity);
+	if (entry != NULL)
+		return entry;
 
-		row = palloc0(sizeof(*row));
-		fb_bag_charge_bytes(state, sizeof(*row), "apply bag row state");
-		row->row_identity = (char *) identity;
-		row->tuple = tuple;
-		if (identity_owned)
-			fb_bag_charge_bytes(state,
-								fb_memory_cstring_bytes(identity),
-								"apply bag row identity");
-		if (tuple_owned)
-			fb_bag_charge_bytes(state,
-								fb_memory_heaptuple_bytes(tuple),
-								"apply bag tuple");
-		row->next = (FbBagRow *) bucket->head;
-		bucket->head = row;
-	}
-	else if (row->tuple == NULL && tuple != NULL)
-	{
-		row->tuple = tuple;
-		if (tuple_owned)
-			fb_bag_charge_bytes(state,
-								fb_memory_heaptuple_bytes(tuple),
-								"apply bag tuple");
-	}
+	hash_value = fb_apply_hash_identity(identity);
+	bucket = (FbBagBucket *) hash_search(state->buckets, &hash_value, HASH_ENTER, &found);
+	if (!found)
+		bucket->head = NULL;
+
+	entry = palloc0(sizeof(*entry));
+	fb_bag_charge_bytes(state, sizeof(*entry), "apply bag delta entry");
+	entry->row_identity = pstrdup(identity);
+	fb_bag_charge_bytes(state,
+						fb_memory_cstring_bytes(entry->row_identity),
+						"apply bag row identity");
+	entry->bucket_next = (FbBagEntry *) bucket->head;
+	bucket->head = entry;
+
+	if (state->entries_tail == NULL)
+		state->entries_head = entry;
 	else
-	{
-		if (identity_owned)
-			pfree((char *) identity);
-		if (tuple_owned && tuple != NULL)
-			heap_freetuple(tuple);
-	}
+		state->entries_tail->all_next = entry;
+	state->entries_tail = entry;
 
-	row->count += delta;
+	return entry;
 }
+
+/*
+ * fb_bag_adjust_delta
+ *    Bag apply helper.
+ */
 
 static void
-fb_result_sink_put_tuple(const FbResultSink *sink, HeapTuple tuple, TupleDesc tupdesc)
+fb_bag_adjust_delta(FbBagApplyState *state,
+					 const char *identity,
+					 HeapTuple tuple,
+					 int64 delta)
 {
-	if (sink == NULL || sink->put_tuple == NULL)
-		elog(ERROR, "fb result sink must not be NULL");
+	FbBagEntry *entry;
 
-	sink->put_tuple(tuple, tupdesc, sink->arg);
+	if (identity == NULL)
+		return;
+
+	entry = fb_bag_get_or_create_entry(state, identity);
+	entry->delta += delta;
+	if (delta > 0 && tuple != NULL)
+		entry->tuple = tuple;
 }
 
-static void
-fb_bag_load_current_tuple(HeapTuple tuple, TupleDesc tupdesc, void *arg)
-{
-	(void) tupdesc;
-	fb_bag_state_add_current_tuple((FbBagState *) arg, tuple);
-}
+/*
+ * fb_bag_apply_begin
+ *    Bag apply entry point.
+ */
 
-static uint64
-fb_bag_count_rows(HTAB *rows)
-{
-	HASH_SEQ_STATUS seq;
-	FbBagBucket *bucket;
-	uint64 total = 0;
-
-	hash_seq_init(&seq, rows);
-	while ((bucket = (FbBagBucket *) hash_seq_search(&seq)) != NULL)
-	{
-		FbBagRow *row;
-
-		for (row = (FbBagRow *) bucket->head; row != NULL; row = row->next)
-		{
-			if (row->count > 0 && row->tuple != NULL)
-				total += (uint64) row->count;
-		}
-	}
-
-	return total;
-}
-
-FbBagState *
-fb_bag_state_create(TupleDesc tupdesc,
-					 uint64 tracked_bytes,
-					 uint64 memory_limit_bytes)
-{
-	FbBagState *state = palloc0(sizeof(*state));
-
-	state->tupdesc = tupdesc;
-	state->rows = fb_bag_create_bucket_hash();
-	state->tracked_bytes = tracked_bytes;
-	state->memory_limit_bytes = memory_limit_bytes;
-	return state;
-}
-
-void
-fb_bag_state_add_current_tuple(FbBagState *state, HeapTuple tuple)
-{
-	char *identity;
-
-	identity = fb_apply_build_row_identity(tuple, state->tupdesc);
-	fb_bag_adjust_row(state, identity, tuple, 1, true, true);
-}
-
-void
-fb_bag_state_apply_add_tuple(FbBagState *state, HeapTuple tuple)
-{
-	char *identity;
-
-	identity = fb_apply_build_row_identity(tuple, state->tupdesc);
-	fb_bag_adjust_row(state, identity, tuple, 1, true, true);
-}
-
-void
-fb_bag_state_apply_remove_tuple(FbBagState *state, HeapTuple tuple)
-{
-	char *identity;
-
-	identity = fb_apply_build_row_identity(tuple, state->tupdesc);
-	fb_bag_adjust_row(state, identity, tuple, -1, true, true);
-}
-
-uint64
-fb_bag_state_count_rows(FbBagState *state)
-{
-	return fb_bag_count_rows(state->rows);
-}
-
-uint64
-fb_bag_state_emit_rows(FbBagState *state,
-						TupleDesc tupdesc,
-						const FbResultSink *sink)
-{
-	HASH_SEQ_STATUS seq;
-	FbBagBucket *bucket;
-	uint64 emitted = 0;
-
-	hash_seq_init(&seq, state->rows);
-	while ((bucket = (FbBagBucket *) hash_seq_search(&seq)) != NULL)
-	{
-		FbBagRow *row;
-
-		for (row = (FbBagRow *) bucket->head; row != NULL; row = row->next)
-		{
-			int64 j;
-
-			if (row->count <= 0 || row->tuple == NULL)
-				continue;
-
-			for (j = 0; j < row->count; j++)
-			{
-				fb_result_sink_put_tuple(sink, row->tuple, tupdesc);
-				emitted++;
-			}
-		}
-	}
-
-	return emitted;
-}
-
-uint64
-fb_apply_bag_mode(const FbRelationInfo *info,
+void *
+fb_bag_apply_begin(const FbRelationInfo *info,
 				   TupleDesc tupdesc,
-				   const FbReverseOpStream *stream,
-				   const FbResultSink *sink)
+				   const FbReverseOpStream *stream)
 {
-	FbBagState *state;
+	FbBagApplyState *state;
 	uint32 i;
-	uint64 emitted;
-	uint64 total_rows;
 
 	(void) info;
 
-	state = fb_bag_state_create(tupdesc,
-								stream->tracked_bytes,
-								stream->memory_limit_bytes);
-
-	fb_apply_scan_current_relation(info->relid,
-								   fb_bag_load_current_tuple,
-								   state,
-								   NULL);
-	if (stream->count == 0)
-		fb_progress_update_percent(FB_PROGRESS_STAGE_APPLY, 100, NULL);
+	state = palloc0(sizeof(*state));
+	state->tupdesc = tupdesc;
+	state->buckets = fb_bag_create_bucket_hash();
+	state->tracked_bytes = stream->tracked_bytes;
+	state->memory_limit_bytes = stream->memory_limit_bytes;
 
 	for (i = 0; i < stream->count; i++)
 	{
@@ -337,65 +248,145 @@ fb_apply_bag_mode(const FbRelationInfo *info,
 		switch (op->type)
 		{
 			case FB_REVERSE_REMOVE:
-				if (op->new_row.tuple != NULL)
-					fb_bag_state_apply_remove_tuple(state, op->new_row.tuple);
+				fb_bag_adjust_delta(state,
+									op->new_row.row_identity,
+									op->new_row.tuple,
+									-1);
 				break;
 			case FB_REVERSE_ADD:
-				if (op->old_row.tuple != NULL)
-					fb_bag_state_apply_add_tuple(state, op->old_row.tuple);
+				fb_bag_adjust_delta(state,
+									op->old_row.row_identity,
+									op->old_row.tuple,
+									1);
 				break;
 			case FB_REVERSE_REPLACE:
-				if (op->new_row.tuple != NULL)
-					fb_bag_state_apply_remove_tuple(state, op->new_row.tuple);
-				if (op->old_row.tuple != NULL)
-					fb_bag_state_apply_add_tuple(state, op->old_row.tuple);
+				fb_bag_adjust_delta(state,
+									op->new_row.row_identity,
+									op->new_row.tuple,
+									-1);
+				fb_bag_adjust_delta(state,
+									op->old_row.row_identity,
+									op->old_row.tuple,
+									1);
 				break;
 		}
-
-		fb_progress_update_percent(FB_PROGRESS_STAGE_APPLY,
-								   fb_progress_map_subrange(40, 60,
-															(uint64) i + 1,
-															stream->count),
-								   NULL);
 	}
 
-	total_rows = fb_bag_state_count_rows(state);
-	fb_progress_enter_stage(FB_PROGRESS_STAGE_MATERIALIZE, NULL);
-	if (total_rows == 0)
+	return state;
+}
+
+/*
+ * fb_bag_apply_process_current
+ *    Bag apply entry point.
+ */
+
+HeapTuple
+fb_bag_apply_process_current(void *arg, HeapTuple tuple)
+{
+	FbBagApplyState *state = (FbBagApplyState *) arg;
+	FbBagEntry *entry;
+	char *identity;
+
+	identity = fb_apply_build_row_identity(tuple, state->tupdesc);
+	entry = fb_bag_find_entry(state->buckets, identity);
+	pfree(identity);
+
+	if (entry == NULL)
+		return tuple;
+
+	if (entry->delta < 0)
 	{
-		fb_progress_update_percent(FB_PROGRESS_STAGE_MATERIALIZE, 100, NULL);
-		return 0;
+		entry->delta++;
+		heap_freetuple(tuple);
+		return NULL;
 	}
 
-	emitted = 0;
-	{
-		HASH_SEQ_STATUS seq;
-		FbBagBucket *bucket;
+	return tuple;
+}
 
-		hash_seq_init(&seq, state->rows);
-		while ((bucket = (FbBagBucket *) hash_seq_search(&seq)) != NULL)
+/*
+ * fb_bag_apply_finish_scan
+ *    Bag apply entry point.
+ */
+
+void
+fb_bag_apply_finish_scan(void *arg)
+{
+	FbBagApplyState *state = (FbBagApplyState *) arg;
+	FbBagEntry *entry;
+
+	state->residual_total = 0;
+	for (entry = state->entries_head; entry != NULL; entry = entry->all_next)
+	{
+		if (entry->delta < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("fb bag apply consumed fewer current rows than reverse ops require")));
+		if (entry->delta > 0 && entry->tuple == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("fb bag apply is missing representative tuple for residual rows")));
+		state->residual_total += (uint64) Max(entry->delta, 0);
+	}
+
+	state->residual_cursor = state->entries_head;
+	state->residual_repeat = 0;
+}
+
+/*
+ * fb_bag_apply_residual_total
+ *    Bag apply entry point.
+ */
+
+uint64
+fb_bag_apply_residual_total(void *arg)
+{
+	FbBagApplyState *state = (FbBagApplyState *) arg;
+
+	return state->residual_total;
+}
+
+/*
+ * fb_bag_apply_next_residual
+ *    Bag apply entry point.
+ */
+
+HeapTuple
+fb_bag_apply_next_residual(void *arg)
+{
+	FbBagApplyState *state = (FbBagApplyState *) arg;
+
+	while (state->residual_cursor != NULL)
+	{
+		if (state->residual_repeat > 0)
 		{
-			FbBagRow *row;
+			state->residual_repeat--;
+			return state->residual_cursor->tuple;
+		}
 
-			for (row = (FbBagRow *) bucket->head; row != NULL; row = row->next)
+		state->residual_cursor = state->residual_cursor->all_next;
+		while (state->residual_cursor != NULL)
+		{
+			if (state->residual_cursor->delta > 0)
 			{
-				int64 j;
-
-				if (row->count <= 0 || row->tuple == NULL)
-					continue;
-
-				for (j = 0; j < row->count; j++)
-				{
-					fb_result_sink_put_tuple(sink, row->tuple, tupdesc);
-					emitted++;
-					fb_progress_update_fraction(FB_PROGRESS_STAGE_MATERIALIZE,
-											 emitted,
-											 total_rows,
-											 NULL);
-				}
+				state->residual_repeat = state->residual_cursor->delta - 1;
+				return state->residual_cursor->tuple;
 			}
+
+			state->residual_cursor = state->residual_cursor->all_next;
 		}
 	}
 
-	return emitted;
+	return NULL;
+}
+
+/*
+ * fb_bag_apply_end
+ *    Bag apply entry point.
+ */
+
+void
+fb_bag_apply_end(void *arg)
+{
+	(void) arg;
 }

@@ -1,7 +1,6 @@
 \set ON_ERROR_STOP on
 CREATE EXTENSION IF NOT EXISTS pg_flashback;
 SET pg_flashback.archive_dest = :'archive_dest';
-SET pg_flashback.ckwal_restore_dir = :'ckwal_dir';
 SELECT set_config('fb_deep.distinct_count', :'distinct_count', false);
 SELECT set_config('fb_deep.op_distinct_count', :'op_distinct_count', false);
 SELECT set_config('fb_deep.insert_count', :'insert_count', false);

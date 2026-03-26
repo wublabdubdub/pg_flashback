@@ -1,3 +1,8 @@
+/*
+ * fb_reverse_ops.h
+ *    Forward and reverse operation data structures and builders.
+ */
+
 #ifndef FB_REVERSE_OPS_H
 #define FB_REVERSE_OPS_H
 
@@ -22,12 +27,22 @@ typedef enum FbReverseOpType
 	FB_REVERSE_REPLACE
 } FbReverseOpType;
 
+/*
+ * FbRowImage
+ *    Reverse-op structure.
+ */
+
 typedef struct FbRowImage
 {
 	HeapTuple tuple;
 	char *row_identity;
 	char *key_identity;
 } FbRowImage;
+
+/*
+ * FbForwardOp
+ *    Reverse-op structure.
+ */
 
 typedef struct FbForwardOp
 {
@@ -40,6 +55,11 @@ typedef struct FbForwardOp
 	FbRowImage new_row;
 } FbForwardOp;
 
+/*
+ * FbReverseOp
+ *    Reverse-op structure.
+ */
+
 typedef struct FbReverseOp
 {
 	FbReverseOpType type;
@@ -51,6 +71,11 @@ typedef struct FbReverseOp
 	FbRowImage new_row;
 } FbReverseOp;
 
+/*
+ * FbForwardOpStream
+ *    Stores forward op stream state.
+ */
+
 typedef struct FbForwardOpStream
 {
 	FbForwardOp *ops;
@@ -59,6 +84,11 @@ typedef struct FbForwardOpStream
 	uint64 tracked_bytes;
 	uint64 memory_limit_bytes;
 } FbForwardOpStream;
+
+/*
+ * FbReverseOpStream
+ *    Stores reverse op stream state.
+ */
 
 typedef struct FbReverseOpStream
 {
@@ -69,13 +99,33 @@ typedef struct FbReverseOpStream
 	uint64 memory_limit_bytes;
 } FbReverseOpStream;
 
+/*
+ * fb_build_forward_ops
+ *    Reverse-op API.
+ */
+
 void fb_build_forward_ops(const FbRelationInfo *info,
 						  const FbWalRecordIndex *index,
 						  TupleDesc tupdesc,
 						  FbForwardOpStream *stream);
+/*
+ * fb_build_reverse_ops
+ *    Reverse-op API.
+ */
+
 void fb_build_reverse_ops(const FbForwardOpStream *forward,
 						  FbReverseOpStream *reverse);
+/*
+ * fb_forward_ops_debug_summary
+ *    Reverse-op API.
+ */
+
 char *fb_forward_ops_debug_summary(const FbForwardOpStream *stream);
+/*
+ * fb_reverse_ops_debug_summary
+ *    Reverse-op API.
+ */
+
 char *fb_reverse_ops_debug_summary(const FbReverseOpStream *stream);
 
 #endif

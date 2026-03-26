@@ -1,3 +1,8 @@
+/*
+ * fb_progress.c
+ *    Client-visible progress reporting.
+ */
+
 #include "postgres.h"
 
 #include "lib/stringinfo.h"
@@ -5,12 +10,22 @@
 #include "fb_guc.h"
 #include "fb_progress.h"
 
+/*
+ * FbProgressStageDef
+ *    Defines one progress stage entry.
+ */
+
 typedef struct FbProgressStageDef
 {
 	int stage_no;
 	bool percent;
 	const char *label;
 } FbProgressStageDef;
+
+/*
+ * FbProgressContext
+ *    Tracks progress context.
+ */
 
 typedef struct FbProgressContext
 {
@@ -30,10 +45,15 @@ static const FbProgressStageDef fb_progress_defs[] = {
 	{6, true, "replay final and build forward ops"},
 	{7, true, "building reverse ops"},
 	{8, true, "applying reverse ops"},
-	{9, true, "materializing result table"}
+	{9, true, "emitting residual historical rows"}
 };
 
 static FbProgressContext fb_progress_ctx = {0};
+
+/*
+ * fb_progress_get_def
+ *    Progress helper.
+ */
 
 static const FbProgressStageDef *
 fb_progress_get_def(FbProgressStage stage)
@@ -43,6 +63,11 @@ fb_progress_get_def(FbProgressStage stage)
 
 	return &fb_progress_defs[stage];
 }
+
+/*
+ * fb_progress_emit
+ *    Progress helper.
+ */
 
 static void
 fb_progress_emit(FbProgressStage stage, bool with_percent, uint32 percent,
@@ -80,6 +105,11 @@ fb_progress_emit(FbProgressStage stage, bool with_percent, uint32 percent,
 								 def->label)));
 }
 
+/*
+ * fb_progress_bucket_percent
+ *    Progress helper.
+ */
+
 static uint32
 fb_progress_bucket_percent(uint32 percent)
 {
@@ -88,6 +118,11 @@ fb_progress_bucket_percent(uint32 percent)
 
 	return (percent / 20) * 20;
 }
+
+/*
+ * fb_progress_begin
+ *    Progress entry point.
+ */
 
 void
 fb_progress_begin(void)
@@ -98,17 +133,32 @@ fb_progress_begin(void)
 	fb_progress_ctx.last_percent = -1;
 }
 
+/*
+ * fb_progress_finish
+ *    Progress entry point.
+ */
+
 void
 fb_progress_finish(void)
 {
 	MemSet(&fb_progress_ctx, 0, sizeof(fb_progress_ctx));
 }
 
+/*
+ * fb_progress_abort
+ *    Progress entry point.
+ */
+
 void
 fb_progress_abort(void)
 {
 	MemSet(&fb_progress_ctx, 0, sizeof(fb_progress_ctx));
 }
+
+/*
+ * fb_progress_enter_stage
+ *    Progress entry point.
+ */
 
 void
 fb_progress_enter_stage(FbProgressStage stage, const char *detail)
@@ -127,6 +177,11 @@ fb_progress_enter_stage(FbProgressStage stage, const char *detail)
 		fb_progress_emit(stage, false, 0, detail);
 }
 
+/*
+ * fb_progress_update_percent
+ *    Progress entry point.
+ */
+
 void
 fb_progress_update_percent(FbProgressStage stage, uint32 percent, const char *detail)
 {
@@ -144,6 +199,11 @@ fb_progress_update_percent(FbProgressStage stage, uint32 percent, const char *de
 	fb_progress_ctx.last_percent = (int) bucket;
 	fb_progress_emit(stage, true, bucket, detail);
 }
+
+/*
+ * fb_progress_update_fraction
+ *    Progress entry point.
+ */
 
 void
 fb_progress_update_fraction(FbProgressStage stage, uint64 done, uint64 total,
@@ -164,6 +224,11 @@ fb_progress_update_fraction(FbProgressStage stage, uint64 done, uint64 total,
 
 	fb_progress_update_percent(stage, percent, detail);
 }
+
+/*
+ * fb_progress_map_subrange
+ *    Progress entry point.
+ */
 
 uint32
 fb_progress_map_subrange(uint32 base_percent, uint32 span_percent,

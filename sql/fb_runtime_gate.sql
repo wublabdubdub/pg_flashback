@@ -10,20 +10,25 @@ SET pg_flashback.show_progress = off;
 
 CREATE TABLE fb_runtime_table (id integer);
 
-SELECT pg_flashback('fb_runtime_result', 'fb_runtime_table', now()::text);
+SELECT *
+FROM pg_flashback(NULL::public.fb_runtime_table, now()::text);
 
 SET pg_flashback.archive_dir = '/__definitely_missing_pg_flashback_archive__';
-SELECT pg_flashback('fb_runtime_result', 'fb_runtime_table', now()::text);
+SELECT *
+FROM pg_flashback(NULL::public.fb_runtime_table, now()::text);
 
 SET pg_flashback.archive_dir = '/tmp';
-SELECT pg_flashback('fb_runtime_result', 'fb_runtime_table', now()::text);
+SELECT *
+FROM pg_flashback(NULL::public.fb_runtime_table, now()::text);
 
 DO $$
 BEGIN
 	EXECUTE format('SET pg_flashback.archive_dir = %L', current_setting('data_directory') || '/pg_wal');
 END;
 $$;
-SELECT pg_flashback('fb_runtime_result', 'fb_runtime_table', (now() + interval '1 hour')::text);
-SELECT pg_flashback('fb_runtime_result', 'pg_class', now()::text);
-SELECT pg_flashback('fb_runtime_result', 'fb_runtime_table', now()::text);
-TABLE fb_runtime_result;
+SELECT *
+FROM pg_flashback(NULL::public.fb_runtime_table, (now() + interval '1 hour')::text);
+SELECT *
+FROM pg_flashback(NULL::pg_catalog.pg_class, now()::text);
+SELECT *
+FROM pg_flashback(NULL::public.fb_runtime_table, now()::text);

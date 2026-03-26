@@ -1,5 +1,11 @@
+/*
+ * fb_guc.c
+ *    GUC definitions and runtime configuration selection.
+ */
+
 #include "postgres.h"
 
+#include <limits.h>
 #include <sys/stat.h>
 
 #include "fmgr.h"
@@ -17,9 +23,18 @@ static char *fb_debug_pg_wal_dir = NULL;
 static int fb_memory_limit_kb = 65536;
 static bool fb_parallel_segment_scan = false;
 static bool fb_show_progress = true;
-static int fb_parallel_apply_workers_count = 0;
+
+/*
+ * _PG_init
+ *    GUC entry point.
+ */
 
 PGDLLEXPORT void _PG_init(void);
+
+/*
+ * _PG_init
+ *    GUC entry point.
+ */
 
 void
 _PG_init(void)
@@ -92,21 +107,13 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
-	DefineCustomIntVariable("pg_flashback.parallel_apply_workers",
-							"Enable opt-in background-worker parallel apply/write for pg_flashback.",
-							"When greater than zero, pg_flashback uses autonomous background workers to create and fill the result table in parallel; the result table no longer rolls back with the caller transaction.",
-							&fb_parallel_apply_workers_count,
-							0,
-							0,
-							32,
-							PGC_USERSET,
-							0,
-							NULL,
-							NULL,
-							NULL);
-
 	fb_runtime_ensure_initialized();
 }
+
+/*
+ * fb_get_archive_dir
+ *    GUC entry point.
+ */
 
 const char *
 fb_get_archive_dir(void)
@@ -114,11 +121,21 @@ fb_get_archive_dir(void)
 	return fb_archive_dir;
 }
 
+/*
+ * fb_get_archive_dest
+ *    GUC entry point.
+ */
+
 const char *
 fb_get_archive_dest(void)
 {
 	return fb_archive_dest;
 }
+
+/*
+ * fb_get_effective_archive_dir
+ *    GUC entry point.
+ */
 
 const char *
 fb_get_effective_archive_dir(void)
@@ -129,11 +146,21 @@ fb_get_effective_archive_dir(void)
 	return fb_archive_dir;
 }
 
+/*
+ * fb_using_legacy_archive_dir
+ *    GUC entry point.
+ */
+
 bool
 fb_using_legacy_archive_dir(void)
 {
 	return fb_archive_dest == NULL || fb_archive_dest[0] == '\0';
 }
+
+/*
+ * fb_get_pg_wal_dir
+ *    GUC entry point.
+ */
 
 char *
 fb_get_pg_wal_dir(void)
@@ -143,6 +170,11 @@ fb_get_pg_wal_dir(void)
 
 	return psprintf("%s/pg_wal", DataDir);
 }
+
+/*
+ * fb_require_existing_directory
+ *    GUC helper.
+ */
 
 static void
 fb_require_existing_directory(const char *guc_name, const char *path)
@@ -165,6 +197,11 @@ fb_require_existing_directory(const char *guc_name, const char *path)
 				 errmsg("%s is not a directory: %s", guc_name, path)));
 }
 
+/*
+ * fb_require_archive_dir
+ *    GUC entry point.
+ */
+
 void
 fb_require_archive_dir(void)
 {
@@ -185,11 +222,21 @@ fb_require_archive_dir(void)
 			 errmsg("neither pg_flashback.archive_dest nor legacy pg_flashback.archive_dir is set")));
 }
 
+/*
+ * fb_get_memory_limit_bytes
+ *    GUC entry point.
+ */
+
 uint64
 fb_get_memory_limit_bytes(void)
 {
 	return (uint64) fb_memory_limit_kb * (uint64) 1024;
 }
+
+/*
+ * fb_parallel_segment_scan_enabled
+ *    GUC entry point.
+ */
 
 bool
 fb_parallel_segment_scan_enabled(void)
@@ -197,14 +244,13 @@ fb_parallel_segment_scan_enabled(void)
 	return fb_parallel_segment_scan;
 }
 
+/*
+ * fb_show_progress_enabled
+ *    GUC entry point.
+ */
+
 bool
 fb_show_progress_enabled(void)
 {
 	return fb_show_progress;
-}
-
-int
-fb_parallel_apply_workers(void)
-{
-	return fb_parallel_apply_workers_count;
 }
