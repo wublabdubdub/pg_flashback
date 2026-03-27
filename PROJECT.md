@@ -161,6 +161,7 @@ FROM pg_flashback(
   - `fb_flashback_keyed`
   - `fb_flashback_bag`
   - `fb_flashback_storage_boundary`
+  - `fb_flashback_toast_storage_boundary`
   - `pg_flashback`
   - `fb_user_surface`
   - `fb_memory_limit`

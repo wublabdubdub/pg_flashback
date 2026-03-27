@@ -54,3 +54,4 @@
 - 源码导读：`docs/architecture/源码级维护手册.md`
 - 代码优先入口导读：`docs/architecture/核心入口源码导读.md`
 - 调试手册：`docs/architecture/调试与验证手册.md`
+- 本机仓库维护脚本：`scripts/cron_daily_update.sh`

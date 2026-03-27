@@ -14,6 +14,8 @@
 #include "nodes/execnodes.h"
 #include "parser/parse_type.h"
 #include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
@@ -161,6 +163,72 @@ fb_validate_flashback_target(Oid relid, TimestampTz target_ts,
  */
 
 static void
+fb_append_qualified_relation_name(StringInfo buf, Oid relid)
+{
+	char *relname;
+	char *nspname;
+
+	relname = get_rel_name(relid);
+	nspname = get_namespace_name(get_rel_namespace(relid));
+
+	if (relname == NULL || nspname == NULL)
+	{
+		appendStringInfo(buf, "%u", relid);
+		return;
+	}
+
+	appendStringInfo(buf, "%s.%s",
+					 quote_identifier(nspname),
+					 quote_identifier(relname));
+}
+
+static char *
+fb_build_unsafe_detail(const FbRelationInfo *info,
+					   const FbWalRecordIndex *index)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "scope=%s",
+					 fb_wal_unsafe_scope_name(index->unsafe_scope));
+
+	if (index->unsafe_reason == FB_WAL_UNSAFE_STORAGE_CHANGE)
+		appendStringInfo(&buf, " operation=%s",
+						 fb_wal_storage_change_op_name(index->unsafe_storage_op));
+
+	appendStringInfoString(&buf, " target=");
+	fb_append_qualified_relation_name(&buf, info->relid);
+
+	if (index->unsafe_scope == FB_WAL_UNSAFE_SCOPE_TOAST &&
+		OidIsValid(info->toast_relid))
+	{
+		appendStringInfoString(&buf, " toast=");
+		fb_append_qualified_relation_name(&buf, info->toast_relid);
+	}
+
+	if (TransactionIdIsValid(index->unsafe_xid))
+		appendStringInfo(&buf, " xid=%u", index->unsafe_xid);
+
+	if (index->unsafe_commit_ts != 0)
+	{
+		char *commit_ts_text;
+
+		commit_ts_text =
+			TextDatumGetCString(DirectFunctionCall2(
+				timestamptz_to_char,
+				TimestampTzGetDatum(index->unsafe_commit_ts),
+				CStringGetTextDatum("YYYY-MM-DD HH24:MI:SS.USOF")));
+		appendStringInfo(&buf, " commit_ts=%s", commit_ts_text);
+	}
+
+	if (XLogRecPtrIsInvalid(index->unsafe_record_lsn) == false)
+		appendStringInfo(&buf, " lsn=%X/%X",
+						 LSN_FORMAT_ARGS(index->unsafe_record_lsn));
+
+	return buf.data;
+}
+
+static void
 fb_build_flashback_reverse_ops(TimestampTz target_ts,
 							   const FbRelationInfo *info,
 							   TupleDesc tupdesc,
@@ -176,10 +244,15 @@ fb_build_flashback_reverse_ops(TimestampTz target_ts,
 	fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
 	fb_wal_build_record_index(info, &scan_ctx, &index);
 	if (index.unsafe)
+	{
+		char *detail = fb_build_unsafe_detail(info, &index);
+
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("fb does not support WAL windows containing %s operations",
-						fb_wal_unsafe_reason_name(index.unsafe_reason))));
+						fb_wal_unsafe_reason_name(index.unsafe_reason)),
+				 errdetail_internal("%s", detail)));
+	}
 
 	MemSet(&replay_result, 0, sizeof(replay_result));
 	replay_result.tracked_bytes = index.tracked_bytes;

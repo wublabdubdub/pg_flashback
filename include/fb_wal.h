@@ -21,6 +21,21 @@ typedef enum FbWalUnsafeReason
 	FB_WAL_UNSAFE_STORAGE_CHANGE
 } FbWalUnsafeReason;
 
+typedef enum FbWalUnsafeScope
+{
+	FB_WAL_UNSAFE_SCOPE_NONE = 0,
+	FB_WAL_UNSAFE_SCOPE_MAIN,
+	FB_WAL_UNSAFE_SCOPE_TOAST
+} FbWalUnsafeScope;
+
+typedef enum FbWalStorageChangeOp
+{
+	FB_WAL_STORAGE_CHANGE_UNKNOWN = 0,
+	FB_WAL_STORAGE_CHANGE_STANDBY_LOCK,
+	FB_WAL_STORAGE_CHANGE_SMGR_CREATE,
+	FB_WAL_STORAGE_CHANGE_SMGR_TRUNCATE
+} FbWalStorageChangeOp;
+
 /*
  * FbWalScanContext
  *    Tracks WAL scan context.
@@ -56,6 +71,11 @@ typedef struct FbWalScanContext
 	uint32 anchor_hint_segment_index;
 	bool unsafe;
 	FbWalUnsafeReason unsafe_reason;
+	TransactionId unsafe_xid;
+	TimestampTz unsafe_commit_ts;
+	XLogRecPtr unsafe_record_lsn;
+	FbWalUnsafeScope unsafe_scope;
+	FbWalStorageChangeOp unsafe_storage_op;
 	void *resolved_segments;
 	uint32 resolved_segment_count;
 	uint32 pg_wal_segment_count;
@@ -163,6 +183,11 @@ typedef struct FbWalRecordIndex
 	bool anchor_found;
 	bool unsafe;
 	FbWalUnsafeReason unsafe_reason;
+	TransactionId unsafe_xid;
+	TimestampTz unsafe_commit_ts;
+	XLogRecPtr unsafe_record_lsn;
+	FbWalUnsafeScope unsafe_scope;
+	FbWalStorageChangeOp unsafe_storage_op;
 	uint64 total_record_count;
 	uint64 kept_record_count;
 	uint64 target_record_count;
@@ -246,5 +271,7 @@ void fb_wal_visit_records(FbWalScanContext *ctx, FbWalRecordVisitor visitor,
  */
 
 const char *fb_wal_unsafe_reason_name(FbWalUnsafeReason reason);
+const char *fb_wal_unsafe_scope_name(FbWalUnsafeScope scope);
+const char *fb_wal_storage_change_op_name(FbWalStorageChangeOp op);
 
 #endif

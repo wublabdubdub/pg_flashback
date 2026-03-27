@@ -107,6 +107,9 @@ typedef struct FbUnsafeXidEntry
 {
 	TransactionId xid;
 	FbWalUnsafeReason reason;
+	FbWalUnsafeScope scope;
+	FbWalStorageChangeOp storage_op;
+	XLogRecPtr lsn;
 } FbUnsafeXidEntry;
 
 /*
@@ -300,6 +303,10 @@ typedef struct FbCheckpointSidecarEntry
  */
 
 static void fb_mark_unsafe(FbWalScanContext *ctx, FbWalUnsafeReason reason);
+static void fb_capture_unsafe_context(FbWalScanContext *ctx,
+									  const FbUnsafeXidEntry *entry,
+									  TransactionId xid,
+									  TimestampTz commit_ts);
 /*
  * fb_record_xid
  *    WAL helper.
@@ -313,6 +320,10 @@ static TransactionId fb_record_xid(XLogReaderState *reader);
 
 static bool fb_locator_matches_relation(const RelFileLocator *locator,
 									   const FbRelationInfo *info);
+static FbWalUnsafeScope fb_relation_scope_from_locator(const RelFileLocator *locator,
+													   const FbRelationInfo *info);
+static FbWalUnsafeScope fb_relation_scope_from_relid(Oid relid,
+													 const FbRelationInfo *info);
 static FbWalSegmentEntry *fb_wal_prepare_segment(FbWalReaderPrivate *private,
 												 XLogSegNo next_segno);
 static void fb_wal_close_private_file(FbWalReaderPrivate *private);
@@ -328,8 +339,9 @@ static void fb_index_note_materialized_record(FbWalRecordIndex *index,
  */
 
 static bool fb_standby_record_matches_relation(XLogReaderState *reader,
-											   const FbRelationInfo *info,
-											   TransactionId *matched_xid);
+								   const FbRelationInfo *info,
+								   TransactionId *matched_xid,
+								   FbWalUnsafeScope *matched_scope);
 /*
  * fb_record_touches_relation
  *    WAL helper.
@@ -3269,13 +3281,22 @@ fb_mark_xid_touched(HTAB *touched_xids, TransactionId xid,
 
 static void
 fb_mark_xid_unsafe(HTAB *unsafe_xids, TransactionId xid,
-				   FbWalUnsafeReason reason, FbWalScanContext *ctx)
+				   FbWalUnsafeReason reason,
+				   FbWalUnsafeScope scope,
+				   FbWalStorageChangeOp storage_op,
+				   XLogRecPtr lsn,
+				   FbWalScanContext *ctx)
 {
 	FbUnsafeXidEntry *entry;
 	bool found;
 
 	if (!TransactionIdIsValid(xid))
 	{
+		ctx->unsafe_xid = InvalidTransactionId;
+		ctx->unsafe_commit_ts = 0;
+		ctx->unsafe_record_lsn = lsn;
+		ctx->unsafe_scope = scope;
+		ctx->unsafe_storage_op = storage_op;
 		fb_mark_unsafe(ctx, reason);
 		return;
 	}
@@ -3286,10 +3307,28 @@ fb_mark_xid_unsafe(HTAB *unsafe_xids, TransactionId xid,
 	{
 		entry->xid = xid;
 		entry->reason = reason;
+		entry->scope = scope;
+		entry->storage_op = storage_op;
+		entry->lsn = lsn;
 	}
 	else if (entry->reason == FB_WAL_UNSAFE_STORAGE_CHANGE &&
 			 reason != FB_WAL_UNSAFE_STORAGE_CHANGE)
 		entry->reason = reason;
+	else if (entry->reason == FB_WAL_UNSAFE_STORAGE_CHANGE &&
+			 reason == FB_WAL_UNSAFE_STORAGE_CHANGE)
+	{
+		bool entry_generic = (entry->storage_op == FB_WAL_STORAGE_CHANGE_UNKNOWN ||
+							  entry->storage_op == FB_WAL_STORAGE_CHANGE_STANDBY_LOCK);
+		bool incoming_specific = (storage_op == FB_WAL_STORAGE_CHANGE_SMGR_CREATE ||
+								  storage_op == FB_WAL_STORAGE_CHANGE_SMGR_TRUNCATE);
+
+		if (incoming_specific && entry_generic)
+		{
+			entry->scope = scope;
+			entry->storage_op = storage_op;
+			entry->lsn = lsn;
+		}
+	}
 }
 
 /*
@@ -3358,6 +3397,31 @@ fb_locator_matches_relation(const RelFileLocator *locator,
 	return false;
 }
 
+static FbWalUnsafeScope
+fb_relation_scope_from_locator(const RelFileLocator *locator,
+							   const FbRelationInfo *info)
+{
+	if (RelFileLocatorEquals(*locator, info->locator))
+		return FB_WAL_UNSAFE_SCOPE_MAIN;
+
+	if (info->has_toast_locator &&
+		RelFileLocatorEquals(*locator, info->toast_locator))
+		return FB_WAL_UNSAFE_SCOPE_TOAST;
+
+	return FB_WAL_UNSAFE_SCOPE_NONE;
+}
+
+static FbWalUnsafeScope
+fb_relation_scope_from_relid(Oid relid, const FbRelationInfo *info)
+{
+	if (relid == info->relid)
+		return FB_WAL_UNSAFE_SCOPE_MAIN;
+	if (OidIsValid(info->toast_relid) && relid == info->toast_relid)
+		return FB_WAL_UNSAFE_SCOPE_TOAST;
+
+	return FB_WAL_UNSAFE_SCOPE_NONE;
+}
+
 /*
  * fb_record_touches_relation
  *    WAL helper.
@@ -3403,6 +3467,25 @@ fb_mark_unsafe(FbWalScanContext *ctx, FbWalUnsafeReason reason)
 
 	ctx->unsafe = true;
 	ctx->unsafe_reason = reason;
+}
+
+static void
+fb_capture_unsafe_context(FbWalScanContext *ctx,
+						  const FbUnsafeXidEntry *entry,
+						  TransactionId xid,
+						  TimestampTz commit_ts)
+{
+	if (ctx->unsafe)
+		return;
+
+	ctx->unsafe_xid = xid;
+	ctx->unsafe_commit_ts = commit_ts;
+	if (entry != NULL)
+	{
+		ctx->unsafe_record_lsn = entry->lsn;
+		ctx->unsafe_scope = entry->scope;
+		ctx->unsafe_storage_op = entry->storage_op;
+	}
 }
 
 /*
@@ -3462,9 +3545,17 @@ fb_heap_rewrite_matches_relation(XLogReaderState *reader,
  */
 
 static bool
-fb_smgr_record_matches_relation(XLogReaderState *reader, const FbRelationInfo *info)
+fb_smgr_record_matches_relation(XLogReaderState *reader,
+								const FbRelationInfo *info,
+								FbWalUnsafeScope *matched_scope,
+								FbWalStorageChangeOp *matched_op)
 {
 	uint8 info_code = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+
+	if (matched_scope != NULL)
+		*matched_scope = FB_WAL_UNSAFE_SCOPE_NONE;
+	if (matched_op != NULL)
+		*matched_op = FB_WAL_STORAGE_CHANGE_UNKNOWN;
 
 	if (info_code == XLOG_SMGR_CREATE)
 	{
@@ -3475,8 +3566,15 @@ fb_smgr_record_matches_relation(XLogReaderState *reader, const FbRelationInfo *i
 
 		{
 			RelFileLocator locator = FB_XL_SMGR_CREATE_LOCATOR(xlrec);
+			FbWalUnsafeScope scope = fb_relation_scope_from_locator(&locator, info);
 
-			return fb_locator_matches_relation(&locator, info);
+			if (scope == FB_WAL_UNSAFE_SCOPE_NONE)
+				return false;
+			if (matched_scope != NULL)
+				*matched_scope = scope;
+			if (matched_op != NULL)
+				*matched_op = FB_WAL_STORAGE_CHANGE_SMGR_CREATE;
+			return true;
 		}
 	}
 	else if (info_code == XLOG_SMGR_TRUNCATE)
@@ -3488,8 +3586,15 @@ fb_smgr_record_matches_relation(XLogReaderState *reader, const FbRelationInfo *i
 
 		{
 			RelFileLocator locator = FB_XL_SMGR_TRUNCATE_LOCATOR(xlrec);
+			FbWalUnsafeScope scope = fb_relation_scope_from_locator(&locator, info);
 
-			return fb_locator_matches_relation(&locator, info);
+			if (scope == FB_WAL_UNSAFE_SCOPE_NONE)
+				return false;
+			if (matched_scope != NULL)
+				*matched_scope = scope;
+			if (matched_op != NULL)
+				*matched_op = FB_WAL_STORAGE_CHANGE_SMGR_TRUNCATE;
+			return true;
 		}
 	}
 
@@ -3504,7 +3609,8 @@ fb_smgr_record_matches_relation(XLogReaderState *reader, const FbRelationInfo *i
 static bool
 fb_standby_record_matches_relation(XLogReaderState *reader,
 								   const FbRelationInfo *info,
-								   TransactionId *matched_xid)
+								   TransactionId *matched_xid,
+								   FbWalUnsafeScope *matched_scope)
 {
 	uint8 info_code = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
 	xl_standby_locks *xlrec;
@@ -3512,6 +3618,8 @@ fb_standby_record_matches_relation(XLogReaderState *reader,
 
 	if (matched_xid != NULL)
 		*matched_xid = InvalidTransactionId;
+	if (matched_scope != NULL)
+		*matched_scope = FB_WAL_UNSAFE_SCOPE_NONE;
 
 	if (info_code != XLOG_STANDBY_LOCK)
 		return false;
@@ -3529,6 +3637,8 @@ fb_standby_record_matches_relation(XLogReaderState *reader,
 
 		if (matched_xid != NULL)
 			*matched_xid = lock->xid;
+		if (matched_scope != NULL)
+			*matched_scope = fb_relation_scope_from_relid(lock->relOid, info);
 		return true;
 	}
 
@@ -3565,7 +3675,11 @@ fb_note_xact_record(XLogReaderState *reader, HTAB *touched_xids,
 				{
 					ctx->commit_count++;
 					if (unsafe_entry != NULL)
+					{
+						fb_capture_unsafe_context(ctx, unsafe_entry, xid,
+												  parsed.xact_time);
 						fb_mark_unsafe(ctx, unsafe_entry->reason);
+					}
 				}
 				break;
 			}
@@ -3643,6 +3757,7 @@ fb_note_xact_status_for_touched(XLogReaderState *reader,
 					commit_ts <= ctx->query_now_ts &&
 					unsafe_entry != NULL)
 				{
+					fb_capture_unsafe_context(ctx, unsafe_entry, xid, commit_ts);
 					fb_mark_unsafe(ctx, unsafe_entry->reason);
 				}
 				break;
@@ -3715,7 +3830,11 @@ fb_scan_record_visitor(XLogReaderState *reader, void *arg)
 			if (info_code == XLOG_HEAP_TRUNCATE &&
 				fb_heap_truncate_matches_relation(reader, info))
 				fb_mark_xid_unsafe(unsafe_xids, fb_record_xid(reader),
-								   FB_WAL_UNSAFE_TRUNCATE, ctx);
+								   FB_WAL_UNSAFE_TRUNCATE,
+								   FB_WAL_UNSAFE_SCOPE_NONE,
+								   FB_WAL_STORAGE_CHANGE_UNKNOWN,
+								   reader->ReadRecPtr,
+								   ctx);
 		}
 		else if (rmid == RM_HEAP2_ID)
 		{
@@ -3728,22 +3847,38 @@ fb_scan_record_visitor(XLogReaderState *reader, void *arg)
 
 				xlrec = (xl_heap_rewrite_mapping *) XLogRecGetData(reader);
 				fb_mark_xid_unsafe(unsafe_xids, xlrec->mapped_xid,
-								   FB_WAL_UNSAFE_REWRITE, ctx);
+								   FB_WAL_UNSAFE_REWRITE,
+								   FB_WAL_UNSAFE_SCOPE_NONE,
+								   FB_WAL_STORAGE_CHANGE_UNKNOWN,
+								   reader->ReadRecPtr,
+								   ctx);
 			}
 		}
 		else if (rmid == RM_SMGR_ID)
 		{
-			if (fb_smgr_record_matches_relation(reader, info))
+			FbWalUnsafeScope scope;
+			FbWalStorageChangeOp op;
+
+			if (fb_smgr_record_matches_relation(reader, info, &scope, &op))
 				fb_mark_xid_unsafe(unsafe_xids, fb_record_xid(reader),
-								   FB_WAL_UNSAFE_STORAGE_CHANGE, ctx);
+								   FB_WAL_UNSAFE_STORAGE_CHANGE,
+								   scope,
+								   op,
+								   reader->ReadRecPtr,
+								   ctx);
 		}
 		else if (rmid == RM_STANDBY_ID)
 		{
 			TransactionId lock_xid = InvalidTransactionId;
+			FbWalUnsafeScope scope;
 
-			if (fb_standby_record_matches_relation(reader, info, &lock_xid))
+			if (fb_standby_record_matches_relation(reader, info, &lock_xid, &scope))
 				fb_mark_xid_unsafe(unsafe_xids, lock_xid,
-								   FB_WAL_UNSAFE_STORAGE_CHANGE, ctx);
+								   FB_WAL_UNSAFE_STORAGE_CHANGE,
+								   scope,
+								   FB_WAL_STORAGE_CHANGE_STANDBY_LOCK,
+								   reader->ReadRecPtr,
+								   ctx);
 		}
 
 		if (rmid == RM_XACT_ID)
@@ -3758,7 +3893,11 @@ fb_scan_record_visitor(XLogReaderState *reader, void *arg)
 		if (info_code == XLOG_HEAP_TRUNCATE &&
 			fb_heap_truncate_matches_relation(reader, info))
 			fb_mark_xid_unsafe(unsafe_xids, fb_record_xid(reader),
-							   FB_WAL_UNSAFE_TRUNCATE, ctx);
+							   FB_WAL_UNSAFE_TRUNCATE,
+							   FB_WAL_UNSAFE_SCOPE_NONE,
+							   FB_WAL_STORAGE_CHANGE_UNKNOWN,
+							   reader->ReadRecPtr,
+							   ctx);
 	}
 	else if (rmid == RM_HEAP2_ID)
 	{
@@ -3771,7 +3910,11 @@ fb_scan_record_visitor(XLogReaderState *reader, void *arg)
 
 			xlrec = (xl_heap_rewrite_mapping *) XLogRecGetData(reader);
 			fb_mark_xid_unsafe(unsafe_xids, xlrec->mapped_xid,
-							   FB_WAL_UNSAFE_REWRITE, ctx);
+							   FB_WAL_UNSAFE_REWRITE,
+							   FB_WAL_UNSAFE_SCOPE_NONE,
+							   FB_WAL_STORAGE_CHANGE_UNKNOWN,
+							   reader->ReadRecPtr,
+							   ctx);
 		}
 	}
 	else if (rmid == RM_XLOG_ID)
@@ -3780,17 +3923,29 @@ fb_scan_record_visitor(XLogReaderState *reader, void *arg)
 	}
 	else if (rmid == RM_SMGR_ID)
 	{
-		if (fb_smgr_record_matches_relation(reader, info))
+		FbWalUnsafeScope scope;
+		FbWalStorageChangeOp op;
+
+		if (fb_smgr_record_matches_relation(reader, info, &scope, &op))
 			fb_mark_xid_unsafe(unsafe_xids, fb_record_xid(reader),
-							   FB_WAL_UNSAFE_STORAGE_CHANGE, ctx);
+							   FB_WAL_UNSAFE_STORAGE_CHANGE,
+							   scope,
+							   op,
+							   reader->ReadRecPtr,
+							   ctx);
 	}
 	else if (rmid == RM_STANDBY_ID)
 	{
 		TransactionId lock_xid = InvalidTransactionId;
+		FbWalUnsafeScope scope;
 
-		if (fb_standby_record_matches_relation(reader, info, &lock_xid))
+		if (fb_standby_record_matches_relation(reader, info, &lock_xid, &scope))
 			fb_mark_xid_unsafe(unsafe_xids, lock_xid,
-							   FB_WAL_UNSAFE_STORAGE_CHANGE, ctx);
+							   FB_WAL_UNSAFE_STORAGE_CHANGE,
+							   scope,
+							   FB_WAL_STORAGE_CHANGE_STANDBY_LOCK,
+							   reader->ReadRecPtr,
+							   ctx);
 	}
 
 	if (fb_record_touches_relation(reader, info))
@@ -3834,7 +3989,11 @@ fb_index_record_visitor(XLogReaderState *reader, void *arg)
 			if (info_code == XLOG_HEAP_TRUNCATE &&
 				fb_heap_truncate_matches_relation(reader, info))
 				fb_mark_xid_unsafe(unsafe_xids, fb_record_xid(reader),
-								   FB_WAL_UNSAFE_TRUNCATE, ctx);
+								   FB_WAL_UNSAFE_TRUNCATE,
+								   FB_WAL_UNSAFE_SCOPE_NONE,
+								   FB_WAL_STORAGE_CHANGE_UNKNOWN,
+								   reader->ReadRecPtr,
+								   ctx);
 		}
 		else if (rmid == RM_HEAP2_ID)
 		{
@@ -3847,22 +4006,38 @@ fb_index_record_visitor(XLogReaderState *reader, void *arg)
 
 				xlrec = (xl_heap_rewrite_mapping *) XLogRecGetData(reader);
 				fb_mark_xid_unsafe(unsafe_xids, xlrec->mapped_xid,
-								   FB_WAL_UNSAFE_REWRITE, ctx);
+								   FB_WAL_UNSAFE_REWRITE,
+								   FB_WAL_UNSAFE_SCOPE_NONE,
+								   FB_WAL_STORAGE_CHANGE_UNKNOWN,
+								   reader->ReadRecPtr,
+								   ctx);
 			}
 		}
 		else if (rmid == RM_SMGR_ID)
 		{
-			if (fb_smgr_record_matches_relation(reader, info))
+			FbWalUnsafeScope scope;
+			FbWalStorageChangeOp op;
+
+			if (fb_smgr_record_matches_relation(reader, info, &scope, &op))
 				fb_mark_xid_unsafe(unsafe_xids, fb_record_xid(reader),
-								   FB_WAL_UNSAFE_STORAGE_CHANGE, ctx);
+								   FB_WAL_UNSAFE_STORAGE_CHANGE,
+								   scope,
+								   op,
+								   reader->ReadRecPtr,
+								   ctx);
 		}
 		else if (rmid == RM_STANDBY_ID)
 		{
 			TransactionId lock_xid = InvalidTransactionId;
+			FbWalUnsafeScope scope;
 
-			if (fb_standby_record_matches_relation(reader, info, &lock_xid))
+			if (fb_standby_record_matches_relation(reader, info, &lock_xid, &scope))
 				fb_mark_xid_unsafe(unsafe_xids, lock_xid,
-								   FB_WAL_UNSAFE_STORAGE_CHANGE, ctx);
+								   FB_WAL_UNSAFE_STORAGE_CHANGE,
+								   scope,
+								   FB_WAL_STORAGE_CHANGE_STANDBY_LOCK,
+								   reader->ReadRecPtr,
+								   ctx);
 		}
 
 		if (rmid == RM_XACT_ID)
@@ -3879,7 +4054,11 @@ fb_index_record_visitor(XLogReaderState *reader, void *arg)
 			info_code == XLOG_HEAP_TRUNCATE &&
 			fb_heap_truncate_matches_relation(reader, info))
 			fb_mark_xid_unsafe(unsafe_xids, fb_record_xid(reader),
-							   FB_WAL_UNSAFE_TRUNCATE, ctx);
+							   FB_WAL_UNSAFE_TRUNCATE,
+							   FB_WAL_UNSAFE_SCOPE_NONE,
+							   FB_WAL_STORAGE_CHANGE_UNKNOWN,
+							   reader->ReadRecPtr,
+							   ctx);
 
 		if (fb_heap_record_matches_target(reader, info))
 		{
@@ -3963,7 +4142,11 @@ fb_index_record_visitor(XLogReaderState *reader, void *arg)
 
 			xlrec = (xl_heap_rewrite_mapping *) XLogRecGetData(reader);
 			fb_mark_xid_unsafe(unsafe_xids, xlrec->mapped_xid,
-							   FB_WAL_UNSAFE_REWRITE, ctx);
+							   FB_WAL_UNSAFE_REWRITE,
+							   FB_WAL_UNSAFE_SCOPE_NONE,
+							   FB_WAL_STORAGE_CHANGE_UNKNOWN,
+							   reader->ReadRecPtr,
+							   ctx);
 		}
 		else if (
 #if PG_VERSION_NUM >= 170000
@@ -4051,17 +4234,29 @@ fb_index_record_visitor(XLogReaderState *reader, void *arg)
 	}
 	else if (state->collect_metadata && rmid == RM_SMGR_ID)
 	{
-		if (fb_smgr_record_matches_relation(reader, info))
+		FbWalUnsafeScope scope;
+		FbWalStorageChangeOp op;
+
+		if (fb_smgr_record_matches_relation(reader, info, &scope, &op))
 			fb_mark_xid_unsafe(unsafe_xids, fb_record_xid(reader),
-							   FB_WAL_UNSAFE_STORAGE_CHANGE, ctx);
+							   FB_WAL_UNSAFE_STORAGE_CHANGE,
+							   scope,
+							   op,
+							   reader->ReadRecPtr,
+							   ctx);
 	}
 	else if (state->collect_metadata && rmid == RM_STANDBY_ID)
 	{
 		TransactionId lock_xid = InvalidTransactionId;
+		FbWalUnsafeScope scope;
 
-		if (fb_standby_record_matches_relation(reader, info, &lock_xid))
+		if (fb_standby_record_matches_relation(reader, info, &lock_xid, &scope))
 			fb_mark_xid_unsafe(unsafe_xids, lock_xid,
-							   FB_WAL_UNSAFE_STORAGE_CHANGE, ctx);
+							   FB_WAL_UNSAFE_STORAGE_CHANGE,
+							   scope,
+							   FB_WAL_STORAGE_CHANGE_STANDBY_LOCK,
+							   reader->ReadRecPtr,
+							   ctx);
 	}
 
 	if (state->collect_metadata && rmid == RM_XACT_ID)
@@ -4389,6 +4584,11 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 
 	index->unsafe = ctx->unsafe;
 	index->unsafe_reason = ctx->unsafe_reason;
+	index->unsafe_xid = ctx->unsafe_xid;
+	index->unsafe_commit_ts = ctx->unsafe_commit_ts;
+	index->unsafe_record_lsn = ctx->unsafe_record_lsn;
+	index->unsafe_scope = ctx->unsafe_scope;
+	index->unsafe_storage_op = ctx->unsafe_storage_op;
 
 	if (windows != NULL)
 		pfree(windows);
@@ -4442,6 +4642,40 @@ fb_wal_unsafe_reason_name(FbWalUnsafeReason reason)
 			return "rewrite";
 		case FB_WAL_UNSAFE_STORAGE_CHANGE:
 			return "storage_change";
+	}
+
+	return "unknown";
+}
+
+const char *
+fb_wal_unsafe_scope_name(FbWalUnsafeScope scope)
+{
+	switch (scope)
+	{
+		case FB_WAL_UNSAFE_SCOPE_NONE:
+			return "none";
+		case FB_WAL_UNSAFE_SCOPE_MAIN:
+			return "main";
+		case FB_WAL_UNSAFE_SCOPE_TOAST:
+			return "toast";
+	}
+
+	return "unknown";
+}
+
+const char *
+fb_wal_storage_change_op_name(FbWalStorageChangeOp op)
+{
+	switch (op)
+	{
+		case FB_WAL_STORAGE_CHANGE_UNKNOWN:
+			return "unknown";
+		case FB_WAL_STORAGE_CHANGE_STANDBY_LOCK:
+			return "standby_lock";
+		case FB_WAL_STORAGE_CHANGE_SMGR_CREATE:
+			return "smgr_create";
+		case FB_WAL_STORAGE_CHANGE_SMGR_TRUNCATE:
+			return "smgr_truncate";
 	}
 
 	return "unknown";

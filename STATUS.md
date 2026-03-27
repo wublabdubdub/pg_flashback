@@ -47,6 +47,13 @@
 
 ## 本轮完成
 
+- 新增仓库维护脚本 `scripts/cron_daily_update.sh`：
+  - 仅在仓库存在变更时执行 `git add -A`
+  - 固定提交信息 `update`
+  - 推送目标固定为 `origin/main`
+- 已为当前用户安装本机 `cron`：
+  - 每天 `01:00` 在 `/root/pg_flashback` 执行自动提交/推送
+  - 日志输出到仓库根目录 `cron_daily_update.log`
 - 将 `README.md` 重写为面向客户的使用文档
 - 抽取 `fb_compat` 跨版本兼容层
 - 去掉 `Makefile` 中默认绑定的 `PG18` `PG_CONFIG`
@@ -82,13 +89,24 @@
   - `docs/decisions/ADR-0006-bounded-spill-main-pipeline.md`
   - `docs/decisions/ADR-0007-toast-heavy-materialized-srf.md`
   - 若干 `docs/superpowers/specs` / `plans` 与冷缓存报告
+- 已复盘用户 live 案例 `scenario_oa_12t_50000r.notices`：
+  - 主表 `relfilenode = 16396047`
+  - TOAST `relfilenode = 16396114`
+  - 建表事务 `xid = 204237`，提交时间 `2026-03-27 22:40:37.885578+08`
+  - 阻塞 flashback 的真实原因不是建表，而是 TOAST relation 在事务 `xid = 294470` 中发生 `SMGR TRUNCATE`
+  - 该 TOAST truncate 提交时间为 `2026-03-27 22:51:42.387556+08`
+- 已新增回归 `fb_flashback_toast_storage_boundary`，覆盖“target 后 TOAST relation 发生 truncate / storage_change 必须直接报错”的用户案例边界
+- 已增强 `storage_change` 诊断信息，当前会直接暴露 relation scope / storage op / xid / commit time
 
 ## 当前验证结果
 
+- `scripts/cron_daily_update.sh` 幂等校验：通过
+- 当前用户 `crontab` 安装校验：通过
 - `PG12-18` 本机编译矩阵：通过
 - `make PG_CONFIG=/home/18pg/local/bin/pg_config install`：通过
 - `su - 18pg -c 'PGPORT=5832 ... make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck'`：`All 12 tests passed.`
 - `2026-03-27` 当前恢复工作区 `make PG_CONFIG=/home/18pg/local/bin/pg_config -j4`：通过
+- `PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_flashback_toast_storage_boundary'`：`All 1 tests passed.`
 - `/tmp/pgfb_exact_probe` 顺序回放成功后 `make PG_CONFIG=/home/18pg/local/bin/pg_config -j4`：通过
 - 当前回归覆盖：
   - `fb_smoke`
@@ -98,6 +116,7 @@
   - `fb_flashback_keyed`
   - `fb_flashback_bag`
   - `fb_flashback_storage_boundary`
+  - `fb_flashback_toast_storage_boundary`
   - `pg_flashback`
   - `fb_user_surface`
   - `fb_memory_limit`
@@ -118,6 +137,7 @@
 
 ## 下一步
 
+- 观察首次 `2026-03-28 01:00 CST` 自动提交结果，确认日志与推送行为符合预期
 - 在具备环境后补齐 `PG10/11` 的正式编译/回归复验
 - 继续处理 deep pilot batch B blocker
 - 为 `fb_export_undo` 开始独立实现

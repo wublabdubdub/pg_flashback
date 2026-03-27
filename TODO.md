@@ -10,6 +10,7 @@
 
 ## 本轮已完成
 
+- [x] 新增本机 nightly 自动提交脚本并安装 `01:00` 用户级 `cron`
 - [x] 删除旧公开入口 `pg_flashback(text, text, text)`
 - [x] 删除旧结果表物化逻辑
 - [x] 删除 `fb_parallel` 模块
@@ -33,6 +34,8 @@
 - [x] apply 主链改为变化集驱动的小内存流式执行
 - [x] 历史结果集改为直接查询型 SRF 返回
 - [ ] keyed 主键变化场景补齐
+- [x] 补齐 TOAST relation truncate / storage_change 的用户案例回归
+- [x] 增强 `storage_change` 报错诊断，直接显示 main/toast、create/truncate、xid、commit time
 - [ ] apply / replay / TOAST 交界处继续补更多宽表与极端场景验证
 
 ### P5.5 用户接口与来源模型

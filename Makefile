@@ -20,7 +20,7 @@ OBJS = \
 	src/fb_toast.o
 
 DATA = sql/pg_flashback--0.1.0.sql
-REGRESS = fb_smoke fb_relation_gate fb_relation_unsupported fb_runtime_gate fb_flashback_keyed fb_flashback_bag fb_flashback_storage_boundary pg_flashback fb_user_surface fb_recordref fb_wal_sidecar fb_memory_limit fb_spill fb_toast_flashback fb_progress
+REGRESS = fb_smoke fb_relation_gate fb_relation_unsupported fb_runtime_gate fb_flashback_keyed fb_flashback_bag fb_flashback_storage_boundary fb_flashback_toast_storage_boundary pg_flashback fb_user_surface fb_recordref fb_wal_sidecar fb_memory_limit fb_spill fb_toast_flashback fb_progress
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
