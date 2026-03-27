@@ -1,0 +1,79 @@
+DO $$
+BEGIN
+	IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_flashback') THEN
+		EXECUTE 'DROP EXTENSION pg_flashback CASCADE';
+	END IF;
+END;
+$$;
+CREATE EXTENSION pg_flashback;
+
+DO $$
+BEGIN
+	IF to_regprocedure('fb_recordref_debug(regclass,timestamptz)') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_recordref_debug(regclass, timestamptz)';
+	END IF;
+	IF to_regprocedure('fb_wal_sidecar_debug(regclass,timestamptz)') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_wal_sidecar_debug(regclass, timestamptz)';
+	END IF;
+END;
+$$;
+
+CREATE FUNCTION fb_recordref_debug(regclass, timestamptz)
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_recordref_debug'
+LANGUAGE C
+STRICT;
+
+CREATE FUNCTION fb_wal_sidecar_debug(regclass, timestamptz)
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_wal_sidecar_debug'
+LANGUAGE C
+STRICT;
+
+DO $$
+BEGIN
+	EXECUTE format('SET pg_flashback.archive_dir = %L', current_setting('data_directory') || '/pg_wal');
+END;
+$$;
+
+CREATE TABLE fb_wal_sidecar_target (
+	id integer PRIMARY KEY,
+	payload integer
+);
+
+CHECKPOINT;
+
+INSERT INTO fb_wal_sidecar_target VALUES (0, 10);
+UPDATE fb_wal_sidecar_target SET payload = 11 WHERE id = 0;
+
+CREATE TABLE fb_wal_sidecar_mark (
+	target_ts timestamptz NOT NULL
+);
+
+INSERT INTO fb_wal_sidecar_mark VALUES (clock_timestamp());
+
+DO $$
+BEGIN
+	PERFORM pg_sleep(1.1);
+END;
+$$;
+
+CHECKPOINT;
+
+INSERT INTO fb_wal_sidecar_target VALUES (1, 20);
+UPDATE fb_wal_sidecar_target SET payload = 21 WHERE id = 1;
+DELETE FROM fb_wal_sidecar_target WHERE id = 0;
+
+SELECT fb_recordref_debug(
+	'fb_wal_sidecar_target'::regclass,
+	(SELECT target_ts FROM fb_wal_sidecar_mark)
+);
+
+SELECT regexp_replace(
+	fb_wal_sidecar_debug(
+		'fb_wal_sidecar_target'::regclass,
+		(SELECT target_ts FROM fb_wal_sidecar_mark)
+	),
+	'checkpoint_entries=[0-9]+',
+	'checkpoint_entries=<n>'
+);

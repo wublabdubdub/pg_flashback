@@ -15,19 +15,25 @@
 - 当前结果模型固定为：
   - 不创建结果表
   - 不返回结果表名
-  - 不走 `tuplestore`
-  - 直接以 SRF 逐行返回结果集
+  - 默认仍是直接查询型 SRF
+  - 允许在执行器允许时内部切到 materialized SRF / `tuplestore`
 - 当前旧入口与旧中间层已删除：
   - `pg_flashback(text, text, text)`
   - `fb_parallel`
   - `parallel_apply_workers`
   - 公开安装面的 `fb_flashback_materialize(...)`
 - 当前主链已经收敛为：
-  - `checkpoint + RecordRef + block redo + ForwardOp + ReverseOp + streaming apply`
+  - `checkpoint + RecordRef + block redo + ForwardOp + ReverseOpSource + streaming apply`
 - 当前 apply 已切到小内存口径：
   - keyed 只跟踪变化 key
   - bag 只跟踪变化 row identity
   - 不再按当前整表大小构造 apply 工作集
+- 当前 spill / sidecar 主链已进入恢复后的继续收敛状态：
+  - `fb_spool`
+  - `sql/fb_spill.sql`
+  - `sql/fb_wal_sidecar.sql`
+  - `fb_wal` recent tail inline / sidecar 诊断口径
+  - `pg_flashback()` 内部 materialized SRF 发射路径
 - 当前运行时与来源解析已落地：
   - `archive_dest`
   - `archive_dir` 兼容回退
@@ -60,12 +66,30 @@
 - 回归 SQL 全量迁移到 `NULL::schema.table` 调用形态
 - deep SQL 主线迁移到直接查询口径，不再依赖结果表
 - 重写当前维护文档，移除旧的结果表/并行写表描述
+- 已从本机会话日志中恢复出一版可编译的 bounded spill Stage A 代码基线：
+  - 新增 `fb_spool`
+  - 新增 `sql/fb_spill.sql`
+  - `fb_wal` / `fb_replay` / `fb_reverse_ops` / `fb_apply` 已切到 `FbReverseOpSource`
+  - 该基线来自 `2026-03-26 18:22`、`2026-03-26 20:03`、`2026-03-26 21:10` 三段会话的前半段稳定 patch
+- 已继续从本机会话日志恢复出 `2026-03-27` 后续 spill follow-up：
+  - `fb_apply` 新增 emit / materialize 双路径
+  - `fb_entry` 新增内部 materialized SRF 分支
+  - `fb_wal` 新增 recent tail inline / sidecar 相关恢复代码与调试 SQL
+  - `sql/fb_recordref.sql` / `sql/fb_toast_flashback.sql` / `sql/fb_wal_sidecar.sql` 已同步回恢复结果
+  - 当前稳定继续恢复树为：`/tmp/pgfb_exact_probe`
+- 已补回本轮会话内新增的设计 / ADR / 报告文档：
+  - `docs/specs/2026-03-26-bounded-spill-design.md`
+  - `docs/decisions/ADR-0006-bounded-spill-main-pipeline.md`
+  - `docs/decisions/ADR-0007-toast-heavy-materialized-srf.md`
+  - 若干 `docs/superpowers/specs` / `plans` 与冷缓存报告
 
 ## 当前验证结果
 
 - `PG12-18` 本机编译矩阵：通过
 - `make PG_CONFIG=/home/18pg/local/bin/pg_config install`：通过
 - `su - 18pg -c 'PGPORT=5832 ... make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck'`：`All 12 tests passed.`
+- `2026-03-27` 当前恢复工作区 `make PG_CONFIG=/home/18pg/local/bin/pg_config -j4`：通过
+- `/tmp/pgfb_exact_probe` 顺序回放成功后 `make PG_CONFIG=/home/18pg/local/bin/pg_config -j4`：通过
 - 当前回归覆盖：
   - `fb_smoke`
   - `fb_relation_gate`
@@ -87,6 +111,10 @@
 - `fb_export_undo`
 - WAL 索引 / replay 主链继续向 bounded spill 演进
 - 更多 PG18 heap WAL 与主键变化正确性补齐
+- install / installcheck / deep 级别验证尚未按本轮恢复后的代码重新补跑
+- 当前可继续恢复 / 对照的稳定临时树为：
+  - `/tmp/pgfb_stageA_clean`
+  - `/tmp/pgfb_exact_probe`
 
 ## 下一步
 
@@ -95,3 +123,4 @@
 - 为 `fb_export_undo` 开始独立实现
 - 继续压缩 WAL 索引 / replay 路径的高水位内存
 - 补齐主键变化与更多 TOAST / 宽表场景验证
+- 按当前恢复后的工作区补跑 install / installcheck / deep 验证，确认恢复结果不仅“可编译”

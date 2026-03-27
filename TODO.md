@@ -47,8 +47,17 @@
 ### P5.6 内存与效率
 
 - [x] apply 不再按当前表大小线性占用内存
+- [x] 从本机会话日志恢复 bounded spill Stage A 代码基线（`fb_spool` / `fb_spill` / `FbReverseOpSource`）
+- [x] 继续从本机会话日志恢复 `2026-03-26 21:10` 后半段到 `2026-03-27` 的 spill follow-up / `fb_wal` sidecar / materialized SRF 主链
 - [ ] WAL 索引 / replay 主链继续向 bounded spill 演进
 - [ ] deep full 的 `parallel_segment_scan on/off` 端到端验证继续推进
+- [ ] 按恢复后的代码重新补跑 installcheck / deep / 冷缓存场景验证
+
+## 恢复记录
+
+- [x] 已将当前可编译恢复点同步回当前工作区
+- [x] 已记录稳定临时树 `/tmp/pgfb_stageA_clean`
+- [x] 已将恢复记录继续同步到设计 / ADR / 架构文档
 
 ### P5.7 版本兼容与文档
 

@@ -24,6 +24,7 @@
 #include "fb_error.h"
 #include "fb_guc.h"
 #include "fb_progress.h"
+#include "fb_replay.h"
 #include "fb_reverse_ops.h"
 #include "fb_wal.h"
 
@@ -36,7 +37,8 @@ typedef struct FbFlashbackQueryState
 {
 	FbRelationInfo info;
 	TupleDesc tupdesc;
-	FbReverseOpStream reverse;
+	FbSpoolSession *spool;
+	FbReverseOpSource *reverse;
 	FbApplyContext *apply;
 	ExprContext *econtext;
 	bool cleanup_registered;
@@ -46,6 +48,8 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(fb_version);
 PG_FUNCTION_INFO_V1(fb_check_relation);
+PG_FUNCTION_INFO_V1(fb_recordref_debug);
+PG_FUNCTION_INFO_V1(fb_wal_sidecar_debug);
 PG_FUNCTION_INFO_V1(pg_flashback);
 PG_FUNCTION_INFO_V1(fb_export_undo);
 
@@ -160,14 +164,16 @@ static void
 fb_build_flashback_reverse_ops(TimestampTz target_ts,
 							   const FbRelationInfo *info,
 							   TupleDesc tupdesc,
-							   FbReverseOpStream *reverse)
+							   FbSpoolSession *spool,
+							   FbReverseOpSource **reverse_out)
 {
 	FbWalScanContext scan_ctx;
 	FbWalRecordIndex index;
-	FbForwardOpStream forward;
+	FbReplayResult replay_result;
+	FbReverseOpSource *reverse;
 
 	fb_progress_enter_stage(FB_PROGRESS_STAGE_PREPARE_WAL, NULL);
-	fb_wal_prepare_scan_context(target_ts, &scan_ctx);
+	fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
 	fb_wal_build_record_index(info, &scan_ctx, &index);
 	if (index.unsafe)
 		ereport(ERROR,
@@ -175,8 +181,36 @@ fb_build_flashback_reverse_ops(TimestampTz target_ts,
 				 errmsg("fb does not support WAL windows containing %s operations",
 						fb_wal_unsafe_reason_name(index.unsafe_reason))));
 
-	fb_build_forward_ops(info, &index, tupdesc, &forward);
-	fb_build_reverse_ops(&forward, reverse);
+	MemSet(&replay_result, 0, sizeof(replay_result));
+	replay_result.tracked_bytes = index.tracked_bytes;
+	replay_result.memory_limit_bytes = index.memory_limit_bytes;
+	reverse = fb_reverse_source_create(spool,
+									   &replay_result.tracked_bytes,
+									   replay_result.memory_limit_bytes);
+	fb_replay_build_reverse_source(info, &index, tupdesc, &replay_result, reverse);
+	fb_reverse_source_finish(reverse);
+	*reverse_out = reverse;
+}
+
+static void
+fb_prepare_flashback_query(FbFlashbackQueryState *state,
+						   Oid source_relid,
+						   TimestampTz target_ts)
+{
+	state->spool = fb_spool_session_create();
+	fb_validate_flashback_target(source_relid, target_ts, &state->info, &state->tupdesc);
+	fb_build_flashback_reverse_ops(target_ts,
+								   &state->info,
+								   state->tupdesc,
+								   state->spool,
+								   &state->reverse);
+	state->apply = fb_apply_begin(&state->info,
+								  state->tupdesc,
+								  state->reverse);
+	fb_reverse_source_destroy(state->reverse);
+	state->reverse = NULL;
+	fb_spool_session_destroy(state->spool);
+	state->spool = NULL;
 }
 
 /*
@@ -193,6 +227,16 @@ fb_flashback_cleanup_callback(Datum arg)
 	{
 		fb_apply_end(state->apply);
 		state->apply = NULL;
+	}
+	if (state != NULL && state->reverse != NULL)
+	{
+		fb_reverse_source_destroy(state->reverse);
+		state->reverse = NULL;
+	}
+	if (state != NULL && state->spool != NULL)
+	{
+		fb_spool_session_destroy(state->spool);
+		state->spool = NULL;
 	}
 
 	fb_progress_abort();
@@ -249,6 +293,87 @@ fb_check_relation(PG_FUNCTION_ARGS)
 }
 
 /*
+ * fb_recordref_debug
+ *    SQL entry point for regression-only index diagnostics.
+ */
+
+Datum
+fb_recordref_debug(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	FbRelationInfo info;
+	FbWalScanContext scan_ctx;
+	FbWalRecordIndex index;
+	FbSpoolSession *spool = NULL;
+	StringInfoData buf;
+
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+	fb_catalog_load_relation_info(relid, &info);
+
+	PG_TRY();
+	{
+		spool = fb_spool_session_create();
+		fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
+		fb_wal_build_record_index(&info, &scan_ctx, &index);
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "anchor=%s unsafe=%s reason=%s meta_refs=%llu payload_refs=%u kept=%llu target_dml=%llu commits=%llu aborts=%llu tail_inline=%s head_gap_refs=%u tail_refs=%u",
+						 index.anchor_found ? "true" : "false",
+						 index.unsafe ? "true" : "false",
+						 fb_wal_unsafe_reason_name(index.unsafe_reason),
+						 (unsigned long long) index.total_record_count,
+						 index.record_count,
+						 (unsigned long long) index.kept_record_count,
+						 (unsigned long long) index.target_record_count,
+						 (unsigned long long) index.target_commit_count,
+						 (unsigned long long) index.target_abort_count,
+						 index.tail_inline_payload ? "true" : "false",
+						 fb_spool_log_count(index.record_log),
+						 fb_spool_log_count(index.record_tail_log));
+
+		fb_spool_session_destroy(spool);
+		spool = NULL;
+		PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+	}
+	PG_CATCH();
+	{
+		if (spool != NULL)
+			fb_spool_session_destroy(spool);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+/*
+ * fb_wal_sidecar_debug
+ *    SQL entry point for regression-only sidecar diagnostics.
+ */
+
+Datum
+fb_wal_sidecar_debug(PG_FUNCTION_ARGS)
+{
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	FbWalScanContext scan_ctx;
+	StringInfoData buf;
+
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+	fb_wal_prepare_scan_context(target_ts, NULL, &scan_ctx);
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "anchor_hint=%s start_pruned=%s checkpoint_entries=%u",
+					 scan_ctx.anchor_hint_found ? "true" : "false",
+					 scan_ctx.start_lsn_pruned ? "true" : "false",
+					 scan_ctx.checkpoint_sidecar_entries);
+
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+/*
  * pg_flashback
  *    SQL entry point.
  */
@@ -256,14 +381,56 @@ fb_check_relation(PG_FUNCTION_ARGS)
 Datum
 pg_flashback(PG_FUNCTION_ARGS)
 {
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	FuncCallContext *funcctx;
 	FbFlashbackQueryState *state;
+	Oid source_relid = InvalidOid;
+	bool prefer_materialize = false;
+
+	if (rsinfo != NULL && IsA(rsinfo, ReturnSetInfo))
+	{
+		source_relid = fb_resolve_target_type_relid(fcinfo);
+		prefer_materialize = ((rsinfo->allowedModes & SFRM_Materialize) != 0);
+	}
+
+	if (prefer_materialize)
+	{
+		FbFlashbackQueryState state;
+		TimestampTz target_ts;
+		bits32 srf_flags = 0;
+
+		if (rsinfo->econtext == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("pg_flashback is missing executor expression context")));
+
+		MemSet(&state, 0, sizeof(state));
+		target_ts = fb_parse_target_ts_text(PG_GETARG_TEXT_PP(1));
+
+		fb_progress_begin();
+		PG_TRY();
+		{
+			fb_prepare_flashback_query(&state, source_relid, target_ts);
+			if (rsinfo->expectedDesc != NULL)
+				srf_flags |= MAT_SRF_USE_EXPECTED_DESC;
+			InitMaterializedSRF(fcinfo, srf_flags);
+			fb_apply_materialize(state.apply, rsinfo->setResult);
+			fb_apply_end(state.apply);
+			state.apply = NULL;
+			fb_progress_finish();
+			PG_RETURN_NULL();
+		}
+		PG_CATCH();
+		{
+			fb_flashback_cleanup_callback(PointerGetDatum(&state));
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
 
 	if (SRF_IS_FIRSTCALL())
 	{
 		MemoryContext oldcontext;
-		ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-		Oid source_relid;
 		TimestampTz target_ts;
 
 		if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
@@ -295,13 +462,10 @@ pg_flashback(PG_FUNCTION_ARGS)
 
 		PG_TRY();
 		{
-			source_relid = fb_resolve_target_type_relid(fcinfo);
+			if (!OidIsValid(source_relid))
+				source_relid = fb_resolve_target_type_relid(fcinfo);
 			target_ts = fb_parse_target_ts_text(PG_GETARG_TEXT_PP(1));
-			fb_validate_flashback_target(source_relid, target_ts, &state->info, &state->tupdesc);
-			fb_build_flashback_reverse_ops(target_ts, &state->info, state->tupdesc, &state->reverse);
-			state->apply = fb_apply_begin(&state->info,
-										 state->tupdesc,
-										 &state->reverse);
+			fb_prepare_flashback_query(state, source_relid, target_ts);
 		}
 		PG_CATCH();
 		{
@@ -319,13 +483,10 @@ pg_flashback(PG_FUNCTION_ARGS)
 
 	PG_TRY();
 	{
-		HeapTuple tuple;
 		Datum result;
 
-		tuple = fb_apply_next(state->apply);
-		if (tuple != NULL)
+		if (fb_apply_next(state->apply, &result))
 		{
-			result = heap_copy_tuple_as_datum(tuple, state->tupdesc);
 			SRF_RETURN_NEXT(funcctx, result);
 		}
 
@@ -361,17 +522,20 @@ fb_export_undo(PG_FUNCTION_ARGS)
 	FbRelationInfo info;
 	FbWalScanContext scan_ctx;
 	FbWalRecordIndex index;
+	FbSpoolSession *spool;
 
 	fb_require_target_ts_not_future(target_ts);
 	fb_require_archive_dir();
 	fb_require_supported_target_relation(relid, &info);
-	fb_wal_prepare_scan_context(target_ts, &scan_ctx);
+	spool = fb_spool_session_create();
+	fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
 	fb_wal_build_record_index(&info, &scan_ctx, &index);
 	if (index.unsafe)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("fb does not support WAL windows containing %s operations",
 						fb_wal_unsafe_reason_name(index.unsafe_reason))));
+	fb_spool_session_destroy(spool);
 	fb_raise_not_implemented("fb_export_undo page replay + reverse op stream");
 	PG_RETURN_NULL();
 }

@@ -1,6 +1,6 @@
 /*
  * fb_reverse_ops.h
- *    Forward and reverse operation data structures and builders.
+ *    Reverse operation data structures, spill source, and readers.
  */
 
 #ifndef FB_REVERSE_OPS_H
@@ -11,7 +11,7 @@
 #include "access/htup_details.h"
 
 #include "fb_common.h"
-#include "fb_wal.h"
+#include "fb_spool.h"
 
 typedef enum FbForwardOpType
 {
@@ -27,22 +27,11 @@ typedef enum FbReverseOpType
 	FB_REVERSE_REPLACE
 } FbReverseOpType;
 
-/*
- * FbRowImage
- *    Reverse-op structure.
- */
-
 typedef struct FbRowImage
 {
 	HeapTuple tuple;
-	char *row_identity;
-	char *key_identity;
+	bool finalized;
 } FbRowImage;
-
-/*
- * FbForwardOp
- *    Reverse-op structure.
- */
 
 typedef struct FbForwardOp
 {
@@ -55,11 +44,6 @@ typedef struct FbForwardOp
 	FbRowImage new_row;
 } FbForwardOp;
 
-/*
- * FbReverseOp
- *    Reverse-op structure.
- */
-
 typedef struct FbReverseOp
 {
 	FbReverseOpType type;
@@ -71,61 +55,23 @@ typedef struct FbReverseOp
 	FbRowImage new_row;
 } FbReverseOp;
 
-/*
- * FbForwardOpStream
- *    Stores forward op stream state.
- */
+typedef struct FbReverseOpSource FbReverseOpSource;
+typedef struct FbReverseOpReader FbReverseOpReader;
 
-typedef struct FbForwardOpStream
-{
-	FbForwardOp *ops;
-	uint32 count;
-	uint32 capacity;
-	uint64 tracked_bytes;
-	uint64 memory_limit_bytes;
-} FbForwardOpStream;
+FbReverseOpSource *fb_reverse_source_create(FbSpoolSession *session,
+											 uint64 *tracked_bytes,
+											 uint64 memory_limit_bytes);
+void fb_reverse_source_append(FbReverseOpSource *source, const FbReverseOp *op);
+void fb_reverse_source_finish(FbReverseOpSource *source);
+void fb_reverse_source_destroy(FbReverseOpSource *source);
+uint64 fb_reverse_source_tracked_bytes(const FbReverseOpSource *source);
+uint64 fb_reverse_source_memory_limit_bytes(const FbReverseOpSource *source);
+uint64 fb_reverse_source_total_count(const FbReverseOpSource *source);
 
-/*
- * FbReverseOpStream
- *    Stores reverse op stream state.
- */
+FbReverseOpReader *fb_reverse_reader_open(const FbReverseOpSource *source);
+bool fb_reverse_reader_next(FbReverseOpReader *reader, FbReverseOp *op);
+void fb_reverse_reader_close(FbReverseOpReader *reader);
 
-typedef struct FbReverseOpStream
-{
-	FbReverseOp *ops;
-	uint32 count;
-	uint32 capacity;
-	uint64 tracked_bytes;
-	uint64 memory_limit_bytes;
-} FbReverseOpStream;
-
-/*
- * fb_build_forward_ops
- *    Reverse-op API.
- */
-
-void fb_build_forward_ops(const FbRelationInfo *info,
-						  const FbWalRecordIndex *index,
-						  TupleDesc tupdesc,
-						  FbForwardOpStream *stream);
-/*
- * fb_build_reverse_ops
- *    Reverse-op API.
- */
-
-void fb_build_reverse_ops(const FbForwardOpStream *forward,
-						  FbReverseOpStream *reverse);
-/*
- * fb_forward_ops_debug_summary
- *    Reverse-op API.
- */
-
-char *fb_forward_ops_debug_summary(const FbForwardOpStream *stream);
-/*
- * fb_reverse_ops_debug_summary
- *    Reverse-op API.
- */
-
-char *fb_reverse_ops_debug_summary(const FbReverseOpStream *stream);
+char *fb_reverse_ops_debug_summary(const FbReverseOpSource *source);
 
 #endif

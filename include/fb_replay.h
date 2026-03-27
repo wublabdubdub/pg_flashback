@@ -38,14 +38,14 @@ void fb_replay_execute(const FbRelationInfo *info,
 					   const FbWalRecordIndex *index,
 					   FbReplayResult *result);
 /*
- * fb_replay_build_forward_ops
+ * fb_replay_build_reverse_source
  *    Replay API.
  */
 
-void fb_replay_build_forward_ops(const FbRelationInfo *info,
-								 const FbWalRecordIndex *index,
-								 TupleDesc tupdesc,
-								 FbReplayResult *result,
-								 FbForwardOpStream *stream);
+void fb_replay_build_reverse_source(const FbRelationInfo *info,
+									  const FbWalRecordIndex *index,
+									  TupleDesc tupdesc,
+									  FbReplayResult *result,
+									  FbReverseOpSource *source);
 
 #endif

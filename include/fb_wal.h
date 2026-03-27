@@ -11,6 +11,7 @@
 #include "utils/hsearch.h"
 
 #include "fb_common.h"
+#include "fb_spool.h"
 
 typedef enum FbWalUnsafeReason
 {
@@ -37,6 +38,7 @@ typedef struct FbWalScanContext
 	bool segments_complete;
 	bool end_is_partial;
 	XLogRecPtr start_lsn;
+	XLogRecPtr original_start_lsn;
 	XLogRecPtr end_lsn;
 	XLogRecPtr first_record_lsn;
 	XLogRecPtr last_record_lsn;
@@ -45,9 +47,13 @@ typedef struct FbWalScanContext
 	uint64 commit_count;
 	uint64 abort_count;
 	bool anchor_found;
+	bool anchor_hint_found;
 	XLogRecPtr anchor_checkpoint_lsn;
 	XLogRecPtr anchor_redo_lsn;
 	TimestampTz anchor_time;
+	bool start_lsn_pruned;
+	uint32 checkpoint_sidecar_entries;
+	uint32 anchor_hint_segment_index;
 	bool unsafe;
 	FbWalUnsafeReason unsafe_reason;
 	void *resolved_segments;
@@ -67,6 +73,7 @@ typedef struct FbWalScanContext
 	bool current_segment_may_hit;
 	uint32 progress_segment_total;
 	uint32 visited_segment_count;
+	FbSpoolSession *spool_session;
 } FbWalScanContext;
 
 typedef enum FbWalRecordKind
@@ -148,6 +155,8 @@ typedef struct FbRecordRef
 
 typedef struct FbWalRecordIndex
 {
+	TimestampTz target_ts;
+	TimestampTz query_now_ts;
 	XLogRecPtr anchor_checkpoint_lsn;
 	XLogRecPtr anchor_redo_lsn;
 	TimestampTz anchor_time;
@@ -164,12 +173,16 @@ typedef struct FbWalRecordIndex
 	uint64 target_update_count;
 	uint64 tracked_bytes;
 	uint64 memory_limit_bytes;
-	void *payload_arena;
-	FbRecordRef *records;
 	uint32 record_count;
-	uint32 record_capacity;
+	bool tail_inline_payload;
+	XLogRecPtr tail_cutover_lsn;
 	HTAB *xid_statuses;
+	FbSpoolSession *spool_session;
+	FbSpoolLog *record_log;
+	FbSpoolLog *record_tail_log;
 } FbWalRecordIndex;
+
+typedef struct FbWalRecordCursor FbWalRecordCursor;
 
 typedef bool (*FbWalRecordVisitor) (XLogReaderState *reader, void *arg);
 
@@ -184,7 +197,9 @@ void fb_require_archive_has_wal_segments(void);
  *    WAL API.
  */
 
-void fb_wal_prepare_scan_context(TimestampTz target_ts, FbWalScanContext *ctx);
+void fb_wal_prepare_scan_context(TimestampTz target_ts,
+								 FbSpoolSession *spool_session,
+								 FbWalScanContext *ctx);
 /*
  * fb_wal_scan_relation_window
  *    WAL API.
@@ -208,6 +223,16 @@ bool fb_wal_lookup_xid_status(const FbWalRecordIndex *index,
 							  TransactionId xid,
 							  FbWalXidStatus *status,
 							  TimestampTz *commit_ts);
+FbWalRecordCursor *fb_wal_record_cursor_open(const FbWalRecordIndex *index,
+											 FbSpoolDirection direction);
+bool fb_wal_record_cursor_seek(FbWalRecordCursor *cursor, uint32 record_index);
+bool fb_wal_record_cursor_read(FbWalRecordCursor *cursor,
+							   FbRecordRef *record,
+							   uint32 *record_index);
+void fb_wal_record_cursor_close(FbWalRecordCursor *cursor);
+bool fb_wal_record_load(const FbWalRecordIndex *index,
+						 uint32 record_index,
+						 FbRecordRef *record);
 /*
  * fb_wal_visit_records
  *    WAL API.

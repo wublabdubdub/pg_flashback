@@ -6,13 +6,10 @@
 #include "postgres.h"
 
 #include "access/heapam.h"
-#include "lib/stringinfo.h"
 #include "access/relation.h"
 #include "access/heapam_xlog.h"
 #include "storage/bufpage.h"
-#include "utils/builtins.h"
 #include "utils/hsearch.h"
-#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -88,6 +85,18 @@ typedef struct FbReplayControl
 	uint32 round_no;
 	HTAB *missing_blocks;
 } FbReplayControl;
+
+typedef struct FbPendingReverseOpEntry
+{
+	FbReverseOp op;
+	struct FbPendingReverseOpEntry *next;
+} FbPendingReverseOpEntry;
+
+typedef struct FbPendingReverseOpQueue
+{
+	FbPendingReverseOpEntry *head;
+	FbPendingReverseOpEntry *tail;
+} FbPendingReverseOpQueue;
 
 /*
  * fb_replay_progress_stage
@@ -255,77 +264,6 @@ fb_fix_infomask_from_infobits(uint8 infobits, uint16 *infomask, uint16 *infomask
 }
 
 /*
- * fb_tuple_identity
- *    Replay helper.
- */
-
-static char *
-fb_tuple_identity(HeapTuple tuple, TupleDesc tupdesc,
-				  const AttrNumber *attrs, int attr_count)
-{
-	int natts = tupdesc->natts;
-	Datum *values;
-	bool *nulls;
-	StringInfoData buf;
-	int i;
-
-	values = palloc0(sizeof(Datum) * natts);
-	nulls = palloc0(sizeof(bool) * natts);
-	heap_deform_tuple(tuple, tupdesc, values, nulls);
-
-	initStringInfo(&buf);
-
-	for (i = 0; i < natts; i++)
-	{
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
-		bool include = (attrs == NULL);
-
-		if (attr->attisdropped)
-			continue;
-
-		if (!include)
-		{
-			int key_index;
-
-			for (key_index = 0; key_index < attr_count; key_index++)
-			{
-				if (attrs[key_index] == attr->attnum)
-				{
-					include = true;
-					break;
-				}
-			}
-		}
-
-		if (!include)
-			continue;
-
-		if (buf.len > 0)
-			appendStringInfoChar(&buf, '|');
-
-		appendStringInfoString(&buf, NameStr(attr->attname));
-		appendStringInfoChar(&buf, '=');
-
-		if (nulls[i])
-			appendStringInfoString(&buf, "NULL");
-		else
-		{
-			Oid output_func;
-			bool is_varlena;
-			char *value_text;
-			char *quoted;
-
-			getTypeOutputInfo(attr->atttypid, &output_func, &is_varlena);
-			value_text = OidOutputFunctionCall(output_func, values[i]);
-			quoted = quote_literal_cstr(value_text);
-			appendStringInfoString(&buf, quoted);
-		}
-	}
-
-	return buf.data;
-}
-
-/*
  * fb_copy_page_tuple
  *    Replay helper.
  */
@@ -435,44 +373,6 @@ fb_page_prune_execute(Page page, bool lp_truncate_only,
 }
 
 /*
- * fb_row_image_set_identities
- *    Replay helper.
- */
-
-static void
-fb_row_image_set_identities(const FbRelationInfo *info,
-							TupleDesc tupdesc,
-							HeapTuple tuple,
-							FbRowImage *row,
-							FbReplayResult *result)
-{
-	if (row == NULL)
-		return;
-
-	row->row_identity = NULL;
-	row->key_identity = NULL;
-	if (tuple == NULL)
-		return;
-
-	if (info->mode == FB_APPLY_KEYED && info->key_natts > 0)
-	{
-		row->key_identity = fb_tuple_identity(tuple, tupdesc,
-											  info->key_attnums,
-											  info->key_natts);
-		fb_replay_charge_bytes(result,
-							   fb_memory_cstring_bytes(row->key_identity),
-							   "forward key identity");
-	}
-	else
-	{
-		row->row_identity = fb_tuple_identity(tuple, tupdesc, NULL, 0);
-		fb_replay_charge_bytes(result,
-							   fb_memory_cstring_bytes(row->row_identity),
-							   "forward row identity");
-	}
-}
-
-/*
  * fb_prepare_historical_visible_tuple
  *    Replay helper.
  */
@@ -493,247 +393,138 @@ fb_prepare_historical_visible_tuple(const FbRelationInfo *info,
 	return tuple;
 }
 
-/*
- * fb_forward_stream_finalize
- *    Replay helper.
- */
-
 static void
-fb_forward_stream_finalize(const FbRelationInfo *info,
-						   TupleDesc tupdesc,
-						   FbToastStore *toast_store,
-						   FbReplayResult *result,
-						   FbForwardOpStream *stream)
+fb_finalize_row_image(const FbRelationInfo *info,
+					  TupleDesc tupdesc,
+					  FbToastStore *toast_store,
+					  XLogRecPtr record_lsn,
+					  const char *type_name,
+					  const char *side_name,
+					  FbRowImage *row,
+					  FbReplayResult *result)
 {
-	uint32 i;
-	const char *type_name = "unknown";
+	HeapTuple original_tuple;
 
-	if (stream == NULL || tupdesc == NULL)
+	if (row == NULL || row->tuple == NULL)
 		return;
 
-	for (i = 0; i < stream->count; i++)
+	original_tuple = row->tuple;
+	PG_TRY();
 	{
-		FbForwardOp *op = &stream->ops[i];
-
-		switch (op->type)
-		{
-			case FB_FORWARD_INSERT:
-				type_name = "insert";
-				break;
-			case FB_FORWARD_DELETE:
-				type_name = "delete";
-				break;
-			case FB_FORWARD_UPDATE:
-				type_name = "update";
-				break;
-		}
-
-		switch (op->type)
-		{
-			case FB_FORWARD_INSERT:
-				if (op->new_row.tuple != NULL)
-				{
-					HeapTuple original_tuple = op->new_row.tuple;
-
-					PG_TRY();
-					{
-						op->new_row.tuple = fb_prepare_historical_visible_tuple(info, toast_store,
-																	  tupdesc, op->new_row.tuple);
-					}
-					PG_CATCH();
-					{
-						ErrorData  *edata = CopyErrorData();
-
-						FlushErrorState();
-						ereport(ERROR,
-								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-								 errmsg("failed to finalize toast-bearing forward row"),
-								 errdetail("op=%s side=new lsn=%X/%08X cause=%s inner_detail=%s",
-										   type_name,
-										   LSN_FORMAT_ARGS(op->record_lsn),
-										   edata->message ? edata->message : "unknown",
-										   edata->detail ? edata->detail : "none")));
-					}
-					PG_END_TRY();
-					if (op->new_row.tuple != original_tuple)
-						fb_replay_charge_bytes(result,
-											   fb_memory_heaptuple_bytes(op->new_row.tuple),
-											   "forward finalized tuple");
-					if (fb_toast_tuple_uses_external(tupdesc, op->new_row.tuple))
-						ereport(ERROR,
-								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-								 errmsg("unresolved external toast datum after finalize"),
-								 errdetail("op=%s side=new lsn=%X/%08X",
-										   type_name,
-										   LSN_FORMAT_ARGS(op->record_lsn))));
-					fb_row_image_set_identities(info, tupdesc,
-												op->new_row.tuple,
-												&op->new_row,
-												result);
-				}
-				break;
-			case FB_FORWARD_DELETE:
-				if (op->old_row.tuple != NULL)
-				{
-					HeapTuple original_tuple = op->old_row.tuple;
-
-					PG_TRY();
-					{
-						op->old_row.tuple = fb_prepare_historical_visible_tuple(info, toast_store,
-																	  tupdesc, op->old_row.tuple);
-					}
-					PG_CATCH();
-					{
-						ErrorData  *edata = CopyErrorData();
-
-						FlushErrorState();
-						ereport(ERROR,
-								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-								 errmsg("failed to finalize toast-bearing forward row"),
-								 errdetail("op=%s side=old lsn=%X/%08X cause=%s inner_detail=%s",
-										   type_name,
-										   LSN_FORMAT_ARGS(op->record_lsn),
-										   edata->message ? edata->message : "unknown",
-										   edata->detail ? edata->detail : "none")));
-					}
-					PG_END_TRY();
-					if (op->old_row.tuple != original_tuple)
-						fb_replay_charge_bytes(result,
-											   fb_memory_heaptuple_bytes(op->old_row.tuple),
-											   "forward finalized tuple");
-					if (fb_toast_tuple_uses_external(tupdesc, op->old_row.tuple))
-						ereport(ERROR,
-								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-								 errmsg("unresolved external toast datum after finalize"),
-								 errdetail("op=%s side=old lsn=%X/%08X",
-										   type_name,
-										   LSN_FORMAT_ARGS(op->record_lsn))));
-					fb_row_image_set_identities(info, tupdesc,
-												op->old_row.tuple,
-												&op->old_row,
-												result);
-				}
-				break;
-			case FB_FORWARD_UPDATE:
-				if (op->old_row.tuple != NULL)
-				{
-					HeapTuple original_tuple = op->old_row.tuple;
-
-					PG_TRY();
-					{
-						op->old_row.tuple = fb_prepare_historical_visible_tuple(info, toast_store,
-																	  tupdesc, op->old_row.tuple);
-					}
-					PG_CATCH();
-					{
-						ErrorData  *edata = CopyErrorData();
-
-						FlushErrorState();
-						ereport(ERROR,
-								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-								 errmsg("failed to finalize toast-bearing forward row"),
-								 errdetail("op=%s side=old lsn=%X/%08X cause=%s inner_detail=%s",
-										   type_name,
-										   LSN_FORMAT_ARGS(op->record_lsn),
-										   edata->message ? edata->message : "unknown",
-										   edata->detail ? edata->detail : "none")));
-					}
-					PG_END_TRY();
-					if (op->old_row.tuple != original_tuple)
-						fb_replay_charge_bytes(result,
-											   fb_memory_heaptuple_bytes(op->old_row.tuple),
-											   "forward finalized tuple");
-					if (fb_toast_tuple_uses_external(tupdesc, op->old_row.tuple))
-						ereport(ERROR,
-								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-								 errmsg("unresolved external toast datum after finalize"),
-								 errdetail("op=%s side=old lsn=%X/%08X",
-										   type_name,
-										   LSN_FORMAT_ARGS(op->record_lsn))));
-					fb_row_image_set_identities(info, tupdesc,
-												op->old_row.tuple,
-												&op->old_row,
-												result);
-				}
-				if (op->new_row.tuple != NULL)
-				{
-					HeapTuple original_tuple = op->new_row.tuple;
-
-					PG_TRY();
-					{
-						op->new_row.tuple = fb_prepare_historical_visible_tuple(info, toast_store,
-																	  tupdesc, op->new_row.tuple);
-					}
-					PG_CATCH();
-					{
-						ErrorData  *edata = CopyErrorData();
-
-						FlushErrorState();
-						ereport(ERROR,
-								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-								 errmsg("failed to finalize toast-bearing forward row"),
-								 errdetail("op=%s side=new lsn=%X/%08X cause=%s inner_detail=%s",
-										   type_name,
-										   LSN_FORMAT_ARGS(op->record_lsn),
-										   edata->message ? edata->message : "unknown",
-										   edata->detail ? edata->detail : "none")));
-					}
-					PG_END_TRY();
-					if (op->new_row.tuple != original_tuple)
-						fb_replay_charge_bytes(result,
-											   fb_memory_heaptuple_bytes(op->new_row.tuple),
-											   "forward finalized tuple");
-					if (fb_toast_tuple_uses_external(tupdesc, op->new_row.tuple))
-						ereport(ERROR,
-								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-								 errmsg("unresolved external toast datum after finalize"),
-								 errdetail("op=%s side=new lsn=%X/%08X",
-										   type_name,
-										   LSN_FORMAT_ARGS(op->record_lsn))));
-					fb_row_image_set_identities(info, tupdesc,
-												op->new_row.tuple,
-												&op->new_row,
-												result);
-				}
-				break;
-		}
+		row->tuple = fb_prepare_historical_visible_tuple(info, toast_store,
+														 tupdesc, row->tuple);
 	}
+	PG_CATCH();
+	{
+		ErrorData  *edata = CopyErrorData();
+
+		FlushErrorState();
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("failed to finalize toast-bearing forward row"),
+				 errdetail("op=%s side=%s lsn=%X/%08X cause=%s inner_detail=%s",
+						   type_name,
+						   side_name,
+						   LSN_FORMAT_ARGS(record_lsn),
+						   edata->message ? edata->message : "unknown",
+						   edata->detail ? edata->detail : "none")));
+	}
+	PG_END_TRY();
+
+	if (row->tuple != original_tuple)
+		fb_replay_charge_bytes(result,
+							   fb_memory_heaptuple_bytes(row->tuple),
+							   "forward finalized tuple");
+	if (fb_toast_tuple_uses_external(tupdesc, row->tuple))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("unresolved external toast datum after finalize"),
+				 errdetail("op=%s side=%s lsn=%X/%08X",
+						   type_name,
+						   side_name,
+						   LSN_FORMAT_ARGS(record_lsn))));
+	row->finalized = true;
 }
 
-/*
- * fb_forward_stream_append
- *    Replay helper.
- */
+static bool
+fb_row_image_needs_delayed_toast_finalize(const FbRelationInfo *info,
+										  TupleDesc tupdesc,
+										  HeapTuple tuple)
+{
+	if (info == NULL || tupdesc == NULL || tuple == NULL || !info->has_toast_locator)
+		return false;
+
+	return fb_toast_tuple_uses_external(tupdesc, tuple);
+}
+
+static bool
+fb_row_image_needs_finalize(const FbRelationInfo *info,
+							const FbRowImage *row)
+{
+	(void) info;
+
+	if (row == NULL || row->tuple == NULL)
+		return false;
+
+	return !row->finalized;
+}
 
 static void
-fb_forward_stream_append(FbForwardOpStream *stream,
-						 const FbForwardOp *op,
-						 FbReplayResult *result)
+fb_pending_reverse_op_enqueue(FbPendingReverseOpQueue *queue,
+							  FbReverseOp *op,
+							  FbReplayResult *result)
 {
-	uint32 old_capacity;
+	FbPendingReverseOpEntry *entry;
 
-	if (stream == NULL)
+	if (queue == NULL || op == NULL)
 		return;
 
-	if (stream->count == stream->capacity)
+	entry = palloc0(sizeof(*entry));
+	entry->op = *op;
+	entry->next = NULL;
+	if (queue->tail != NULL)
+		queue->tail->next = entry;
+	else
+		queue->head = entry;
+	queue->tail = entry;
+	fb_replay_charge_bytes(result, sizeof(*entry), "pending reverse op");
+}
+
+static void
+fb_pending_reverse_op_flush(FbPendingReverseOpQueue *queue,
+							const FbRelationInfo *info,
+							TupleDesc tupdesc,
+							FbToastStore *toast_store,
+							FbReplayResult *result,
+							FbReverseOpSource *source)
+{
+	FbPendingReverseOpEntry *entry = (queue != NULL) ? queue->head : NULL;
+
+	while (entry != NULL)
 	{
-		old_capacity = stream->capacity;
-		stream->capacity = (stream->capacity == 0) ? 32 : stream->capacity * 2;
-		fb_replay_charge_bytes(result,
-							   sizeof(FbForwardOp) * (stream->capacity - old_capacity),
-							   "ForwardOp array");
-		if (stream->ops == NULL)
-			stream->ops = palloc0(sizeof(FbForwardOp) * stream->capacity);
-		else
-		{
-			stream->ops = repalloc(stream->ops,
-								   sizeof(FbForwardOp) * stream->capacity);
-			MemSet(stream->ops + old_capacity, 0,
-				   sizeof(FbForwardOp) * (stream->capacity - old_capacity));
-		}
+		FbPendingReverseOpEntry *next = entry->next;
+
+		if (fb_row_image_needs_finalize(info, &entry->op.old_row))
+			fb_finalize_row_image(info, tupdesc, toast_store, entry->op.record_lsn,
+								  entry->op.type == FB_REVERSE_ADD ? "delete" : "update",
+								  "old", &entry->op.old_row, result);
+
+		if (fb_row_image_needs_finalize(info, &entry->op.new_row))
+			fb_finalize_row_image(info, tupdesc, toast_store, entry->op.record_lsn,
+								  entry->op.type == FB_REVERSE_REMOVE ? "insert" : "update",
+								  "new", &entry->op.new_row, result);
+
+		fb_reverse_source_append(source, &entry->op);
+		fb_memory_release_bytes(&result->tracked_bytes, sizeof(*entry));
+		pfree(entry);
+		entry = next;
 	}
 
-	stream->ops[stream->count++] = *op;
+	if (queue != NULL)
+	{
+		queue->head = NULL;
+		queue->tail = NULL;
+	}
 }
 
 /*
@@ -946,36 +737,40 @@ fb_replay_resolve_missing_anchors(const FbWalRecordIndex *index,
 								  HTAB *missing_blocks)
 {
 	uint32 unresolved;
-	int32 i;
+	FbWalRecordCursor *cursor;
+	FbRecordRef record;
+	uint32 record_index;
 
 	unresolved = fb_replay_missing_block_count(missing_blocks);
 	if (unresolved == 0)
 		return;
 
-	for (i = (int32) index->record_count - 1; i >= 0 && unresolved > 0; i--)
+	cursor = fb_wal_record_cursor_open(index, FB_SPOOL_BACKWARD);
+	while (unresolved > 0 &&
+		   fb_wal_record_cursor_read(cursor, &record, &record_index))
 	{
-		const FbRecordRef *record = &index->records[i];
 		int block_index;
 
-		for (block_index = 0; block_index < record->block_count; block_index++)
+		for (block_index = 0; block_index < record.block_count; block_index++)
 		{
-			const FbRecordBlockRef *block_ref = &record->blocks[block_index];
+			const FbRecordBlockRef *block_ref = &record.blocks[block_index];
 			FbReplayMissingBlock *entry;
 
 			entry = fb_replay_find_missing_block(missing_blocks, block_ref);
 			if (entry == NULL || entry->anchor_found ||
-				(uint32) i >= entry->first_record_index)
+				record_index >= entry->first_record_index)
 				continue;
 
 			if (!block_ref->has_image &&
-				!fb_record_allows_init_for_block(record, block_index))
+				!fb_record_allows_init_for_block(&record, block_index))
 				continue;
 
 			entry->anchor_found = true;
-			entry->anchor_record_index = (uint32) i;
+			entry->anchor_record_index = record_index;
 			unresolved--;
 		}
 	}
+	fb_wal_record_cursor_close(cursor);
 }
 
 /*
@@ -1025,9 +820,12 @@ fb_replay_raise_unresolved_missing_fpi(const FbWalRecordIndex *index,
 				.forknum = entry->key.forknum,
 				.blkno = entry->key.blkno
 			};
-			const FbRecordRef *record = &index->records[entry->first_record_index];
+			FbRecordRef record;
 
-			fb_replay_missing_fpi_error(record, &temp_block_ref, false);
+			if (!fb_wal_record_load(index, entry->first_record_index, &record))
+				elog(ERROR, "missing record %u while raising unresolved missing FPI",
+					 entry->first_record_index);
+			fb_replay_missing_fpi_error(&record, &temp_block_ref, false);
 		}
 	}
 }
@@ -1212,12 +1010,13 @@ fb_append_forward_insert(const FbRelationInfo *info, TupleDesc tupdesc,
 						 FbToastStore *toast_store,
 						 const FbRecordRef *record, HeapTuple new_tuple,
 						 FbReplayResult *result,
-						 FbForwardOpStream *stream)
+						 FbReverseOpSource *source,
+						 FbPendingReverseOpQueue *pending_ops)
 {
-	FbForwardOp op;
+	FbReverseOp op;
 
 	MemSet(&op, 0, sizeof(op));
-	op.type = FB_FORWARD_INSERT;
+	op.type = FB_REVERSE_REMOVE;
 	op.xid = record->xid;
 	op.commit_ts = record->commit_ts;
 	op.commit_lsn = record->commit_lsn;
@@ -1226,7 +1025,14 @@ fb_append_forward_insert(const FbRelationInfo *info, TupleDesc tupdesc,
 	fb_replay_charge_bytes(result,
 						   fb_memory_heaptuple_bytes(new_tuple),
 						   "forward row tuple");
-	fb_forward_stream_append(stream, &op, result);
+	if (fb_row_image_needs_delayed_toast_finalize(info, tupdesc, new_tuple))
+	{
+		fb_pending_reverse_op_enqueue(pending_ops, &op, result);
+		return;
+	}
+	fb_finalize_row_image(info, tupdesc, toast_store, record->lsn,
+						  "insert", "new", &op.new_row, result);
+	fb_reverse_source_append(source, &op);
 }
 
 /*
@@ -1239,12 +1045,13 @@ fb_append_forward_delete(const FbRelationInfo *info, TupleDesc tupdesc,
 						 FbToastStore *toast_store,
 						 const FbRecordRef *record, HeapTuple old_tuple,
 						 FbReplayResult *result,
-						 FbForwardOpStream *stream)
+						 FbReverseOpSource *source,
+						 FbPendingReverseOpQueue *pending_ops)
 {
-	FbForwardOp op;
+	FbReverseOp op;
 
 	MemSet(&op, 0, sizeof(op));
-	op.type = FB_FORWARD_DELETE;
+	op.type = FB_REVERSE_ADD;
 	op.xid = record->xid;
 	op.commit_ts = record->commit_ts;
 	op.commit_lsn = record->commit_lsn;
@@ -1253,7 +1060,14 @@ fb_append_forward_delete(const FbRelationInfo *info, TupleDesc tupdesc,
 	fb_replay_charge_bytes(result,
 						   fb_memory_heaptuple_bytes(old_tuple),
 						   "forward row tuple");
-	fb_forward_stream_append(stream, &op, result);
+	if (fb_row_image_needs_delayed_toast_finalize(info, tupdesc, old_tuple))
+	{
+		fb_pending_reverse_op_enqueue(pending_ops, &op, result);
+		return;
+	}
+	fb_finalize_row_image(info, tupdesc, toast_store, record->lsn,
+						  "delete", "old", &op.old_row, result);
+	fb_reverse_source_append(source, &op);
 }
 
 /*
@@ -1267,12 +1081,13 @@ fb_append_forward_update(const FbRelationInfo *info, TupleDesc tupdesc,
 						 const FbRecordRef *record,
 						 HeapTuple old_tuple, HeapTuple new_tuple,
 						 FbReplayResult *result,
-						 FbForwardOpStream *stream)
+						 FbReverseOpSource *source,
+						 FbPendingReverseOpQueue *pending_ops)
 {
-	FbForwardOp op;
+	FbReverseOp op;
 
 	MemSet(&op, 0, sizeof(op));
-	op.type = FB_FORWARD_UPDATE;
+	op.type = FB_REVERSE_REPLACE;
 	op.xid = record->xid;
 	op.commit_ts = record->commit_ts;
 	op.commit_lsn = record->commit_lsn;
@@ -1285,7 +1100,17 @@ fb_append_forward_update(const FbRelationInfo *info, TupleDesc tupdesc,
 	fb_replay_charge_bytes(result,
 						   fb_memory_heaptuple_bytes(new_tuple),
 						   "forward row tuple");
-	fb_forward_stream_append(stream, &op, result);
+	if (fb_row_image_needs_delayed_toast_finalize(info, tupdesc, old_tuple) ||
+		fb_row_image_needs_delayed_toast_finalize(info, tupdesc, new_tuple))
+	{
+		fb_pending_reverse_op_enqueue(pending_ops, &op, result);
+		return;
+	}
+	fb_finalize_row_image(info, tupdesc, toast_store, record->lsn,
+						  "update", "old", &op.old_row, result);
+	fb_finalize_row_image(info, tupdesc, toast_store, record->lsn,
+						  "update", "new", &op.new_row, result);
+	fb_reverse_source_append(source, &op);
 }
 
 /*
@@ -1378,7 +1203,8 @@ fb_replay_heap_insert(const FbRelationInfo *info,
 					  FbToastStore *toast_store,
 					  FbReplayControl *control,
 					  FbReplayResult *result,
-					  FbForwardOpStream *stream)
+					  FbReverseOpSource *source,
+					  FbPendingReverseOpQueue *pending_ops)
 {
 	xl_heap_insert *xlrec = (xl_heap_insert *) record->main_data;
 	FbReplayBlockState *state;
@@ -1470,7 +1296,7 @@ fb_replay_heap_insert(const FbRelationInfo *info,
 		}
 	}
 
-	if (stream != NULL && tupdesc != NULL &&
+	if (source != NULL && tupdesc != NULL &&
 		record->committed_after_target && block_ref->is_main_relation &&
 		!fb_record_is_speculative_insert(record))
 	{
@@ -1478,7 +1304,7 @@ fb_replay_heap_insert(const FbRelationInfo *info,
 
 		if (new_tuple != NULL)
 			fb_append_forward_insert(info, tupdesc, toast_store, record, new_tuple,
-									result, stream);
+									result, source, pending_ops);
 	}
 }
 
@@ -1496,7 +1322,8 @@ fb_replay_heap_delete(const FbRelationInfo *info,
 					  FbToastStore *toast_store,
 					  FbReplayControl *control,
 					  FbReplayResult *result,
-					  FbForwardOpStream *stream)
+					  FbReverseOpSource *source,
+					  FbPendingReverseOpQueue *pending_ops)
 {
 	xl_heap_delete *xlrec = (xl_heap_delete *) record->main_data;
 	FbReplayBlockState *state;
@@ -1515,7 +1342,7 @@ fb_replay_heap_delete(const FbRelationInfo *info,
 	page = (Page) state->page;
 	fb_replay_sync_toast_page_if_image(block_ref, page, toast_tupdesc, toast_store);
 
-	if (stream != NULL && tupdesc != NULL &&
+	if (source != NULL && tupdesc != NULL &&
 		record->committed_after_target && block_ref->is_main_relation)
 		old_tuple = fb_copy_page_tuple(page, block_ref->blkno, xlrec->offnum);
 	if (block_ref->is_toast_relation && toast_store != NULL && toast_tupdesc != NULL)
@@ -1557,7 +1384,7 @@ fb_replay_heap_delete(const FbRelationInfo *info,
 
 	if (old_tuple != NULL && !fb_record_is_super_delete(record))
 		fb_append_forward_delete(info, tupdesc, toast_store, record, old_tuple,
-								 result, stream);
+								 result, source, pending_ops);
 	else if (old_tuple != NULL)
 		heap_freetuple(old_tuple);
 	if (old_toast_tuple != NULL)
@@ -1579,7 +1406,8 @@ fb_replay_heap_update(const FbRelationInfo *info,
 					  FbToastStore *toast_store,
 					  FbReplayControl *control,
 					  FbReplayResult *result,
-					  FbForwardOpStream *stream)
+					  FbReverseOpSource *source,
+					  FbPendingReverseOpQueue *pending_ops)
 {
 	xl_heap_update *xlrec = (xl_heap_update *) record->main_data;
 	FbRecordBlockRef *new_block_ref = (FbRecordBlockRef *) &record->blocks[0];
@@ -1641,7 +1469,7 @@ fb_replay_heap_update(const FbRelationInfo *info,
 	if (new_block_ref != old_block_ref)
 		fb_replay_sync_toast_page_if_image(new_block_ref, newpage, toast_tupdesc, toast_store);
 
-	if (stream != NULL && tupdesc != NULL &&
+	if (source != NULL && tupdesc != NULL &&
 		record->committed_after_target && old_block_ref->is_main_relation)
 		old_tuple = fb_copy_page_tuple(oldpage, old_block_ref->blkno, xlrec->old_offnum);
 	if (old_block_ref->is_toast_relation && toast_store != NULL && toast_tupdesc != NULL)
@@ -1779,13 +1607,14 @@ fb_replay_heap_update(const FbRelationInfo *info,
 	if (record->committed_after_target && new_block_ref->is_main_relation)
 		result->target_update_count++;
 
-	if (stream != NULL && tupdesc != NULL &&
+	if (source != NULL && tupdesc != NULL &&
 		record->committed_after_target && new_block_ref->is_main_relation)
 	{
 		new_tuple = fb_copy_page_tuple(newpage, new_block_ref->blkno, xlrec->new_offnum);
 		if (old_tuple != NULL && new_tuple != NULL)
 			fb_append_forward_update(info, tupdesc, toast_store, record,
-								 old_tuple, new_tuple, result, stream);
+									 old_tuple, new_tuple, result, source,
+									 pending_ops);
 	}
 	if (new_block_ref->is_toast_relation && toast_store != NULL && toast_tupdesc != NULL)
 	{
@@ -2190,7 +2019,8 @@ fb_replay_heap2_multi_insert(const FbRelationInfo *info,
 							 FbToastStore *toast_store,
 							 FbReplayControl *control,
 							 FbReplayResult *result,
-							 FbForwardOpStream *stream)
+							 FbReverseOpSource *source,
+							 FbPendingReverseOpQueue *pending_ops)
 {
 	xl_heap_multi_insert *xlrec = (xl_heap_multi_insert *) record->main_data;
 	FbReplayBlockState *state;
@@ -2282,14 +2112,14 @@ fb_replay_heap2_multi_insert(const FbRelationInfo *info,
 				}
 			}
 
-		if (stream != NULL && tupdesc != NULL &&
+		if (source != NULL && tupdesc != NULL &&
 			record->committed_after_target && block_ref->is_main_relation)
 		{
 			HeapTuple new_tuple = fb_copy_page_tuple(page, block_ref->blkno, offnum);
 
 			if (new_tuple != NULL)
 				fb_append_forward_insert(info, tupdesc, toast_store, record, new_tuple,
-										result, stream);
+										result, source, pending_ops);
 		}
 	}
 
@@ -2323,80 +2153,97 @@ fb_replay_run_pass(const FbRelationInfo *info,
 				   FbReplayStore *store,
 				   FbReplayControl *control,
 				   FbReplayResult *result,
-				   FbForwardOpStream *stream,
+				   FbReverseOpSource *source,
+				   FbPendingReverseOpQueue *pending_ops,
 				   XLogRecPtr lower_bound,
 				   XLogRecPtr upper_bound)
 {
-	uint32 i;
+	FbWalRecordCursor *cursor;
+	FbRecordRef record;
+	uint32 record_index;
+	uint32 progress_stride = 1;
 
-	for (i = 0; i < index->record_count; i++)
+	if (index != NULL && index->record_count > 0)
+		progress_stride = Max((uint32) 1, index->record_count / 1024);
+
+	cursor = fb_wal_record_cursor_open(index, FB_SPOOL_FORWARD);
+	while (fb_wal_record_cursor_read(cursor, &record, &record_index))
 	{
-		const FbRecordRef *record = &index->records[i];
-
-		if (!XLogRecPtrIsInvalid(lower_bound) && record->lsn < lower_bound)
+		if (!XLogRecPtrIsInvalid(lower_bound) && record.lsn < lower_bound)
 			continue;
-		if (!XLogRecPtrIsInvalid(upper_bound) && record->lsn >= upper_bound)
+		if (!XLogRecPtrIsInvalid(upper_bound) && record.lsn >= upper_bound)
 			continue;
-		if (record->aborted)
+		if (record.aborted)
 			continue;
 		if (control != NULL)
 		{
-			control->record_index = i;
-			fb_replay_progress_update(control, (uint64) i + 1, index->record_count);
+			control->record_index = record_index;
+			if (record_index == 0 ||
+				(record_index + 1) >= index->record_count ||
+				((record_index + 1) % progress_stride) == 0)
+				fb_replay_progress_update(control,
+										 (uint64) record_index + 1,
+										 index->record_count);
 		}
 		if (control != NULL &&
 			control->phase == FB_REPLAY_PHASE_WARM &&
-			!fb_record_should_apply_for_backtrack(record,
+			!fb_record_should_apply_for_backtrack(&record,
 												 control->missing_blocks,
-												 i))
+												 record_index))
 			continue;
 
-		switch (record->kind)
+		switch (record.kind)
 		{
 			case FB_WAL_RECORD_HEAP_INSERT:
-				fb_replay_heap_insert(info, record, store, tupdesc, toast_tupdesc,
-									  toast_store, control, result, stream);
+				fb_replay_heap_insert(info, &record, store, tupdesc, toast_tupdesc,
+									  toast_store, control, result, source,
+									  pending_ops);
 				break;
 			case FB_WAL_RECORD_HEAP_DELETE:
-				fb_replay_heap_delete(info, record, store, tupdesc, toast_tupdesc,
-									  toast_store, control, result, stream);
+				fb_replay_heap_delete(info, &record, store, tupdesc, toast_tupdesc,
+									  toast_store, control, result, source,
+									  pending_ops);
 				break;
 			case FB_WAL_RECORD_HEAP_UPDATE:
-				fb_replay_heap_update(info, record, store, false, tupdesc, toast_tupdesc,
-									  toast_store, control, result, stream);
+				fb_replay_heap_update(info, &record, store, false, tupdesc, toast_tupdesc,
+									  toast_store, control, result, source,
+									  pending_ops);
 				break;
 			case FB_WAL_RECORD_HEAP_HOT_UPDATE:
-				fb_replay_heap_update(info, record, store, true, tupdesc, toast_tupdesc,
-									  toast_store, control, result, stream);
+				fb_replay_heap_update(info, &record, store, true, tupdesc, toast_tupdesc,
+									  toast_store, control, result, source,
+									  pending_ops);
 				break;
 			case FB_WAL_RECORD_HEAP_CONFIRM:
-				fb_replay_heap_confirm(record, store, control, result);
+				fb_replay_heap_confirm(&record, store, control, result);
 				break;
 			case FB_WAL_RECORD_HEAP_LOCK:
-				fb_replay_heap_lock(record, store, control, result);
+				fb_replay_heap_lock(&record, store, control, result);
 				break;
 			case FB_WAL_RECORD_HEAP_INPLACE:
-				fb_replay_heap_inplace(record, store, control, result);
+				fb_replay_heap_inplace(&record, store, control, result);
 				break;
 			case FB_WAL_RECORD_HEAP2_PRUNE:
-				fb_replay_heap2_prune(record, store, control, result);
+				fb_replay_heap2_prune(&record, store, control, result);
 				break;
 			case FB_WAL_RECORD_HEAP2_VISIBLE:
-				fb_replay_heap2_visible(record, store, control, result);
+				fb_replay_heap2_visible(&record, store, control, result);
 				break;
 			case FB_WAL_RECORD_HEAP2_MULTI_INSERT:
-				fb_replay_heap2_multi_insert(info, record, store, tupdesc, toast_tupdesc,
-											 toast_store, control, result, stream);
+				fb_replay_heap2_multi_insert(info, &record, store, tupdesc, toast_tupdesc,
+											 toast_store, control, result, source,
+											 pending_ops);
 				break;
 			case FB_WAL_RECORD_HEAP2_LOCK_UPDATED:
-				fb_replay_heap2_lock_updated(record, store, control, result);
+				fb_replay_heap2_lock_updated(&record, store, control, result);
 				break;
-				case FB_WAL_RECORD_XLOG_FPI:
-				case FB_WAL_RECORD_XLOG_FPI_FOR_HINT:
-					fb_replay_xlog_fpi(record, store, control, result, toast_tupdesc, toast_store);
-					break;
+			case FB_WAL_RECORD_XLOG_FPI:
+			case FB_WAL_RECORD_XLOG_FPI_FOR_HINT:
+				fb_replay_xlog_fpi(&record, store, control, result, toast_tupdesc, toast_store);
+				break;
 		}
 	}
+	fb_wal_record_cursor_close(cursor);
 }
 
 /*
@@ -2430,12 +2277,18 @@ fb_replay_warm_store(const FbRelationInfo *info,
 		return;
 	}
 
-	warm_start = index->records[min_anchor_index].lsn;
+	{
+		FbRecordRef anchor_record;
+
+		if (!fb_wal_record_load(index, min_anchor_index, &anchor_record))
+			elog(ERROR, "missing warm anchor record %u", min_anchor_index);
+		warm_start = anchor_record.lsn;
+	}
 	MemSet(&warm_control, 0, sizeof(warm_control));
 	warm_control.phase = FB_REPLAY_PHASE_WARM;
 	warm_control.missing_blocks = backtrack_blocks;
 	fb_replay_run_pass(info, index, NULL, toast_tupdesc, toast_store,
-					   store, &warm_control, result, NULL,
+					   store, &warm_control, result, NULL, NULL,
 					   warm_start, index->anchor_redo_lsn);
 	fb_progress_update_percent(FB_PROGRESS_STAGE_REPLAY_WARM, 100, NULL);
 }
@@ -2464,7 +2317,7 @@ fb_replay_execute_internal(const FbRelationInfo *info,
 						   const FbWalRecordIndex *index,
 						   TupleDesc tupdesc,
 						   FbReplayResult *result,
-						   FbForwardOpStream *stream)
+						   FbReverseOpSource *source)
 {
 	FbReplayStore store;
 	FbToastStore *toast_store = NULL;
@@ -2474,13 +2327,6 @@ fb_replay_execute_internal(const FbRelationInfo *info,
 	HTAB *backtrack_blocks;
 	uint32 iteration;
 	uint64 warm_tracked_bytes;
-
-	if (stream != NULL)
-	{
-		MemSet(stream, 0, sizeof(*stream));
-		stream->tracked_bytes = index->tracked_bytes;
-		stream->memory_limit_bytes = index->memory_limit_bytes;
-	}
 
 	if (info->has_toast_locator && OidIsValid(info->toast_relid))
 	{
@@ -2522,7 +2368,7 @@ fb_replay_execute_internal(const FbRelationInfo *info,
 		fb_replay_progress_enter(&discover_control);
 		fb_replay_run_pass(info, index, NULL, toast_tupdesc, discover_toast_store,
 						   &discover_store, &discover_control, &discover_result,
-						   NULL, index->anchor_redo_lsn, InvalidXLogRecPtr);
+						   NULL, NULL, index->anchor_redo_lsn, InvalidXLogRecPtr);
 		{
 			char *detail = psprintf("round=%u", iteration + 1);
 
@@ -2570,22 +2416,19 @@ fb_replay_execute_internal(const FbRelationInfo *info,
 
 	{
 		FbReplayControl final_control;
+		FbPendingReverseOpQueue pending_ops;
 
 		MemSet(&final_control, 0, sizeof(final_control));
+		MemSet(&pending_ops, 0, sizeof(pending_ops));
 		final_control.phase = FB_REPLAY_PHASE_FINAL;
 		fb_replay_progress_enter(&final_control);
 		fb_replay_run_pass(info, index, tupdesc, toast_tupdesc, toast_store,
-						   &store, &final_control, result, stream,
+						   &store, &final_control, result, source, &pending_ops,
 						   index->anchor_redo_lsn, InvalidXLogRecPtr);
+		fb_pending_reverse_op_flush(&pending_ops, info, tupdesc, toast_store,
+									result, source);
 		fb_progress_update_percent(FB_PROGRESS_STAGE_REPLAY_FINAL, 100, NULL);
 	}
-
-		if (stream != NULL && tupdesc != NULL)
-		{
-			fb_forward_stream_finalize(info, tupdesc, toast_store, result, stream);
-			stream->tracked_bytes = result->tracked_bytes;
-			stream->memory_limit_bytes = result->memory_limit_bytes;
-		}
 
 		if (toast_store != NULL)
 			fb_toast_store_destroy(toast_store);
@@ -2605,16 +2448,16 @@ fb_replay_execute(const FbRelationInfo *info,
 }
 
 /*
- * fb_replay_build_forward_ops
+ * fb_replay_build_reverse_source
  *    Replay entry point.
  */
 
 void
-fb_replay_build_forward_ops(const FbRelationInfo *info,
-							const FbWalRecordIndex *index,
-							TupleDesc tupdesc,
-							FbReplayResult *result,
-							FbForwardOpStream *stream)
+fb_replay_build_reverse_source(const FbRelationInfo *info,
+							   const FbWalRecordIndex *index,
+							   TupleDesc tupdesc,
+							   FbReplayResult *result,
+							   FbReverseOpSource *source)
 {
-	fb_replay_execute_internal(info, index, tupdesc, result, stream);
+	fb_replay_execute_internal(info, index, tupdesc, result, source);
 }

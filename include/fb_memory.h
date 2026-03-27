@@ -38,6 +38,26 @@ fb_memory_charge_bytes(uint64 *tracked_bytes,
 }
 
 /*
+ * fb_memory_release_bytes
+ *    Memory accounting inline helper.
+ */
+
+static inline void
+fb_memory_release_bytes(uint64 *tracked_bytes, Size bytes)
+{
+	if (tracked_bytes == NULL || bytes == 0)
+		return;
+
+	if (*tracked_bytes <= (uint64) bytes)
+	{
+		*tracked_bytes = 0;
+		return;
+	}
+
+	*tracked_bytes -= (uint64) bytes;
+}
+
+/*
  * fb_memory_cstring_bytes
  *    Memory accounting inline helper.
  */

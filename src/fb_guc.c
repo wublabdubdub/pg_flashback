@@ -20,7 +20,7 @@
 static char *fb_archive_dir = NULL;
 static char *fb_archive_dest = NULL;
 static char *fb_debug_pg_wal_dir = NULL;
-static int fb_memory_limit_kb = 65536;
+static double fb_memory_limit_kb = 65536.0;
 static bool fb_parallel_segment_scan = false;
 static bool fb_show_progress = true;
 
@@ -72,18 +72,18 @@ _PG_init(void)
 							   NULL,
 							   NULL);
 
-	DefineCustomIntVariable("pg_flashback.memory_limit_kb",
-							"Per-query memory cap for tracked pg_flashback hot-path structures.",
-							"Limits tracked RecordRef/FPI/block-data/main-data and BlockReplayStore bytes.",
-							&fb_memory_limit_kb,
-							65536,
-							1,
-							INT_MAX / 1024,
-							PGC_USERSET,
-							0,
-							NULL,
-							NULL,
-							NULL);
+	DefineCustomRealVariable("pg_flashback.memory_limit_kb",
+							 "Per-query memory cap for tracked pg_flashback hot-path structures.",
+							 "Limits tracked RecordRef/FPI/block-data/main-data and BlockReplayStore bytes.",
+							 &fb_memory_limit_kb,
+							 65536.0,
+							 1.0,
+							 4194304.0,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
 
 	DefineCustomBoolVariable("pg_flashback.parallel_segment_scan",
 							 "Enable segment-level parallel prefiltering before ordered WAL parsing.",

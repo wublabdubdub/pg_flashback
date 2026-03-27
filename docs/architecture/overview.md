@@ -7,12 +7,13 @@
 - `fb_guc`：运行时 GUC 定义与来源配置选择
 - `fb_progress`：`pg_flashback()` 的客户端进度上下文与 `NOTICE` 输出
 - `fb_memory`：query 级内存跟踪与统一 charge 辅助函数
+- `fb_spool`：query 级 runtime 目录、spill 文件与顺序回读封装
 - `fb_compat`：`PG10-18` 兼容层，负责 relation locator / xlogreader / catalog 差异屏蔽
 - `fb_catalog`：relation 校验、模式选择、TOAST 定位
-- `fb_wal`：WAL 时间窗扫描、事务提交信息提取、来源解析、unsafe 判定，以及 segment 级并行预筛选 / 命中窗口跳段 / prefilter cache
+- `fb_wal`：WAL 时间窗扫描、事务提交信息提取、来源解析、unsafe 判定，以及 segment 级并行预筛选 / 命中窗口跳段 / prefilter cache / tail inline / sidecar
 - `fb_ckwal`：内嵌缺失 WAL 恢复逻辑与 recovered_wal 目录输出
 - `fb_replay`：页级重放、行像提取与 `ForwardOp` 生成
-- `fb_reverse_ops`：生成 `ReverseOp`
+- `fb_reverse_ops`：生成 `ReverseOp` 并输出为 `ReverseOpSource`
 - `fb_apply_keyed`：有键表的变化 key 驱动流式反向应用
 - `fb_apply_bag`：无键表的 delta-bag 驱动流式反向应用
 - `fb_export`：undo SQL / reverse op 导出
@@ -25,11 +26,15 @@
 - `RecordRef`
 - `BlockReplayStore`
 - `ForwardOp / ReverseOp`
+- `fb_spool`
+- `ReverseOpSource`
 - `keyed / bag`
 - `pg_flashback()`
+- materialized SRF 内部分支
 - `archive_dest + pg_wal + recovered_wal` 来源解析
 - 内嵌 `fb_ckwal`
 - `parallel_segment_scan`
+- WAL tail inline / segment sidecar 调试口径
 - baseline 快照恢复式 deep full runner
 - `PG10-18` 兼容层
 - 客户化 README

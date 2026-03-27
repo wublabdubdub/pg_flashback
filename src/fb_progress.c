@@ -50,6 +50,8 @@ static const FbProgressStageDef fb_progress_defs[] = {
 
 static FbProgressContext fb_progress_ctx = {0};
 
+#define FB_PROGRESS_PERCENT_BUCKET 50U
+
 /*
  * fb_progress_get_def
  *    Progress helper.
@@ -116,7 +118,7 @@ fb_progress_bucket_percent(uint32 percent)
 	if (percent >= 100)
 		return 100;
 
-	return (percent / 20) * 20;
+	return (percent / FB_PROGRESS_PERCENT_BUCKET) * FB_PROGRESS_PERCENT_BUCKET;
 }
 
 /*

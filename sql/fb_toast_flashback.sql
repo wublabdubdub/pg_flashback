@@ -50,3 +50,36 @@ FROM pg_flashback(
 	(SELECT target_ts::text FROM fb_toast_flashback_mark)
 )
 ORDER BY 1;
+
+CREATE TABLE fb_toast_preanchor_delete_target (
+	id integer PRIMARY KEY,
+	payload text
+);
+
+ALTER TABLE fb_toast_preanchor_delete_target
+	ALTER COLUMN payload SET STORAGE EXTERNAL;
+
+CHECKPOINT;
+
+INSERT INTO fb_toast_preanchor_delete_target
+VALUES (1, repeat('D', 12000));
+
+CHECKPOINT;
+
+CREATE TABLE fb_toast_preanchor_delete_mark (
+	target_ts timestamptz NOT NULL
+);
+
+INSERT INTO fb_toast_preanchor_delete_mark VALUES (clock_timestamp());
+
+DELETE FROM fb_toast_preanchor_delete_target
+WHERE id = 1;
+
+SELECT id,
+	   left(payload, 4) AS prefix,
+	   length(payload) AS payload_len
+FROM pg_flashback(
+	NULL::public.fb_toast_preanchor_delete_target,
+	(SELECT target_ts::text FROM fb_toast_preanchor_delete_mark)
+)
+ORDER BY 1;
