@@ -16,7 +16,6 @@
 typedef struct ExprContext ExprContext;
 typedef struct FbApplyContext FbApplyContext;
 typedef struct TupleTableSlot TupleTableSlot;
-typedef struct Tuplestorestate Tuplestorestate;
 
 typedef enum FbApplyEmitKind
 {
@@ -73,7 +72,6 @@ FbApplyContext *fb_apply_begin(const FbRelationInfo *info,
  */
 
 bool fb_apply_next(FbApplyContext *ctx, Datum *result);
-void fb_apply_materialize(FbApplyContext *ctx, Tuplestorestate *tupstore);
 /*
  * fb_apply_end
  *    Apply API.

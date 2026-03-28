@@ -16,7 +16,8 @@
   - 不创建结果表
   - 不返回结果表名
   - 默认仍是直接查询型 SRF
-  - 允许在执行器允许时内部切到 materialized SRF / `tuplestore`
+  - 扩展内部统一只走 `ValuePerCall`
+  - `FROM pg_flashback(...)` 已改由扩展自带 `CustomScan` 接管，不再走 PostgreSQL 默认 `FunctionScan -> tuplestore`
 - 当前旧入口与旧中间层已删除：
   - `pg_flashback(text, text, text)`
   - `fb_parallel`
@@ -33,20 +34,88 @@
   - `sql/fb_spill.sql`
   - `sql/fb_wal_sidecar.sql`
   - `fb_wal` recent tail inline / sidecar 诊断口径
-  - `pg_flashback()` 内部 materialized SRF 发射路径
+  - `pg_flashback()` 仅保留 streaming SRF 发射路径
 - 当前运行时与来源解析已落地：
   - `archive_dest`
   - `archive_dir` 兼容回退
   - `debug_pg_wal_dir`
-  - `memory_limit_kb`
+  - `memory_limit`
+  - `spill_mode`
   - `parallel_segment_scan`
   - `show_progress`
+  - 未显式设置 `archive_dest` 时，可按 PostgreSQL 内核 `archive_command` 自动推断本地归档目录
   - 自动初始化 `DataDir/pg_flashback/{runtime,recovered_wal,meta}`
 - 当前 `pg_flashback()` 进度显示固定为 9 段：
   - stage `9` 已改为 residual 历史行发射
 
 ## 本轮完成
 
+- 已完成 `FROM pg_flashback(...)` 的 temp-file 根修：
+  - 新增 `fb_custom_scan` 模块，通过 planner hook + `CustomScan` 接管 `RTE_FUNCTION`
+  - 新增 `fb_pg_flashback_support(internal)` 作为 `pg_flashback` 的 planner support function，确保新会话在规划阶段就加载模块并注册 hook
+  - `CustomScan` executor 直接复用 `fb_flashback_query_begin/next/finish` 主链，不再经过 PostgreSQL 默认 `FunctionScan -> ExecMakeTableFunctionResult() -> tuplestore`
+  - live 复测 `scenario_oa_12t_50000r.documents` 时，`stage 8` 期间 `base/pgsql_tmp` 持续保持目录本身 `6 bytes`，不再出现多 GB 临时文件膨胀
+  - 新增回归 `fb_custom_scan`，覆盖：
+    - `EXPLAIN` 计划节点为 `Custom Scan (FbFlashbackScan)`
+    - 低 `work_mem` 下 `count(*) FROM pg_flashback(...)` 的 `pg_stat_database.temp_bytes` 增量为 `0`
+- 已修复 `CustomScan` 落地过程中的两个配套问题：
+  - `custom_scan_tlist` 现按目标表完整列布局构造，避免聚合场景列映射错位（如 `sum(amount)` 误读成 `sum(id)`）
+  - `_PG_init()` 中 `MarkGUCPrefixReserved("pg_flashback")` 现后移到 `DefineCustom*` 之后，保留用户在模块加载前设置的 `pg_flashback.memory_limit` / `spill_mode` 占位值
+
+- 已移除 `pg_flashback()` 内部 materialized SRF 分支：
+  - `pg_flashback()` 不再因执行器允许 `SFRM_Materialize` 而优先走 `tuplestore`
+  - 内部结果发射统一收口为 `ValuePerCall`
+  - 新增回归 `fb_value_per_call`，覆盖入口模式与低 `work_mem` 下不再由函数自身制造 temp spill
+- `pg_flashback.memory_limit` 已完成收敛：
+  - 用户侧参数名从 `pg_flashback.memory_limit_kb` 改为 `pg_flashback.memory_limit`
+  - 最大允许值从 `4TB` 收紧到 `32GB`
+  - 已补回归覆盖 `8GB`、`32GB` 与超限 `33GB`
+- `pg_flashback.spill_mode` 与 preflight 选择已落地：
+  - 新增 `auto|memory|disk` 三态策略 GUC
+  - 保持 `pg_flashback.memory_limit` 作为唯一内存预算参数
+  - 在 `WAL scan` 后、`replay` 前增加 working-set estimate
+  - `auto/memory` 在 estimate 超预算时提前报错，`disk` 允许继续
+- `pg_flashback.memory_limit='8GB'` 被误拒绝的问题已修复：
+  - `memory_limit` 的单位解析与内部存储已统一改为 `uint64 kB`
+  - 实际允许范围与文案一致为 `1kB .. 32GB`
+- `pg_flashback.memory_limit` 已支持单位输入：
+  - 参数支持用户直接写 `kb/mb/gb`
+  - 内部改为大小写不敏感解析并规范化回显
+  - 保留旧的裸数字 `kB` 语义兼容
+- 内存超限报错已增强可读性：
+  - 统一内存超限报错入口追加 `pg_flashback.memory_limit` 调参提示
+  - `tracked/limit/requested` 保留原始 bytes
+  - 对能被 `1024` 整除的值追加 `KB/MB/GB/...` 可读单位
+- `show_progress` 已增强为耗时可见输出：
+  - 开启时每条 `NOTICE` 追加“相对上一条输出的增量耗时”
+  - 查询结束时额外输出总耗时
+  - 关闭时继续保持完全不输出进度与耗时
+  - 新增回归专用确定性时钟注入钩子，用于稳定覆盖耗时格式与最终总耗时 NOTICE
+- 细化 `docs/architecture/` 全部架构文档，并按当前代码现状重写三份中文手册：
+  - `核心入口源码导读.md`
+  - `源码级维护手册.md`
+  - `调试与验证手册.md`
+  - 同步补齐 `error-model` / `reverse-op-stream` / `row-identity` / `wal-decode` / `wal-source-resolution` / `overview` 的代码级说明
+- WAL 来源解析新增 PostgreSQL 内核归档配置自动发现：
+  - `pg_flashback.archive_dest` 仍保持最高优先级显式覆盖
+  - `pg_flashback.archive_dir` 继续作为兼容回退
+  - 两者都未设置时，可从 PostgreSQL `archive_command` 自动推断本地归档目录
+  - 本地 `pg_probackup archive-push -B ... --instance ...` 可自动映射到 `backup_dir/wal/instance_name`
+  - `archive_library` 非空或复杂/远程 `archive_command` 不自动猜测，继续要求显式设置 `pg_flashback.archive_dest`
+- 修复已加载扩展后的 `pg_flashback.*` GUC typo 被静默接受：
+  - `_PG_init()` 现在保留 `pg_flashback` 前缀
+  - 扩展已加载后，未定义的 `pg_flashback.show_process` 会直接报错
+  - 新增/更新回归 `fb_guc_defaults` 覆盖该行为
+- 修复 `PG18` `same-block HOT_UPDATE + FPW-only` 被误报 `heap update record missing new tuple data`：
+  - `fb_replay_heap_update()` 现在尊重 `apply_image`
+  - 对“new page 镜像已经是最终页态”的 update/hot update 不再错误要求 tuple payload
+- 修复页级重放错误跳过 aborted heap record 导致的页槽位漂移：
+  - `fb_replay` 主循环不再跳过 `record.aborted`
+  - 避免回滚事务留下的物理 tuple/slot 丢失，进而触发后续 `invalid new offnum during heap update redo`
+- 新增回归 `fb_flashback_hot_update_fpw`，覆盖：
+  - `VACUUM FREEZE + CHECKPOINT + same-block HOT_UPDATE + FPW-only`
+  - 修复前稳定报 `heap update record missing new tuple data`
+  - 修复后稳定返回历史旧行像
 - 新增仓库维护脚本 `scripts/cron_daily_update.sh`：
   - 仅在仓库存在变更时执行 `git add -A`
   - 固定提交信息 `update`
@@ -95,11 +164,70 @@
   - 建表事务 `xid = 204237`，提交时间 `2026-03-27 22:40:37.885578+08`
   - 阻塞 flashback 的真实原因不是建表，而是 TOAST relation 在事务 `xid = 294470` 中发生 `SMGR TRUNCATE`
   - 该 TOAST truncate 提交时间为 `2026-03-27 22:51:42.387556+08`
-- 已新增回归 `fb_flashback_toast_storage_boundary`，覆盖“target 后 TOAST relation 发生 truncate / storage_change 必须直接报错”的用户案例边界
+- 已将 `TOAST SMGR TRUNCATE` 从 relation 级直接拒绝改为“允许 replay，最终缺 chunk 时再报错”
+- 已修复 standalone `standby_lock` 被误判为 `storage_change` blocker：
+  - 该记录只表示 Hot Standby 的 `AccessExclusiveLock`
+  - 若没有后续更具体的 `truncate/create/rewrite`，当前不再单独阻塞 flashback
+- 已新增回归 `fb_flashback_standby_lock`，覆盖“standalone standby lock 不应阻塞 flashback”
+- 已将回归 `fb_flashback_toast_storage_boundary` 改写为 truth 对比口径，覆盖“TOAST truncate 后仍可正确 flashback”的用户案例边界
 - 已增强 `storage_change` 诊断信息，当前会直接暴露 relation scope / storage op / xid / commit time
+- 已确认用户现场案例 `scenario_oa_12t_50000r.notices` 的默认内存瓶颈不只在 replay：
+  - `memory_limit=65536/131072` 时卡在 `BlockReplayStore`
+  - `memory_limit=262144/524288` 时 replay 能通过，但会卡在 `forward row tuple`
+  - 当前稳定通过阈值落在 `786432KB` 以上
+- 已决定将 `pg_flashback.memory_limit` 默认值提升到 `1048576KB`（1GB）：
+  - 原因是 bounded spill 尚未接入 WAL 索引 / replay 主链
+  - 在当前实现阶段，用 64MB 作为默认值会让已验证可恢复的 live case 直接失败
+- 已定位新的 live blocker：`scenario_oa_12t_50000r.notices` 在 `target_ts = '2026-03-28 11:06:13'/'2026-03-28 11:07:13'`
+  会在 discover round=1 命中 `lsn=69/8E372BF0` 的 `heap insert off=4 blk=892`
+- 当前根因判断为：
+  - 该 insert 之前存在一条跨页 `UPDATE(old blk 2761 -> new blk 892, new_off=3)`
+  - discover 第一轮因旧页缺锚点跳过该 update
+  - 但新页 `blk 892` 没有被标记为“依赖缺页、当前轮状态不可信”
+  - 导致后续 `INSERT off=4` 仍在落后页态上执行，最终报 `specified item offset is too large`
+- 已继续定位并修复同一 live case 的第二层 blocker：
+  - `blk 12119` 曾报 `missing FPI`
+  - 实际并非无锚点，而是 `69/8D0D5538` 的 `PRUNE_VACUUM_SCAN FPW` 落在 `redo_lsn..checkpoint_lsn` 区间
+  - sidecar 恢复 anchor 后，起扫点被错误裁到 `checkpoint_lsn`，导致这段必要 WAL 被漏扫
+- 已完成两处修复：
+  - replay discover 新增“缺页依赖传播”：跨页记录任一 block 缺锚点时，将同记录所有 block 标记为当前轮不可信；后续同块记录延后到 warm/backtrack 后再重放
+  - checkpoint sidecar 恢复 anchor 时，`start_lsn` 与 `anchor_hint_segment_index` 统一对齐 `redo_lsn`，不再对齐 checkpoint record 自身
+- 已补齐仓库当前 `REGRESS` 缺失的 13 份 `expected/*.out` 基线，恢复全量 installcheck 可执行状态
 
 ## 当前验证结果
 
+- `make PG_CONFIG=/home/18pg/local/bin/pg_config clean`：通过
+- `make PG_CONFIG=/home/18pg/local/bin/pg_config install`：通过
+- `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_custom_scan fb_value_per_call fb_guc_defaults pg_flashback fb_user_surface fb_progress fb_preflight fb_memory_limit fb_spill fb_toast_flashback'`：`All 10 tests passed.`
+- `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_value_per_call pg_flashback fb_user_surface fb_progress'`：`All 4 tests passed.`
+- `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_flashback_keyed fb_flashback_bag fb_toast_flashback fb_memory_limit fb_spill fb_preflight'`：`All 6 tests passed.`
+- `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_guc_defaults fb_memory_limit fb_spill'`：`All 3 tests passed.`
+- `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_guc_defaults fb_preflight fb_memory_limit fb_spill'`：`All 4 tests passed.`
+- `PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_guc_defaults fb_memory_limit'`：`All 2 tests passed.`
+- `PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_memory_limit'`：`All 1 tests passed.`
+- `PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_progress'`：`All 1 tests passed.`
+- `PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_progress fb_user_surface'`：`All 2 tests passed.`
+- `PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_wal_source_policy fb_guc_defaults fb_progress pg_flashback'`：`All 4 tests passed.`
+- `PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_flashback_hot_update_fpw'`：`All 1 tests passed.`
+- 用户现场案例 `scenario_oa_12t_50000r.notices`：
+  - 默认 `memory_limit=65536`：`BlockReplayStore` 超限
+  - `memory_limit=131072`：`BlockReplayStore` 超限
+  - `memory_limit=262144`：`forward row tuple` 超限
+  - `memory_limit=524288`：`forward row tuple` 超限
+  - `memory_limit=786432`：`count(*) = 39902`
+  - `SET pg_flashback.memory_limit = '1048576'` 后：
+    - `target_ts = '2026-03-28 07:42:13'`，`count(*) = 39902`
+    - `target_ts = '2026-03-28 09:42:13'`，`count(*) = 39902`
+  - 本轮继续验证：
+    - `target_ts = '2026-03-28 11:06:13'`，`count(*) = 10091`
+    - `target_ts = '2026-03-28 11:07:13'`，`count(*) = 5242`
+- 新增 root cause 调试结论（`scenario_oa_12t_50000r.documents`）：
+  - 在扩展未于规划前加载时，`EXPLAIN (VERBOSE)` 会退回 `Aggregate -> Function Scan on public.pg_flashback`
+  - 当前已通过 `pg_flashback` 的 planner support function 解决该问题；新会话复测已稳定变为 `Aggregate -> Custom Scan (FbFlashbackScan)`
+  - `stage 8/9` 期间 backend 会生成 `base/pgsql_tmp/pgsql_tmp<backend>.*`
+  - `log_temp_files=0` 与 `lsof` 现场都证明 temp 文件会涨到多 GB
+  - 查询结束或 backend 退出后，`base/pgsql_tmp` 立即回到 `0`
+  - 根因已锁定为 PostgreSQL `FunctionScan` 对 table SRF 的默认 tuplestore materialize
 - `scripts/cron_daily_update.sh` 幂等校验：通过
 - 当前用户 `crontab` 安装校验：通过
 - `PG12-18` 本机编译矩阵：通过
@@ -107,12 +235,22 @@
 - `su - 18pg -c 'PGPORT=5832 ... make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck'`：`All 12 tests passed.`
 - `2026-03-27` 当前恢复工作区 `make PG_CONFIG=/home/18pg/local/bin/pg_config -j4`：通过
 - `PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_flashback_toast_storage_boundary'`：`All 1 tests passed.`
+- `PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_flashback_toast_storage_boundary'`（新 truth 口径）：`All 1 tests passed.`
+- `PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_flashback_standby_lock fb_flashback_toast_storage_boundary'`：`All 2 tests passed.`
+- `PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_guc_defaults fb_flashback_hot_update_fpw fb_flashback_main_truncate fb_flashback_standby_lock fb_flashback_toast_storage_boundary'`：`All 5 tests passed.`
+- `PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_recordref'`：`All 1 tests passed.`
+- `PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck`：`All 20 tests passed.`
+- 用户现场案例 `scenario_oa_12t_50000r.notices`：
+  - `target_ts = '2026-03-28 09:42:13'` 不再被 `standby_lock` 拦截
+  - 当前新的 first blocker 是主表 `SMGR TRUNCATE`
+  - 命中事务 `xid = 501101`，提交时间 `2026-03-28 11:29:08.778971+08`
 - `/tmp/pgfb_exact_probe` 顺序回放成功后 `make PG_CONFIG=/home/18pg/local/bin/pg_config -j4`：通过
 - 当前回归覆盖：
   - `fb_smoke`
   - `fb_relation_gate`
   - `fb_relation_unsupported`
   - `fb_runtime_gate`
+  - `fb_value_per_call`
   - `fb_flashback_keyed`
   - `fb_flashback_bag`
   - `fb_flashback_storage_boundary`
@@ -125,6 +263,8 @@
 
 ## 仍在进行
 
+- [x] `pg_flashback.memory_limit` 用户侧 rename 与 `32GB` 上限收敛
+- [x] `pg_flashback.spill_mode` 与 preflight 内存/磁盘选择
 - `PG10/11` 环境级正式复验
 - batch B / residual `missing FPI` 收敛
 - `fb_export_undo`
@@ -139,7 +279,9 @@
 
 - 观察首次 `2026-03-28 01:00 CST` 自动提交结果，确认日志与推送行为符合预期
 - 在具备环境后补齐 `PG10/11` 的正式编译/回归复验
+- 继续补更多 `archive_command` 本地模式的自动识别与诊断输出
 - 继续处理 deep pilot batch B blocker
+- 评估大 live case 在默认 `memory_limit=65536` 下的 bounded spill / 内存收敛路径
 - 为 `fb_export_undo` 开始独立实现
 - 继续压缩 WAL 索引 / replay 路径的高水位内存
 - 补齐主键变化与更多 TOAST / 宽表场景验证

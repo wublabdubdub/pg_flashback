@@ -10,10 +10,16 @@ AS 'MODULE_PATHNAME', 'fb_check_relation'
 LANGUAGE C
 STRICT;
 
+CREATE FUNCTION fb_pg_flashback_support(internal)
+RETURNS internal
+AS 'MODULE_PATHNAME', 'fb_pg_flashback_support'
+LANGUAGE C;
+
 CREATE FUNCTION pg_flashback(anyelement, text)
 RETURNS SETOF anyelement
 AS 'MODULE_PATHNAME', 'pg_flashback'
-LANGUAGE C;
+LANGUAGE C
+SUPPORT fb_pg_flashback_support;
 
 COMMENT ON FUNCTION fb_version() IS
 'Return current pg_flashback development version.';

@@ -28,9 +28,14 @@ CREATE TABLE fb_flashback_toast_storage_boundary_size (
 	bytes bigint NOT NULL
 );
 
-CREATE TABLE fb_flashback_toast_storage_boundary_diag (
-	errmsg_text text NOT NULL,
-	detail_text text
+CREATE TABLE fb_flashback_toast_storage_boundary_truth (
+	id integer PRIMARY KEY,
+	payload text NOT NULL
+);
+
+CREATE TABLE fb_flashback_toast_storage_boundary_result (
+	id integer PRIMARY KEY,
+	payload text NOT NULL
 );
 
 INSERT INTO fb_flashback_toast_storage_boundary_target
@@ -41,6 +46,10 @@ FROM generate_series(1, 2000) AS g;
 
 INSERT INTO fb_flashback_toast_storage_boundary_mark
 VALUES (clock_timestamp());
+
+INSERT INTO fb_flashback_toast_storage_boundary_truth
+SELECT *
+FROM fb_flashback_toast_storage_boundary_target;
 
 INSERT INTO fb_flashback_toast_storage_boundary_size
 SELECT 'before_vacuum',
@@ -67,33 +76,23 @@ SELECT (SELECT bytes
 		FROM fb_flashback_toast_storage_boundary_size
 		WHERE label = 'after_vacuum') AS toast_shrank;
 
-DO $$
-DECLARE
-	errmsg_text text;
-	detail_text text;
-BEGIN
-	BEGIN
-		PERFORM count(*)
-		FROM pg_flashback(
-			NULL::public.fb_flashback_toast_storage_boundary_target,
-			(SELECT target_ts::text
-			 FROM fb_flashback_toast_storage_boundary_mark)
-		);
-		RAISE EXCEPTION 'expected toast boundary flashback to fail';
-	EXCEPTION
-		WHEN feature_not_supported THEN
-			GET STACKED DIAGNOSTICS
-				errmsg_text = MESSAGE_TEXT,
-				detail_text = PG_EXCEPTION_DETAIL;
-			INSERT INTO fb_flashback_toast_storage_boundary_diag
-			VALUES (errmsg_text, detail_text);
-	END;
-END;
-$$;
+INSERT INTO fb_flashback_toast_storage_boundary_result
+SELECT *
+FROM pg_flashback(
+	NULL::public.fb_flashback_toast_storage_boundary_target,
+	(SELECT target_ts::text
+	 FROM fb_flashback_toast_storage_boundary_mark)
+);
 
-SELECT errmsg_text = 'fb does not support WAL windows containing storage_change operations' AS message_ok,
-	   detail_text LIKE '%scope=toast%' AS scope_ok,
-	   detail_text LIKE '%operation=smgr_truncate%' AS operation_ok,
-	   detail_text ~ 'xid=[0-9]+' AS xid_ok,
-	   detail_text ~ 'commit_ts=[0-9]{4}-[0-9]{2}-[0-9]{2} ' AS commit_ts_ok
-FROM fb_flashback_toast_storage_boundary_diag;
+SELECT (SELECT count(*) FROM fb_flashback_toast_storage_boundary_truth) AS truth_count,
+	   (SELECT count(*) FROM fb_flashback_toast_storage_boundary_result) AS result_count,
+	   (SELECT count(*)
+		FROM (
+			(SELECT * FROM fb_flashback_toast_storage_boundary_truth
+			 EXCEPT ALL
+			 SELECT * FROM fb_flashback_toast_storage_boundary_result)
+			UNION ALL
+			(SELECT * FROM fb_flashback_toast_storage_boundary_result
+			 EXCEPT ALL
+			 SELECT * FROM fb_flashback_toast_storage_boundary_truth)
+		) AS diff_rows) AS diff_count;

@@ -7,6 +7,7 @@ END;
 $$;
 CREATE EXTENSION pg_flashback;
 SET pg_flashback.show_progress = off;
+SET pg_flashback.spill_mode = 'disk';
 
 DO $$
 BEGIN
@@ -14,7 +15,7 @@ BEGIN
 END;
 $$;
 
-SET pg_flashback.memory_limit_kb = 512;
+SET pg_flashback.memory_limit = 512;
 
 CREATE TABLE fb_spill_target (
 	id integer PRIMARY KEY,
@@ -57,3 +58,5 @@ SELECT count(*) AS result_count,
 	   max(id) AS max_id,
 	   max(payload) = 'baseline' AS restored_baseline
 FROM flashback;
+
+RESET client_min_messages;

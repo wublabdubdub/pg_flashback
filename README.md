@@ -80,7 +80,8 @@ CREATE EXTENSION pg_flashback;
 
 ### 3. 为实例准备 WAL 来源
 
-至少需要提供一个可读取的归档目录：
+至少需要让扩展能定位一个可读取的归档目录。
+生产环境仍建议显式设置：
 
 ```sql
 SET pg_flashback.archive_dest = '/path/to/archive';
@@ -90,6 +91,9 @@ SET pg_flashback.archive_dest = '/path/to/archive';
 
 - 首选 `pg_flashback.archive_dest`
 - `pg_flashback.archive_dir` 仅作为兼容回退配置保留
+- 两者都未设置时，扩展会尝试从 PostgreSQL 当前生效的 `archive_command` 自动推断本地 archive 目录
+- 本地 `pg_probackup archive-push -B ... --instance ...` 也支持自动识别
+- `archive_library` 非空，或 `archive_command` 过于复杂/远程时，扩展不会猜，仍需要显式设置 `pg_flashback.archive_dest`
 - `pg_wal` 只补 archive 尚未覆盖的 recent tail
 - 若 `pg_wal` 文件名与内容错配，扩展会尝试恢复到内部 `recovered_wal/`
 
@@ -141,15 +145,28 @@ SET pg_flashback.show_progress = off;
 
 ### `pg_flashback.archive_dest`
 
-主归档目录配置。生产环境建议显式设置。
+主归档目录配置。优先级最高，生产环境建议显式设置。
 
 ### `pg_flashback.archive_dir`
 
 旧配置的兼容回退项。新部署优先使用 `archive_dest`。
 
-### `pg_flashback.memory_limit_kb`
+### `pg_flashback.memory_limit`
 
-单次查询的热路径内存上限。达到上限时直接报错，不做静默降级。
+单次查询的热路径内存上限，当前默认值为 `1GB`。支持直接写 PostgreSQL 内存单位，例如 `64MB`、`1GB`、`8GB`、`32GB`、`2097152kB`。当前允许范围为 `1kB` 到 `32GB`。达到上限时直接报错，不做静默降级。
+
+### `pg_flashback.spill_mode`
+
+控制当预估工作集超过 `pg_flashback.memory_limit` 时是否允许继续走磁盘 spill。
+
+- `auto`
+  - 默认值
+  - 预估超预算时直接报错，让用户显式决定
+- `memory`
+  - 强制内存模式
+  - 预估超预算时直接报错
+- `disk`
+  - 允许继续走当前的 spool / spill 路径
 
 ### `pg_flashback.parallel_segment_scan`
 
@@ -158,6 +175,9 @@ SET pg_flashback.show_progress = off;
 ### `pg_flashback.show_progress`
 
 是否输出 `NOTICE` 进度。默认 `on`。
+
+模块已加载后，如果把 `pg_flashback.*` 配置名写错，例如
+`pg_flashback.show_process`，当前会直接报错，不再静默接受 typo。
 
 ## 结果语义
 
@@ -193,7 +213,8 @@ SET pg_flashback.show_progress = off;
 - 时间窗内检测到 DDL / rewrite / truncate / relfilenode 变化
 - TOAST 历史值无法重建
 - relation 类型不支持
-- 超出 `pg_flashback.memory_limit_kb`
+- 超出 `pg_flashback.memory_limit`
+- `spill_mode=auto/memory` 且 preflight 预估超出 `memory_limit`
 
 ## 常见排障
 
@@ -202,6 +223,7 @@ SET pg_flashback.show_progress = off;
 说明目标时间窗内缺少必须的 WAL。优先检查：
 
 - `pg_flashback.archive_dest` 是否配置正确
+- 若未显式设置，`archive_command` 是否属于可安全识别的本地归档命令
 - 归档目录是否真的覆盖了目标时间窗
 - 目标实例的 `pg_wal` recent tail 是否仍然存在
 
@@ -224,6 +246,9 @@ SET pg_flashback.show_progress = on;
 ```sql
 SET pg_flashback.show_progress = off;
 ```
+
+如果写成 `pg_flashback.show_process`，在 `pg_flashback` 模块已加载后会直接报错；
+正确参数名是 `pg_flashback.show_progress`。
 
 ## 生产使用建议
 

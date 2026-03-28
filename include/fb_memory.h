@@ -9,6 +9,35 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "lib/stringinfo.h"
+
+/*
+ * fb_memory_append_bytes_value
+ *    Memory accounting inline helper.
+ */
+
+static inline void
+fb_memory_append_bytes_value(StringInfo buf, uint64 bytes)
+{
+	static const char *const units[] = {"bytes", "KB", "MB", "GB", "TB", "PB", "EB"};
+	uint64 promoted = bytes;
+	int unit_index = 0;
+
+	appendStringInfo(buf, "%llu bytes", (unsigned long long) bytes);
+
+	while (promoted > 0 &&
+		   unit_index < (lengthof(units) - 1) &&
+		   (promoted % 1024) == 0)
+	{
+		promoted /= 1024;
+		unit_index++;
+	}
+
+	if (unit_index > 0)
+		appendStringInfo(buf, " (%llu %s)",
+						 (unsigned long long) promoted,
+						 units[unit_index]);
+}
 
 /*
  * fb_memory_charge_bytes
@@ -26,13 +55,23 @@ fb_memory_charge_bytes(uint64 *tracked_bytes,
 
 	if (limit_bytes > 0 &&
 		*tracked_bytes + (uint64) bytes > limit_bytes)
+	{
+		StringInfoData detail;
+
+		initStringInfo(&detail);
+		appendStringInfoString(&detail, "tracked=");
+		fb_memory_append_bytes_value(&detail, *tracked_bytes);
+		appendStringInfoString(&detail, " limit=");
+		fb_memory_append_bytes_value(&detail, limit_bytes);
+		appendStringInfoString(&detail, " requested=");
+		fb_memory_append_bytes_value(&detail, bytes);
+
 		ereport(ERROR,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				 errmsg("pg_flashback memory limit exceeded while tracking %s", what),
-				 errdetail("tracked=%llu bytes limit=%llu bytes requested=%zu bytes",
-						   (unsigned long long) *tracked_bytes,
-						   (unsigned long long) limit_bytes,
-						   bytes)));
+				 errdetail_internal("%s", detail.data),
+				 errhint("Consider increasing pg_flashback.memory_limit for this query.")));
+	}
 
 	*tracked_bytes += (uint64) bytes;
 }

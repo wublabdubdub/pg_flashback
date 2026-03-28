@@ -7,6 +7,7 @@ END;
 $$;
 CREATE EXTENSION pg_flashback;
 SET pg_flashback.show_progress = off;
+SET pg_flashback.spill_mode = 'disk';
 
 DO $$
 BEGIN
@@ -14,7 +15,7 @@ BEGIN
 END;
 $$;
 
-SET pg_flashback.memory_limit_kb = 6;
+SET pg_flashback.memory_limit = '6kb';
 
 CREATE TABLE fb_memory_limit_target (
 	id integer PRIMARY KEY,
@@ -41,7 +42,7 @@ FROM pg_flashback(
 	(SELECT target_ts::text FROM fb_memory_limit_mark)
 );
 
-SET pg_flashback.memory_limit_kb = 2048;
+SET pg_flashback.memory_limit = '2mb';
 
 CREATE TABLE fb_memory_limit_apply_target (
 	id integer PRIMARY KEY,
@@ -64,7 +65,7 @@ UPDATE fb_memory_limit_apply_target
 SET payload = payload || 'x'
 WHERE id = 1;
 
-SET pg_flashback.memory_limit_kb = 2048;
+SET pg_flashback.memory_limit = '2mb';
 SET client_min_messages = warning;
 
 WITH flashback AS (
@@ -79,3 +80,5 @@ SELECT count(*) AS result_count,
 	   max(id) AS max_id,
 	   max(payload) FILTER (WHERE id = 1) = repeat(md5('1'), 8) AS restored_seed
 FROM flashback;
+
+RESET client_min_messages;

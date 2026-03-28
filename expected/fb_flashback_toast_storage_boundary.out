@@ -1,0 +1,92 @@
+DO $$
+BEGIN
+	IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_flashback') THEN
+		EXECUTE 'DROP EXTENSION pg_flashback CASCADE';
+	END IF;
+END;
+$$;
+CREATE EXTENSION pg_flashback;
+SET pg_flashback.show_progress = off;
+DO $$
+BEGIN
+	EXECUTE format('SET pg_flashback.archive_dir = %L', current_setting('data_directory') || '/pg_wal');
+END;
+$$;
+CREATE TABLE fb_flashback_toast_storage_boundary_target (
+	id integer PRIMARY KEY,
+	payload text NOT NULL
+);
+CREATE TABLE fb_flashback_toast_storage_boundary_mark (
+	target_ts timestamptz NOT NULL
+);
+CREATE TABLE fb_flashback_toast_storage_boundary_size (
+	label text PRIMARY KEY,
+	bytes bigint NOT NULL
+);
+CREATE TABLE fb_flashback_toast_storage_boundary_truth (
+	id integer PRIMARY KEY,
+	payload text NOT NULL
+);
+CREATE TABLE fb_flashback_toast_storage_boundary_result (
+	id integer PRIMARY KEY,
+	payload text NOT NULL
+);
+INSERT INTO fb_flashback_toast_storage_boundary_target
+SELECT g,
+	   (SELECT string_agg(md5((g * 100000 + s)::text), '')
+		FROM generate_series(1, 128) AS s)
+FROM generate_series(1, 2000) AS g;
+INSERT INTO fb_flashback_toast_storage_boundary_mark
+VALUES (clock_timestamp());
+INSERT INTO fb_flashback_toast_storage_boundary_truth
+SELECT *
+FROM fb_flashback_toast_storage_boundary_target;
+INSERT INTO fb_flashback_toast_storage_boundary_size
+SELECT 'before_vacuum',
+	   pg_relation_size(reltoastrelid)
+FROM pg_class
+WHERE oid = 'fb_flashback_toast_storage_boundary_target'::regclass;
+UPDATE fb_flashback_toast_storage_boundary_target
+SET payload = repeat('small', 8)
+WHERE id > 1000;
+VACUUM fb_flashback_toast_storage_boundary_target;
+INSERT INTO fb_flashback_toast_storage_boundary_size
+SELECT 'after_vacuum',
+	   pg_relation_size(reltoastrelid)
+FROM pg_class
+WHERE oid = 'fb_flashback_toast_storage_boundary_target'::regclass;
+SELECT (SELECT bytes
+		FROM fb_flashback_toast_storage_boundary_size
+		WHERE label = 'before_vacuum') >
+	   (SELECT bytes
+		FROM fb_flashback_toast_storage_boundary_size
+		WHERE label = 'after_vacuum') AS toast_shrank;
+ toast_shrank 
+--------------
+ t
+(1 row)
+
+INSERT INTO fb_flashback_toast_storage_boundary_result
+SELECT *
+FROM pg_flashback(
+	NULL::public.fb_flashback_toast_storage_boundary_target,
+	(SELECT target_ts::text
+	 FROM fb_flashback_toast_storage_boundary_mark)
+);
+SELECT (SELECT count(*) FROM fb_flashback_toast_storage_boundary_truth) AS truth_count,
+	   (SELECT count(*) FROM fb_flashback_toast_storage_boundary_result) AS result_count,
+	   (SELECT count(*)
+		FROM (
+			(SELECT * FROM fb_flashback_toast_storage_boundary_truth
+			 EXCEPT ALL
+			 SELECT * FROM fb_flashback_toast_storage_boundary_result)
+			UNION ALL
+			(SELECT * FROM fb_flashback_toast_storage_boundary_result
+			 EXCEPT ALL
+			 SELECT * FROM fb_flashback_toast_storage_boundary_truth)
+		) AS diff_rows) AS diff_count;
+ truth_count | result_count | diff_count 
+-------------+--------------+------------
+        2000 |         2000 |          0
+(1 row)
+

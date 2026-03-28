@@ -251,7 +251,7 @@ fb_ckwal_restore_segment(TimeLineID timeline_id,
 	if (stat(out_path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0)
 		return true;
 
-	archive_dir = pstrdup(fb_get_effective_archive_dir());
+	archive_dir = fb_get_effective_archive_dir();
 	pg_wal_dir = fb_get_pg_wal_dir();
 	recovered_search_dir = fb_runtime_recovered_wal_dir();
 

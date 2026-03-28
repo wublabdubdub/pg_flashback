@@ -628,6 +628,19 @@ fb_replay_note_missing_block(FbReplayControl *control,
 		entry->first_record_index = control->record_index;
 }
 
+static void
+fb_replay_note_record_missing_blocks(FbReplayControl *control,
+									 const FbRecordRef *record)
+{
+	int	block_index;
+
+	if (control == NULL || record == NULL)
+		return;
+
+	for (block_index = 0; block_index < record->block_count; block_index++)
+		fb_replay_note_missing_block(control, &record->blocks[block_index]);
+}
+
 /*
  * fb_record_allows_init_for_block
  *    Replay helper.
@@ -668,6 +681,25 @@ fb_replay_find_missing_block(HTAB *missing_blocks,
 	key = fb_replay_block_key_from_ref(block_ref);
 	return (FbReplayMissingBlock *) hash_search(missing_blocks, &key,
 												HASH_FIND, NULL);
+}
+
+static bool
+fb_replay_record_touches_missing_block(FbReplayControl *control,
+									   const FbRecordRef *record)
+{
+	int	block_index;
+
+	if (control == NULL || record == NULL || control->missing_blocks == NULL)
+		return false;
+
+	for (block_index = 0; block_index < record->block_count; block_index++)
+	{
+		if (fb_replay_find_missing_block(control->missing_blocks,
+										 &record->blocks[block_index]) != NULL)
+			return true;
+	}
+
+	return false;
 }
 
 /*
@@ -1416,7 +1448,7 @@ fb_replay_heap_update(const FbRelationInfo *info,
 	FbReplayBlockState *old_state;
 	FbReplayBlockState *new_state;
 	FbRecordBlockRef *tuple_data_ref;
-	bool new_page_image_only;
+	bool new_page_image_applied;
 	Page oldpage;
 	Page newpage;
 	HeapTupleHeader oldtup;
@@ -1449,7 +1481,11 @@ fb_replay_heap_update(const FbRelationInfo *info,
 	fb_replay_ensure_block_ready(store, old_block_ref, record, false,
 								 control, result, &old_state, &old_ready);
 	if (!old_ready)
+	{
+		if (control != NULL && control->phase == FB_REPLAY_PHASE_DISCOVER)
+			fb_replay_note_record_missing_blocks(control, record);
 		return;
+	}
 	if (old_block_ref == new_block_ref)
 	{
 		new_state = old_state;
@@ -1459,12 +1495,16 @@ fb_replay_heap_update(const FbRelationInfo *info,
 		fb_replay_ensure_block_ready(store, new_block_ref, record, record->init_page,
 									 control, result, &new_state, &new_ready);
 	if (!new_ready)
+	{
+		if (control != NULL && control->phase == FB_REPLAY_PHASE_DISCOVER)
+			fb_replay_note_record_missing_blocks(control, record);
 		return;
+	}
 
 	oldpage = (Page) old_state->page;
 	newpage = (Page) new_state->page;
-	new_page_image_only = (new_block_ref->has_image &&
-						   old_block_ref != new_block_ref);
+	new_page_image_applied = new_block_ref->has_image &&
+		new_block_ref->apply_image;
 	fb_replay_sync_toast_page_if_image(old_block_ref, oldpage, toast_tupdesc, toast_store);
 	if (new_block_ref != old_block_ref)
 		fb_replay_sync_toast_page_if_image(new_block_ref, newpage, toast_tupdesc, toast_store);
@@ -1508,7 +1548,7 @@ fb_replay_heap_update(const FbRelationInfo *info,
 	if (xlrec->flags & XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED)
 		PageClearAllVisible(oldpage);
 
-	if (!new_page_image_only)
+	if (!new_page_image_applied)
 	{
 		tuple_data_ref = new_block_ref;
 		if ((!tuple_data_ref->has_data || tuple_data_ref->data_len == 0) &&
@@ -1538,7 +1578,19 @@ fb_replay_heap_update(const FbRelationInfo *info,
 		if (PageGetMaxOffsetNumber(newpage) + 1 < offnum)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("invalid new offnum during heap update redo")));
+					 errmsg("invalid new offnum during heap update redo"),
+					 errdetail("lsn=%X/%08X newblk=%u oldblk=%u sameblk=%s off=%u maxoff=%u image=%s apply_image=%s data=%s init_page=%s flags=0x%02X",
+							   LSN_FORMAT_ARGS(record->lsn),
+							   new_block_ref->blkno,
+							   old_block_ref->blkno,
+							   old_block_ref == new_block_ref ? "true" : "false",
+							   offnum,
+							   (unsigned int) PageGetMaxOffsetNumber(newpage),
+							   new_block_ref->has_image ? "true" : "false",
+							   new_block_ref->apply_image ? "true" : "false",
+							   new_block_ref->has_data ? "true" : "false",
+							   record->init_page ? "true" : "false",
+							   xlrec->flags)));
 
 		if (xlrec->flags & XLH_UPDATE_PREFIX_FROM_OLD)
 		{
@@ -1620,7 +1672,7 @@ fb_replay_heap_update(const FbRelationInfo *info,
 	{
 		if (old_toast_tuple != NULL)
 			fb_toast_store_remove_from_tuple(toast_store, toast_tupdesc, old_toast_tuple);
-		if (new_page_image_only)
+		if (new_page_image_applied)
 			fb_toast_store_sync_page(toast_store, toast_tupdesc, newpage, new_block_ref->blkno);
 		else
 		{
@@ -2173,8 +2225,6 @@ fb_replay_run_pass(const FbRelationInfo *info,
 			continue;
 		if (!XLogRecPtrIsInvalid(upper_bound) && record.lsn >= upper_bound)
 			continue;
-		if (record.aborted)
-			continue;
 		if (control != NULL)
 		{
 			control->record_index = record_index;
@@ -2184,6 +2234,13 @@ fb_replay_run_pass(const FbRelationInfo *info,
 				fb_replay_progress_update(control,
 										 (uint64) record_index + 1,
 										 index->record_count);
+		}
+		if (control != NULL &&
+			control->phase == FB_REPLAY_PHASE_DISCOVER &&
+			fb_replay_record_touches_missing_block(control, &record))
+		{
+			fb_replay_note_record_missing_blocks(control, &record);
+			continue;
 		}
 		if (control != NULL &&
 			control->phase == FB_REPLAY_PHASE_WARM &&

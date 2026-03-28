@@ -7,12 +7,15 @@
 
 #include "access/htup_details.h"
 #include "access/relation.h"
+#include "catalog/pg_type_d.h"
 #include "executor/executor.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "nodes/execnodes.h"
+#include "nodes/supportnodes.h"
 #include "parser/parse_type.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
@@ -25,6 +28,7 @@
 #include "fb_entry.h"
 #include "fb_error.h"
 #include "fb_guc.h"
+#include "fb_memory.h"
 #include "fb_progress.h"
 #include "fb_replay.h"
 #include "fb_reverse_ops.h"
@@ -35,7 +39,7 @@
  *    Tracks one SRF execution state.
  */
 
-typedef struct FbFlashbackQueryState
+struct FbFlashbackQueryState
 {
 	FbRelationInfo info;
 	TupleDesc tupdesc;
@@ -44,14 +48,29 @@ typedef struct FbFlashbackQueryState
 	FbApplyContext *apply;
 	ExprContext *econtext;
 	bool cleanup_registered;
-} FbFlashbackQueryState;
+	bool finished;
+	bool aborted;
+};
+
+typedef struct FbPreflightEstimate
+{
+	uint64 wal_bytes;
+	uint64 reverse_bytes;
+	uint64 apply_bytes;
+	uint64 total_bytes;
+} FbPreflightEstimate;
 
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(fb_version);
 PG_FUNCTION_INFO_V1(fb_check_relation);
+PG_FUNCTION_INFO_V1(fb_archive_resolve_debug);
 PG_FUNCTION_INFO_V1(fb_recordref_debug);
+PG_FUNCTION_INFO_V1(fb_progress_debug_set_clock);
+PG_FUNCTION_INFO_V1(fb_progress_debug_reset_clock);
+PG_FUNCTION_INFO_V1(fb_srf_mode_debug);
 PG_FUNCTION_INFO_V1(fb_wal_sidecar_debug);
+PG_FUNCTION_INFO_V1(fb_pg_flashback_support);
 PG_FUNCTION_INFO_V1(pg_flashback);
 PG_FUNCTION_INFO_V1(fb_export_undo);
 
@@ -114,6 +133,25 @@ fb_parse_target_ts_text(text *target_ts_text)
 												   Int32GetDatum(-1)));
 }
 
+static const char *
+fb_choose_srf_mode(ReturnSetInfo *rsinfo)
+{
+	bool allow_value_per_call = false;
+	bool allow_materialize = false;
+
+	if (rsinfo != NULL && IsA(rsinfo, ReturnSetInfo))
+	{
+		allow_value_per_call = ((rsinfo->allowedModes & SFRM_ValuePerCall) != 0);
+		allow_materialize = ((rsinfo->allowedModes & SFRM_Materialize) != 0);
+	}
+
+	if (allow_value_per_call)
+		return "value_per_call";
+	if (allow_materialize)
+		return "materialize_only";
+	return "invalid";
+}
+
 /*
  * fb_resolve_target_type_relid
  *    SQL entry helper.
@@ -155,6 +193,160 @@ fb_validate_flashback_target(Oid relid, TimestampTz target_ts,
 	fb_require_archive_dir();
 	fb_require_supported_target_relation(relid, info_out);
 	*tupdesc_out = fb_relation_tupledesc(relid);
+}
+
+static uint64
+fb_estimate_add_u64(uint64 left, uint64 right)
+{
+	if (PG_UINT64_MAX - left < right)
+		return PG_UINT64_MAX;
+
+	return left + right;
+}
+
+static uint64
+fb_estimate_mul_u64(uint64 left, uint64 right)
+{
+	if (left == 0 || right == 0)
+		return 0;
+	if (left > PG_UINT64_MAX / right)
+		return PG_UINT64_MAX;
+
+	return left * right;
+}
+
+static uint64
+fb_estimate_tuple_bytes(TupleDesc tupdesc)
+{
+	uint64 data_width = 0;
+	int i;
+
+	if (tupdesc == NULL)
+		return UINT64CONST(256);
+
+	for (i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+		int avgwidth;
+
+		if (attr->attisdropped)
+			continue;
+
+		if (attr->attlen > 0)
+			avgwidth = attr->attlen;
+		else
+		{
+			avgwidth = get_typavgwidth(attr->atttypid, attr->atttypmod);
+			if (avgwidth <= 0)
+				avgwidth = 32;
+		}
+
+		data_width = fb_estimate_add_u64(data_width, (uint64) avgwidth);
+	}
+
+	return MAXALIGN(HEAPTUPLESIZE + SizeofHeapTupleHeader + data_width);
+}
+
+static void
+fb_preflight_append_detail(StringInfo buf,
+						   uint64 estimated_bytes,
+						   uint64 limit_bytes,
+						   FbSpillMode mode)
+{
+	appendStringInfoString(buf, "estimated=");
+	fb_memory_append_bytes_value(buf, estimated_bytes);
+	appendStringInfoString(buf, " limit=");
+	fb_memory_append_bytes_value(buf, limit_bytes);
+	appendStringInfo(buf, " mode=%s phase=preflight",
+					 fb_spill_mode_name(mode));
+}
+
+static void
+fb_preflight_estimate_working_set(const FbRelationInfo *info,
+								  TupleDesc tupdesc,
+								  const FbWalRecordIndex *index,
+								  FbPreflightEstimate *estimate_out)
+{
+	uint64 tuple_bytes;
+	uint64 record_count;
+	uint64 target_count;
+	uint64 wal_bytes;
+	uint64 reverse_bytes;
+	uint64 apply_per_entry;
+
+	MemSet(estimate_out, 0, sizeof(*estimate_out));
+	if (index == NULL)
+		return;
+
+	tuple_bytes = fb_estimate_tuple_bytes(tupdesc);
+	record_count = index->kept_record_count;
+	target_count = index->target_record_count;
+
+	wal_bytes = (uint64) fb_spool_log_size(index->record_log);
+	wal_bytes = fb_estimate_add_u64(wal_bytes,
+									(uint64) fb_spool_log_size(index->record_tail_log));
+	wal_bytes = fb_estimate_add_u64(wal_bytes,
+									fb_estimate_mul_u64(record_count,
+														(uint64) sizeof(FbRecordRef)));
+
+	reverse_bytes = fb_estimate_mul_u64(target_count,
+										 (uint64) sizeof(FbReverseOp));
+	reverse_bytes = fb_estimate_add_u64(reverse_bytes,
+										 fb_estimate_mul_u64(target_count,
+														 tuple_bytes));
+	reverse_bytes = fb_estimate_add_u64(reverse_bytes,
+										 fb_estimate_mul_u64(index->target_update_count,
+														 tuple_bytes));
+
+	apply_per_entry = tuple_bytes + ((info != NULL && info->mode == FB_APPLY_KEYED) ?
+									 UINT64CONST(128) : UINT64CONST(64));
+	estimate_out->wal_bytes = wal_bytes;
+	estimate_out->reverse_bytes = reverse_bytes;
+	estimate_out->apply_bytes = fb_estimate_mul_u64(target_count, apply_per_entry);
+	estimate_out->total_bytes = fb_estimate_add_u64(estimate_out->wal_bytes,
+													 estimate_out->reverse_bytes);
+	estimate_out->total_bytes = fb_estimate_add_u64(estimate_out->total_bytes,
+													 estimate_out->apply_bytes);
+}
+
+static bool
+fb_preflight_allow_disk_spill(const FbRelationInfo *info,
+							  TupleDesc tupdesc,
+							  const FbWalRecordIndex *index)
+{
+	FbPreflightEstimate estimate;
+	FbSpillMode mode = fb_get_spill_mode();
+	uint64 limit_bytes = fb_get_memory_limit_bytes();
+	StringInfoData detail;
+
+	fb_preflight_estimate_working_set(info, tupdesc, index, &estimate);
+	if (limit_bytes == 0 || estimate.total_bytes <= limit_bytes)
+		return mode == FB_SPILL_MODE_DISK;
+
+	initStringInfo(&detail);
+	fb_preflight_append_detail(&detail, estimate.total_bytes, limit_bytes, mode);
+
+	if (mode == FB_SPILL_MODE_DISK)
+	{
+		ereport(NOTICE,
+				(errmsg("pg_flashback estimated working set exceeds pg_flashback.memory_limit; continuing with disk spill allowed"),
+				 errdetail_internal("%s", detail.data)));
+		return true;
+	}
+
+	if (mode == FB_SPILL_MODE_MEMORY)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("flashback is configured to run in memory-only mode, but the estimated working set exceeds pg_flashback.memory_limit"),
+				 errdetail_internal("%s", detail.data),
+				 errhint("Increase pg_flashback.memory_limit, or set pg_flashback.spill_mode = 'disk'.")));
+
+	ereport(ERROR,
+			(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+			 errmsg("estimated flashback working set exceeds pg_flashback.memory_limit"),
+			 errdetail_internal("%s", detail.data),
+			 errhint("Increase pg_flashback.memory_limit, or set pg_flashback.spill_mode = 'disk' to allow spill.")));
+	return false;
 }
 
 /*
@@ -239,6 +431,7 @@ fb_build_flashback_reverse_ops(TimestampTz target_ts,
 	FbWalRecordIndex index;
 	FbReplayResult replay_result;
 	FbReverseOpSource *reverse;
+	bool allow_disk_spill;
 
 	fb_progress_enter_stage(FB_PROGRESS_STAGE_PREPARE_WAL, NULL);
 	fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
@@ -254,10 +447,12 @@ fb_build_flashback_reverse_ops(TimestampTz target_ts,
 				 errdetail_internal("%s", detail)));
 	}
 
+	allow_disk_spill = fb_preflight_allow_disk_spill(info, tupdesc, &index);
+
 	MemSet(&replay_result, 0, sizeof(replay_result));
 	replay_result.tracked_bytes = index.tracked_bytes;
 	replay_result.memory_limit_bytes = index.memory_limit_bytes;
-	reverse = fb_reverse_source_create(spool,
+	reverse = fb_reverse_source_create(allow_disk_spill ? spool : NULL,
 									   &replay_result.tracked_bytes,
 									   replay_result.memory_limit_bytes);
 	fb_replay_build_reverse_source(info, &index, tupdesc, &replay_result, reverse);
@@ -286,16 +481,9 @@ fb_prepare_flashback_query(FbFlashbackQueryState *state,
 	state->spool = NULL;
 }
 
-/*
- * fb_flashback_cleanup_callback
- *    SQL entry helper.
- */
-
 static void
-fb_flashback_cleanup_callback(Datum arg)
+fb_flashback_query_release(FbFlashbackQueryState *state)
 {
-	FbFlashbackQueryState *state = (FbFlashbackQueryState *) DatumGetPointer(arg);
-
 	if (state != NULL && state->apply != NULL)
 	{
 		fb_apply_end(state->apply);
@@ -311,7 +499,23 @@ fb_flashback_cleanup_callback(Datum arg)
 		fb_spool_session_destroy(state->spool);
 		state->spool = NULL;
 	}
+}
 
+/*
+ * fb_flashback_cleanup_callback
+ *    SQL entry helper.
+ */
+
+static void
+fb_flashback_cleanup_callback(Datum arg)
+{
+	FbFlashbackQueryState *state = (FbFlashbackQueryState *) DatumGetPointer(arg);
+
+	if (state == NULL || state->aborted || state->finished)
+		return;
+
+	fb_flashback_query_release(state);
+	state->aborted = true;
 	fb_progress_abort();
 }
 
@@ -330,6 +534,68 @@ fb_unregister_flashback_cleanup(FbFlashbackQueryState *state)
 								  fb_flashback_cleanup_callback,
 								  PointerGetDatum(state));
 	state->cleanup_registered = false;
+}
+
+FbFlashbackQueryState *
+fb_flashback_query_begin(Oid source_relid, text *target_ts_text)
+{
+	FbFlashbackQueryState *state;
+	TimestampTz target_ts;
+
+	state = palloc0(sizeof(*state));
+	target_ts = fb_parse_target_ts_text(target_ts_text);
+	fb_progress_begin();
+
+	PG_TRY();
+	{
+		fb_prepare_flashback_query(state, source_relid, target_ts);
+	}
+	PG_CATCH();
+	{
+		fb_flashback_query_abort(state);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return state;
+}
+
+bool
+fb_flashback_query_next_datum(FbFlashbackQueryState *state, Datum *result)
+{
+	if (state == NULL || state->apply == NULL)
+		return false;
+
+	return fb_apply_next(state->apply, result);
+}
+
+TupleDesc
+fb_flashback_query_tupdesc(FbFlashbackQueryState *state)
+{
+	if (state == NULL)
+		return NULL;
+
+	return state->tupdesc;
+}
+
+void
+fb_flashback_query_finish(FbFlashbackQueryState *state)
+{
+	if (state == NULL || state->finished)
+		return;
+
+	fb_flashback_query_release(state);
+	state->finished = true;
+	fb_progress_finish();
+}
+
+void
+fb_flashback_query_abort(FbFlashbackQueryState *state)
+{
+	if (state == NULL)
+		return;
+
+	fb_flashback_cleanup_callback(PointerGetDatum(state));
 }
 
 /*
@@ -362,6 +628,32 @@ fb_check_relation(PG_FUNCTION_ARGS)
 					 info.mode_name,
 					 OidIsValid(info.toast_relid) ? "true" : "false");
 
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+/*
+ * fb_archive_resolve_debug
+ *    SQL entry point for regression-only archive source diagnostics.
+ */
+
+Datum
+fb_archive_resolve_debug(PG_FUNCTION_ARGS)
+{
+	FbArchiveDirSource source;
+	const char *setting_name = NULL;
+	char *archive_dir;
+	StringInfoData buf;
+
+	archive_dir = fb_resolve_archive_dir(&source, &setting_name);
+	fb_require_archive_dir();
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "mode=%s setting=%s path=%s",
+					 fb_archive_dir_source_name(source),
+					 setting_name,
+					 archive_dir);
+
+	pfree(archive_dir);
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }
 
@@ -447,6 +739,120 @@ fb_wal_sidecar_debug(PG_FUNCTION_ARGS)
 }
 
 /*
+ * fb_progress_debug_set_clock
+ *    SQL entry point for regression-only deterministic progress timing.
+ */
+
+Datum
+fb_progress_debug_set_clock(PG_FUNCTION_ARGS)
+{
+	ArrayType  *values = PG_GETARG_ARRAYTYPE_P(0);
+	Datum	   *datums;
+	bool	   *nulls;
+	int			nelems;
+	int64	   *script;
+	int			i;
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+
+	if (ARR_NDIM(values) > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+				 errmsg("fb_progress_debug_set_clock expects a one-dimensional bigint array")));
+	if (ARR_ELEMTYPE(values) != INT8OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("fb_progress_debug_set_clock expects bigint[]")));
+
+	get_typlenbyvalalign(INT8OID, &typlen, &typbyval, &typalign);
+	deconstruct_array(values,
+					  INT8OID,
+					  typlen,
+					  typbyval,
+					  typalign,
+					  &datums,
+					  &nulls,
+					  &nelems);
+
+	script = palloc(sizeof(int64) * Max(nelems, 1));
+	for (i = 0; i < nelems; i++)
+	{
+		if (nulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("fb_progress_debug_set_clock does not accept NULL elements")));
+		script[i] = DatumGetInt64(datums[i]);
+	}
+
+	fb_progress_debug_set_clock_script(script, nelems);
+	pfree(script);
+	pfree(datums);
+	pfree(nulls);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * fb_progress_debug_reset_clock
+ *    SQL entry point for regression-only deterministic progress timing.
+ */
+
+Datum
+fb_progress_debug_reset_clock(PG_FUNCTION_ARGS)
+{
+	fb_progress_debug_clear_clock();
+	PG_RETURN_VOID();
+}
+
+Datum
+fb_srf_mode_debug(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+		MemoryContext oldcontext;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+		funcctx->user_fctx = psprintf("chosen=%s",
+									  fb_choose_srf_mode(rsinfo));
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	if (funcctx->call_cntr == 0)
+		SRF_RETURN_NEXT(funcctx,
+						CStringGetTextDatum((char *) funcctx->user_fctx));
+
+	SRF_RETURN_DONE(funcctx);
+}
+
+/*
+ * fb_pg_flashback_support
+ *    Planner support stub. Its main job is to load the module early enough
+ *    that _PG_init() can register the CustomScan hook before set_rel_pathlist.
+ */
+
+Datum
+fb_pg_flashback_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	if (rawreq == NULL)
+		PG_RETURN_POINTER(NULL);
+
+	if (IsA(rawreq, SupportRequestRows))
+		PG_RETURN_POINTER(NULL);
+	if (IsA(rawreq, SupportRequestCost))
+		PG_RETURN_POINTER(NULL);
+
+	PG_RETURN_POINTER(NULL);
+}
+
+/*
  * pg_flashback
  *    SQL entry point.
  */
@@ -458,53 +864,13 @@ pg_flashback(PG_FUNCTION_ARGS)
 	FuncCallContext *funcctx;
 	FbFlashbackQueryState *state;
 	Oid source_relid = InvalidOid;
-	bool prefer_materialize = false;
 
 	if (rsinfo != NULL && IsA(rsinfo, ReturnSetInfo))
-	{
 		source_relid = fb_resolve_target_type_relid(fcinfo);
-		prefer_materialize = ((rsinfo->allowedModes & SFRM_Materialize) != 0);
-	}
-
-	if (prefer_materialize)
-	{
-		FbFlashbackQueryState state;
-		TimestampTz target_ts;
-		bits32 srf_flags = 0;
-
-		if (rsinfo->econtext == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("pg_flashback is missing executor expression context")));
-
-		MemSet(&state, 0, sizeof(state));
-		target_ts = fb_parse_target_ts_text(PG_GETARG_TEXT_PP(1));
-
-		fb_progress_begin();
-		PG_TRY();
-		{
-			fb_prepare_flashback_query(&state, source_relid, target_ts);
-			if (rsinfo->expectedDesc != NULL)
-				srf_flags |= MAT_SRF_USE_EXPECTED_DESC;
-			InitMaterializedSRF(fcinfo, srf_flags);
-			fb_apply_materialize(state.apply, rsinfo->setResult);
-			fb_apply_end(state.apply);
-			state.apply = NULL;
-			fb_progress_finish();
-			PG_RETURN_NULL();
-		}
-		PG_CATCH();
-		{
-			fb_flashback_cleanup_callback(PointerGetDatum(&state));
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-	}
 
 	if (SRF_IS_FIRSTCALL())
 	{
 		MemoryContext oldcontext;
-		TimestampTz target_ts;
 
 		if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
 			ereport(ERROR,
@@ -521,27 +887,27 @@ pg_flashback(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_INTERNAL_ERROR),
 					 errmsg("pg_flashback is missing executor expression context")));
 
-		funcctx = SRF_FIRSTCALL_INIT();
-		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-		state = palloc0(sizeof(*state));
-		funcctx->user_fctx = state;
+			funcctx = SRF_FIRSTCALL_INIT();
+			oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+			state = palloc0(sizeof(*state));
+			state->econtext = rsinfo->econtext;
+			funcctx->user_fctx = state;
+			RegisterExprContextCallback(rsinfo->econtext,
+										fb_flashback_cleanup_callback,
+										PointerGetDatum(state));
+			state->cleanup_registered = true;
 
-		fb_progress_begin();
-		state->econtext = rsinfo->econtext;
-		RegisterExprContextCallback(rsinfo->econtext,
-									fb_flashback_cleanup_callback,
-									PointerGetDatum(state));
-		state->cleanup_registered = true;
-
-		PG_TRY();
-		{
-			if (!OidIsValid(source_relid))
-				source_relid = fb_resolve_target_type_relid(fcinfo);
-			target_ts = fb_parse_target_ts_text(PG_GETARG_TEXT_PP(1));
-			fb_prepare_flashback_query(state, source_relid, target_ts);
-		}
-		PG_CATCH();
-		{
+			PG_TRY();
+			{
+				if (!OidIsValid(source_relid))
+					source_relid = fb_resolve_target_type_relid(fcinfo);
+				fb_progress_begin();
+				fb_prepare_flashback_query(state,
+										   source_relid,
+										   fb_parse_target_ts_text(PG_GETARG_TEXT_PP(1)));
+			}
+			PG_CATCH();
+			{
 			fb_flashback_cleanup_callback(PointerGetDatum(state));
 			MemoryContextSwitchTo(oldcontext);
 			PG_RE_THROW();
@@ -555,29 +921,23 @@ pg_flashback(PG_FUNCTION_ARGS)
 	state = (FbFlashbackQueryState *) funcctx->user_fctx;
 
 	PG_TRY();
-	{
-		Datum result;
-
-		if (fb_apply_next(state->apply, &result))
 		{
-			SRF_RETURN_NEXT(funcctx, result);
-		}
+			Datum result;
 
-		if (state->apply != NULL)
+			if (fb_flashback_query_next_datum(state, &result))
+			{
+				SRF_RETURN_NEXT(funcctx, result);
+			}
+
+			fb_flashback_query_finish(state);
+			fb_unregister_flashback_cleanup(state);
+		}
+		PG_CATCH();
 		{
-			fb_apply_end(state->apply);
-			state->apply = NULL;
+			fb_flashback_query_abort(state);
+			PG_RE_THROW();
 		}
-
-		fb_unregister_flashback_cleanup(state);
-		fb_progress_finish();
-	}
-	PG_CATCH();
-	{
-		fb_flashback_cleanup_callback(PointerGetDatum(state));
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
+		PG_END_TRY();
 
 	SRF_RETURN_DONE(funcctx);
 }

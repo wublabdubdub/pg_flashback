@@ -1518,6 +1518,26 @@ fb_find_segment_by_segno(FbWalSegmentEntry *segments, int segment_count,
 	return NULL;
 }
 
+static int
+fb_find_segment_index_for_lsn(FbWalSegmentEntry *segments, int segment_count,
+							 XLogRecPtr lsn, int wal_seg_size)
+{
+	XLogSegNo segno;
+	int i;
+
+	if (segments == NULL || segment_count <= 0 || XLogRecPtrIsInvalid(lsn))
+		return -1;
+
+	XLByteToSeg(lsn, segno, wal_seg_size);
+	for (i = 0; i < segment_count; i++)
+	{
+		if (segments[i].segno == segno)
+			return i;
+	}
+
+	return -1;
+}
+
 /*
  * fb_segment_start_lsn
  *    WAL helper.
@@ -1739,7 +1759,9 @@ fb_collect_archive_segments(FbWalScanContext *ctx)
 {
 	FbWalSegmentEntry *candidates = NULL;
 	FbWalSegmentEntry *selected = NULL;
-	const char *archive_dir;
+	char *archive_dir;
+	FbArchiveDirSource archive_source;
+	const char *archive_setting_name;
 	char *pg_wal_dir = NULL;
 	int candidate_count = 0;
 	int candidate_capacity = 0;
@@ -1750,9 +1772,9 @@ fb_collect_archive_segments(FbWalScanContext *ctx)
 	XLogRecPtr last_segment_start;
 	off_t last_segment_bytes;
 
-	archive_dir = fb_get_effective_archive_dir();
-	ctx->using_archive_dest = !fb_using_legacy_archive_dir();
-	ctx->using_legacy_archive_dir = fb_using_legacy_archive_dir();
+	archive_dir = fb_resolve_archive_dir(&archive_source, &archive_setting_name);
+	ctx->using_archive_dest = archive_source != FB_ARCHIVE_DIR_SOURCE_LEGACY_DIR;
+	ctx->using_legacy_archive_dir = archive_source == FB_ARCHIVE_DIR_SOURCE_LEGACY_DIR;
 	pg_wal_dir = fb_get_pg_wal_dir();
 
 	if (ctx->using_archive_dest)
@@ -1776,8 +1798,7 @@ fb_collect_archive_segments(FbWalScanContext *ctx)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("%s contains no WAL segments: %s",
-						ctx->using_archive_dest ? "pg_flashback.archive_dest" :
-						"pg_flashback.archive_dir",
+						archive_setting_name,
 						archive_dir)));
 
 	for (i = 0; i < candidate_count; i++)
@@ -1787,6 +1808,9 @@ fb_collect_archive_segments(FbWalScanContext *ctx)
 	}
 
 	ctx->timeline_id = (TimeLineID) highest_tli;
+
+	if (archive_dir != NULL)
+		pfree(archive_dir);
 
 	for (i = 0; i < candidate_count; i++)
 	{
@@ -2777,10 +2801,16 @@ fb_maybe_seed_anchor_hint(FbWalScanContext *ctx)
 	ctx->anchor_checkpoint_lsn = best_entry.checkpoint_lsn;
 	ctx->anchor_redo_lsn = best_entry.redo_lsn;
 	ctx->anchor_time = best_entry.checkpoint_ts;
-	ctx->anchor_hint_segment_index = best_segment_index;
-	if (best_entry.checkpoint_lsn > ctx->start_lsn)
+	ctx->anchor_hint_segment_index =
+		fb_find_segment_index_for_lsn((FbWalSegmentEntry *) ctx->resolved_segments,
+									 ctx->resolved_segment_count,
+									 best_entry.redo_lsn,
+									 ctx->wal_seg_size);
+	if (ctx->anchor_hint_segment_index < 0)
+		ctx->anchor_hint_segment_index = best_segment_index;
+	if (best_entry.redo_lsn > ctx->start_lsn)
 	{
-		ctx->start_lsn = best_entry.checkpoint_lsn;
+		ctx->start_lsn = best_entry.redo_lsn;
 		ctx->start_lsn_pruned = true;
 	}
 }
@@ -3292,6 +3322,11 @@ fb_mark_xid_unsafe(HTAB *unsafe_xids, TransactionId xid,
 
 	if (!TransactionIdIsValid(xid))
 	{
+		if (reason == FB_WAL_UNSAFE_STORAGE_CHANGE &&
+			(storage_op == FB_WAL_STORAGE_CHANGE_STANDBY_LOCK ||
+			 storage_op == FB_WAL_STORAGE_CHANGE_SMGR_TRUNCATE))
+			return;
+
 		ctx->unsafe_xid = InvalidTransactionId;
 		ctx->unsafe_commit_ts = 0;
 		ctx->unsafe_record_lsn = lsn;
@@ -3467,6 +3502,24 @@ fb_mark_unsafe(FbWalScanContext *ctx, FbWalUnsafeReason reason)
 
 	ctx->unsafe = true;
 	ctx->unsafe_reason = reason;
+}
+
+static bool
+fb_unsafe_entry_requires_reject(const FbUnsafeXidEntry *entry)
+{
+	if (entry == NULL)
+		return false;
+
+	if (entry->reason != FB_WAL_UNSAFE_STORAGE_CHANGE)
+		return true;
+
+	if (entry->storage_op == FB_WAL_STORAGE_CHANGE_STANDBY_LOCK)
+		return false;
+
+	if (entry->storage_op == FB_WAL_STORAGE_CHANGE_SMGR_TRUNCATE)
+		return false;
+
+	return true;
 }
 
 static void
@@ -3674,7 +3727,7 @@ fb_note_xact_record(XLogReaderState *reader, HTAB *touched_xids,
 					parsed.xact_time <= ctx->query_now_ts)
 				{
 					ctx->commit_count++;
-					if (unsafe_entry != NULL)
+					if (fb_unsafe_entry_requires_reject(unsafe_entry))
 					{
 						fb_capture_unsafe_context(ctx, unsafe_entry, xid,
 												  parsed.xact_time);
@@ -3755,7 +3808,7 @@ fb_note_xact_status_for_touched(XLogReaderState *reader,
 
 				if (commit_ts > ctx->target_ts &&
 					commit_ts <= ctx->query_now_ts &&
-					unsafe_entry != NULL)
+					fb_unsafe_entry_requires_reject(unsafe_entry))
 				{
 					fb_capture_unsafe_context(ctx, unsafe_entry, xid, commit_ts);
 					fb_mark_unsafe(ctx, unsafe_entry->reason);
@@ -4332,11 +4385,17 @@ fb_wal_visit_window(FbWalScanContext *ctx, const FbWalVisitWindow *window,
 #if PG_VERSION_NUM < 130000
 	reader = XLogReaderAllocate(ctx->wal_seg_size, fb_wal_read_page, &private);
 #else
-	reader = XLogReaderAllocate(ctx->wal_seg_size, fb_get_effective_archive_dir(),
-								XL_ROUTINE(.page_read = fb_wal_read_page,
-										   .segment_open = fb_wal_open_segment,
-										   .segment_close = fb_wal_close_segment),
-								&private);
+	{
+		char *archive_dir;
+
+		archive_dir = fb_get_effective_archive_dir();
+		reader = XLogReaderAllocate(ctx->wal_seg_size, archive_dir,
+									XL_ROUTINE(.page_read = fb_wal_read_page,
+											   .segment_open = fb_wal_open_segment,
+											   .segment_close = fb_wal_close_segment),
+									&private);
+		pfree(archive_dir);
+	}
 #endif
 	if (reader == NULL)
 		ereport(ERROR,

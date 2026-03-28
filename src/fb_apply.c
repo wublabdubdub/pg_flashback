@@ -14,7 +14,6 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
-#include "utils/tuplestore.h"
 
 #include "fb_apply.h"
 #include "fb_progress.h"
@@ -231,24 +230,6 @@ fb_apply_emit_as_datum(FbApplyContext *ctx, const FbApplyEmit *emit)
 	return (Datum) 0;
 }
 
-static void
-fb_apply_emit_to_tuplestore(Tuplestorestate *tupstore, const FbApplyEmit *emit)
-{
-	switch (emit->kind)
-	{
-		case FB_APPLY_EMIT_SLOT:
-			tuplestore_puttupleslot(tupstore, emit->slot);
-			return;
-		case FB_APPLY_EMIT_TUPLE:
-			tuplestore_puttuple(tupstore, emit->tuple);
-			return;
-		case FB_APPLY_EMIT_NONE:
-			break;
-	}
-
-	elog(ERROR, "fb apply emitted invalid row kind");
-}
-
 /*
  * fb_apply_finish_scan_phase
  *    Apply helper.
@@ -387,62 +368,6 @@ fb_apply_next(FbApplyContext *ctx, Datum *result)
 	}
 
 	return false;
-}
-
-void
-fb_apply_materialize(FbApplyContext *ctx, Tuplestorestate *tupstore)
-{
-	if (ctx == NULL || tupstore == NULL)
-		return;
-
-	if (ctx->phase == FB_APPLY_PHASE_SCAN)
-	{
-		while (table_scan_getnextslot(ctx->scan, ForwardScanDirection, ctx->slot))
-		{
-			FbApplyEmit emit = {0};
-			bool emitted;
-
-			ctx->scanned_rows++;
-			if (ctx->estimated_rows > 0 &&
-				(ctx->scanned_rows == 1 ||
-				 ctx->scanned_rows == ctx->estimated_rows ||
-				 (ctx->scanned_rows % ctx->progress_stride) == 0))
-				fb_progress_update_percent(FB_PROGRESS_STAGE_APPLY,
-										   fb_progress_map_subrange(0, 100,
-																ctx->scanned_rows,
-																ctx->estimated_rows),
-										   NULL);
-
-			emitted = fb_apply_process_current_emit(ctx, ctx->slot, &emit);
-			if (emitted)
-				fb_apply_emit_to_tuplestore(tupstore, &emit);
-			ExecClearTuple(ctx->slot);
-		}
-
-		fb_apply_cleanup_resources(ctx);
-		fb_apply_finish_scan_phase(ctx);
-	}
-
-	if (ctx->phase == FB_APPLY_PHASE_RESIDUAL)
-	{
-		FbApplyEmit emit = {0};
-
-		while (fb_apply_next_residual_emit(ctx, &emit))
-		{
-			fb_apply_emit_to_tuplestore(tupstore, &emit);
-			ctx->residual_emitted++;
-			fb_progress_update_fraction(FB_PROGRESS_STAGE_MATERIALIZE,
-										ctx->residual_emitted,
-										ctx->residual_total,
-										NULL);
-			emit.kind = FB_APPLY_EMIT_NONE;
-			emit.slot = NULL;
-			emit.tuple = NULL;
-		}
-
-		ctx->phase = FB_APPLY_PHASE_DONE;
-		fb_progress_update_percent(FB_PROGRESS_STAGE_MATERIALIZE, 100, NULL);
-	}
 }
 
 /*

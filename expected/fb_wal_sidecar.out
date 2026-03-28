@@ -60,8 +60,6 @@ SELECT fb_recordref_debug(
  anchor=true unsafe=false reason=none meta_refs=5 payload_refs=5 kept=5 target_dml=3 commits=3 aborts=0 tail_inline=false head_gap_refs=5 tail_refs=0
 (1 row)
 
-
-
 SELECT regexp_replace(
 	fb_wal_sidecar_debug(
 		'fb_wal_sidecar_target'::regclass,
@@ -74,3 +72,4 @@ SELECT regexp_replace(
 -----------------------------------------------------------
  anchor_hint=true start_pruned=true checkpoint_entries=<n>
 (1 row)
+

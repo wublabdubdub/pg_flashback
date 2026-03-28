@@ -67,4 +67,10 @@ void fb_progress_update_fraction(FbProgressStage stage, uint64 done, uint64 tota
 uint32 fb_progress_map_subrange(uint32 base_percent, uint32 span_percent,
 								uint64 done, uint64 total);
 
+/*
+ * Regression-only helpers for deterministic clock injection.
+ */
+void fb_progress_debug_set_clock_script(const int64 *script, int count);
+void fb_progress_debug_clear_clock(void);
+
 #endif

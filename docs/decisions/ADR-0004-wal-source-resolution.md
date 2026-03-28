@@ -9,6 +9,7 @@ Accepted
 `pg_flashback` 的最终 WAL 来源模型定为：
 
 - 主配置语义：`archive_dest`
+- 显式未设置时，允许从 PostgreSQL 当前生效的 `archive_command` 自动推断本地 archive 目录
 - 运行时同时解析两个来源：
   - `pg_wal`
   - `archive_dest`
@@ -31,6 +32,26 @@ Accepted
 
 - `pg_flashback.debug_pg_wal_dir`（开发期专用）
 - 扩展内部 `DataDir/pg_flashback/recovered_wal/` 恢复目录
+
+## 内核归档配置自动发现边界
+
+自动发现顺序固定为：
+
+1. `pg_flashback.archive_dest`
+2. `pg_flashback.archive_dir`
+3. PostgreSQL `archive_command`
+
+自动发现仅覆盖“可安全识别的本地归档命令”：
+
+- `cp %p /path/%f`
+- `test ! -f /path/%f && cp %p /path/%f`
+- 本地 `pg_probackup archive-push -B backup_dir --instance instance_name ...`
+
+以下情况不自动推断，继续要求显式设置 `pg_flashback.archive_dest`：
+
+- PostgreSQL `archive_library` 非空
+- 远程归档
+- wrapper script / 环境变量注入 / 无法稳定抽取本地目录的复杂 shell 命令
 
 ## segment 分层
 
@@ -82,6 +103,7 @@ Accepted
 ## 原因
 
 - 仅依赖 `pg_wal` 无法覆盖长期时间窗
-- 仅依赖 `archive_dest` 又会错失 recent/partial WAL
+- 仅依赖手工 `archive_dest` 又会增加部署成本，并且与 PostgreSQL 实际归档配置脱节
 - 双来源解析可以让最近 WAL 和历史 WAL 各走最合适的路径
+- 允许从内核 `archive_command` 做有限自动发现，可以减少“数据库已配置归档，但扩展仍需重复抄一份路径”的运维摩擦
 - 把缺失恢复单独建模，比继续把错误压成“目录里没文件”更可维护

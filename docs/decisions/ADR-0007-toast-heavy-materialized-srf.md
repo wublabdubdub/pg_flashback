@@ -2,7 +2,13 @@
 
 ## 状态
 
-Accepted
+Superseded by `ADR-0009`
+
+## 后续状态说明
+
+该 ADR 在当时为 `TOAST-heavy` 发射 CPU 热点提供了可行方向，但后续 live case 已确认内部 materialized SRF 在大结果集上会引入不可接受的 `pgsql_tmp` temp spill。
+
+当前仓库口径已按 `ADR-0009` 收口为 `ValuePerCall-only`。如果未来需要重新引入 materialize，只能作为新的、严格受限的特例方案重新决策。
 
 ## 决策
 

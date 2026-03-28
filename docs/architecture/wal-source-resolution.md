@@ -1,122 +1,228 @@
 # WAL 来源解析
 
-## 当前问题
+本文只讲当前代码里的 WAL resolver，不再沿用“用户手填一个目录，所有 WAL 都从那里读”的旧口径。
 
-当前 PG18 基线实现把：
+相关代码：
 
-- `pg_flashback.archive_dir`
+- `src/fb_guc.c`
+- `src/fb_wal.c`
+- `src/fb_ckwal.c`
+- `src/fb_runtime.c`
 
-直接当成“唯一 WAL 来源目录”。
+## 一、当前真实来源模型
 
-这只适合开发验证，不适合作为最终产品模型。用户把它直接设成：
+当前 flashback 查询会综合三类实际来源：
 
-```sql
-SET pg_flashback.archive_dir = '/isoTest/18pgdata/pg_wal';
-```
+1. archive 目录
+2. `pg_wal`
+3. `DataDir/pg_flashback/recovered_wal`
 
-虽然能跑通基线验证，但存在三个明显问题：
+其中 archive 目录本身又有三种解析方式：
 
-1. `pg_wal` 只覆盖最近 WAL，不能代表完整历史窗口。
-2. 真正长期保留的 WAL 通常已经归档到 `archive_dest`。
-3. `pg_wal` 中更老的 segment 可能已被覆盖。
+1. 显式 `pg_flashback.archive_dest`
+2. 兼容回退 `pg_flashback.archive_dir`
+3. 未显式设置时，从 PostgreSQL `archive_command` 自动发现
 
-## 已拍板模型
+最终不是“用户决定读哪个目录”，而是 resolver 统一决定每个 segment 应该从哪里来。
 
-最终模型已经确定为：
+## 二、优先级顺序
 
-- 主配置语义：`archive_dest`
-- 运行时双来源解析：
-  - `pg_wal`
-  - `archive_dest`
-- 当两端都不能提供所需 segment 时：
-  - 进入缺失 WAL 恢复层
-  - 恢复失败则统一报 `WAL not complete`
+### 配置优先级
 
-也就是说，最终产品不再是“用户告诉扩展一个固定目录，然后所有 WAL 都从这个目录读”。
+在 `src/fb_guc.c` 中，archive 目录解析顺序固定为：
 
-## segment 状态分类
+1. `pg_flashback.archive_dest`
+2. `pg_flashback.archive_dir`
+3. `archive_command` 自动发现
 
-对目标时间窗需要的每个 segment，运行时需要判定四种状态：
+只要上层已有明确值，下层就不再参与。
 
-- 仅存在于 `pg_wal`
-- 仅存在于 `archive_dest`
-- 同时存在于两端
-- 两端都不存在
+### 读取优先级
 
-## 读取优先级
+同一个 segment 如果 archive 和 `pg_wal` 都存在，当前规则是：
 
-当同一个 segment 同时出现在两端时，规则已经定为：
-
-- `archive_dest` 缺失时才从 `pg_wal` 读取
-- 两端重叠时一律优先 `archive_dest`
+- 优先 archive
 - `pg_wal` 只承接 archive 尚未覆盖的 recent tail
 
-也就是说，当前模型不再要求 resolver 去猜“recent / 历史”的优先级；只要 `archive_dest` 已有稳定归档文件，就直接以它为准。
+也就是：
 
-## `pg_wal` 错配检测
+- 不按“谁更新”来猜
+- 不按“pg_wal 看起来更新鲜”来抢优先级
+- archive 一旦存在，就默认是更可信的长期来源
 
-对于来自 `pg_wal` 的候选 segment，来源解析层需要检查：
+## 三、`archive_command` 自动发现的边界
 
-- 文件名解析出的 `timeline + segno`
-- 首个 long page header 中的 `xlp_seg_size`
-- 首个 long page header 的 `xlp_pageaddr`
+当前实现只识别可安全解析的本地模式。
+
+### 已支持
+
+1. `cp %p /path/%f`
+2. `test ! -f /path/%f && cp %p /path/%f`
+3. 本地 `pg_probackup archive-push -B backup_dir --instance instance_name ...`
+
+第三种会自动映射到：
+
+```text
+backup_dir/wal/instance_name
+```
+
+### 明确不做
+
+1. 解析复杂 shell 脚本
+2. 推断远程归档
+3. 推断 `archive_library`
+4. 猜测任意自定义 wrapper 命令
+
+当 `archive_library` 非空，或 `archive_command` 不属于当前可识别模式时，直接要求用户显式设置 `pg_flashback.archive_dest`。
+
+## 四、`pg_wal` 为什么不能单独当最终来源
+
+因为它只可靠覆盖 recent tail。
+
+单独使用 `pg_wal` 的问题包括：
+
+1. 老 segment 可能已被 recycle
+2. 时间窗较大时，历史段通常只在 archive 里
+3. 文件名和真实页头可能错配
+
+因此当前模型里：
+
+- `pg_wal` 是参与者
+- 但不是唯一真相来源
+
+## 五、resolver 当前怎么判定 segment 是否可信
+
+### 1. 常规检查
+
+resolver 会检查：
+
+- 是否是标准 WAL 文件名
+- 文件是否存在且是常规文件
+- 页头中的 timeline / segno / segsize 是否可解析
+
+### 2. `pg_wal` 错配检查
+
+这是当前实现里的一个关键点。
+
+对于来自 `pg_wal` 的段，系统不仅看文件名，还会读首个 long header。
 
 如果：
 
-- 文件名对应的 segno
-- 和 long page header 对应的 segment 起点
+- 文件名表示的 `timeline + segno`
+- 与页头真实 `xlp_pageaddr` 推导出来的 segment
 
-不一致，就说明该文件可能已经 recycled / 覆盖 / 命名与内容错配。
+不一致，就认为这个文件可能已经 recycled / 覆盖 / 命名与内容错配。
 
-这类 `pg_wal` 文件不能直接参与 flashback，应转入 `ckwal` 恢复路径。
+这类文件不会直接拿去 flashback。
 
-## 被覆盖 WAL 的恢复
+## 六、错配段如何处理
 
-如果查询窗口需要的 segment：
+当前不是简单丢弃，而是进入内嵌 `fb_ckwal` 处理。
 
-- 已经不在 `pg_wal`
-- `archive_dest` 中也缺失或损坏
+流程：
 
-则进入“缺失 WAL 恢复”模型。
+1. 读出页头真实 `timeline + segno`
+2. 在 `DataDir/pg_flashback/recovered_wal/` 下按真实名字重新物化
+3. 让 resolver 在同一轮中重新消费这个恢复结果
 
-这一层后续参考：
+对应代码：
 
-- `/root/xman` 中的 `ckwal`
+- `src/fb_ckwal.c` 中的 `fb_ckwal_materialize_segment()`
 
-但边界已经定死：
+这就是“先转换为 `recovered_wal/<actual-segname>` 再回灌”的当前代码实现。
 
-- 只参考“缺失 segment 复原”的思路
-- 不把 `pg_flashback` 做成外部恢复工具壳子
-- 复原后的 segment 仍然回到扩展自己的来源解析层继续消费
-- 恢复层的输入应当是“需要哪个 `timeline + segno`”
-- 恢复层的输出应当是“把可信 segment 放入扩展私有 `recovered_wal/` 后再次参与解析”
-- 当前已经接入最小接口层：
-  - `pg_flashback.debug_pg_wal_dir`（开发期专用）
+## 七、`fb_ckwal` 当前到底做什么
 
-当前实现语义：
+当前内嵌 `fb_ckwal` 不是外部恢复工具壳子，只做最小闭环：
 
-- 优先尝试 `archive_dest`
-- archive 缺失时才尝试 `pg_wal`
-- `pg_wal` 名称/头部/pageaddr 错配时，不继续信任它
-- 若 `pg_wal` 与 `archive_dest` 均无法提供可信 segment，则进入扩展内嵌恢复路径
-- 对于错配/覆盖的 `pg_wal` 段，恢复层需要先把其实际 header 所对应的 segment 转换为标准 `ckwal` 结果
-- 转换后的结果不仅要落到 `DataDir/pg_flashback/recovered_wal/`
-- 还必须立即回灌到本轮 resolver 的候选集合
-- resolver 需要持续消费：
-  - `archive_dest`
-  - `pg_wal`
-  - `recovered_wal`
-- 直到拼出连续可扫描的 segment 集，或确认三路来源都无法提供可信段
+1. 在 archive / `pg_wal` / `recovered_wal` 中查找需要的 segment
+2. 若文件名和真实内容一致，直接复制到 `recovered_wal`
+3. 若文件名和真实内容不一致，但页头可读，则按真实 segno 重命名物化
+4. 若三处都没有可信段，则失败
 
-## 当前实现与最终模型的关系
+它当前不做：
 
-- `archive_dir=/path/to/pg_wal` 只是当前 PG18 基线开发配置
-- `archive_dir` 不是最终产品接口
-- 后续代码实现应持续沿用独立的 `fb_wal_source_resolver`
-- 现有单目录扫描逻辑只作为过渡基线
+- 从备份系统远程拉取
+- 调外部命令执行复杂恢复
+- 维护单独的产品级恢复协议
 
-## 结论
+## 八、运行时目录在来源模型里的作用
 
-- `pg_flashback()` 的 WAL 来源最终是“解析层决定”，不是“用户手填单目录”
-- `pg_wal + archive_dest` 双来源解析是既定方案
-- 被覆盖 WAL 的恢复已经进入正式架构，不再只是临时想法
+`src/fb_runtime.c` 会在扩展加载时确保这几个目录存在：
+
+- `pg_flashback/runtime`
+- `pg_flashback/recovered_wal`
+- `pg_flashback/meta`
+
+它们分别承担：
+
+- query 级 spool
+- 恢复出来的可信 WAL 段
+- sidecar / metadata
+
+所以来源解析并不是“只在用户配置目录里找”，而是自带扩展私有工作区。
+
+## 九、当前 resolver 与 scan 的配合关系
+
+resolver 的职责不是直接读 record，而是准备好：
+
+- 连续
+- 可信
+- 可覆盖目标时间窗
+
+的 segment 集合。
+
+后续 `fb_wal_prepare_scan_context()` 会把这些结果写入 `FbWalScanContext`，再交给顺序扫描。
+
+`FbWalScanContext` 里与来源模型最相关的字段有：
+
+- `resolved_segments`
+- `resolved_segment_count`
+- `pg_wal_segment_count`
+- `archive_segment_count`
+- `ckwal_segment_count`
+- `using_archive_dest`
+- `using_legacy_archive_dir`
+- `ckwal_invoked`
+
+## 十、当前实现与文档里容易混淆的几点
+
+### 1. `archive_dir` 不是最终产品主语义
+
+它现在只是兼容回退项，不应再在新文档里写成主配置。
+
+### 2. `archive_command` 自动发现不是通用 shell 解析器
+
+只识别少数可安全匹配的本地模式。
+
+### 3. `pg_wal` 不是“比 archive 更新所以优先”
+
+当前优先级正相反：archive 优先，`pg_wal` 只补 tail。
+
+### 4. `fb_ckwal` 不是未来想法
+
+它已经在当前代码里真实参与 resolver 闭环。
+
+## 十一、失败条件
+
+当前来源层失败的典型原因有：
+
+1. archive 目录无法解析
+2. archive 目录不存在或不可访问
+3. 所需 segment 在 archive、`pg_wal`、`recovered_wal` 三处都不可得
+4. `pg_wal` 段可见但页头损坏/错配且无法物化恢复
+5. 最终拼不出覆盖时间窗的连续段集合
+
+最终错误通常体现为：
+
+- archive autodiscovery error
+- contains no WAL segments
+- `WAL not complete`
+
+## 十二、当前最短结论
+
+当前来源模型可以压成一句：
+
+```text
+archive 是主来源，pg_wal 是 recent tail 补源，recovered_wal 是被纠正/恢复后的可信回灌区，三者由统一 resolver 决定如何拼成可扫描窗口
+```

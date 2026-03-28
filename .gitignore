@@ -5,8 +5,8 @@
 *.bc
 *.a
 *.out
+!expected/*.out
 *.sql~
 results/
 regression.diffs
 tmp_check/
-

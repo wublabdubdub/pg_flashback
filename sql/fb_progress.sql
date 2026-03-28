@@ -13,6 +13,16 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION fb_progress_debug_set_clock(bigint[])
+RETURNS void
+AS '$libdir/pg_flashback', 'fb_progress_debug_set_clock'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION fb_progress_debug_reset_clock()
+RETURNS void
+AS '$libdir/pg_flashback', 'fb_progress_debug_reset_clock'
+LANGUAGE C;
+
 CREATE TABLE fb_progress_target (
 	id integer PRIMARY KEY,
 	note text
@@ -37,12 +47,38 @@ UPDATE fb_progress_target
 SET note = 'after-target'
 WHERE id = 1;
 
+SELECT fb_progress_debug_set_clock(ARRAY[
+	0,
+	1000,
+	3000,
+	6000,
+	10000,
+	15000,
+	21000,
+	28000,
+	36000,
+	45000,
+	55000,
+	66000,
+	78000,
+	91000,
+	105000,
+	120000,
+	136000,
+	153000,
+	171000,
+	190000,
+	210000
+]::bigint[]);
+
 SELECT *
 FROM pg_flashback(
 	NULL::public.fb_progress_target,
 	(SELECT target_ts::text FROM fb_progress_mark)
 )
 ORDER BY id;
+
+SELECT fb_progress_debug_reset_clock();
 
 SET pg_flashback.show_progress = off;
 

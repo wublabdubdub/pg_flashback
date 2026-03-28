@@ -89,9 +89,10 @@ FROM pg_flashback(
   - `keyed` 与 `bag` 两种查询执行模型
   - `pg_flashback(anyelement, text)` 真实 flashback 用户入口
 - 当前运行时已落地：
-  - `archive_dest + pg_wal + recovered_wal` 三路来源解析
+  - `archive_dest + archive_command autodiscovery + pg_wal + recovered_wal` 来源解析
   - 内嵌 `fb_ckwal`
-  - 查询级 `memory_limit_kb`
+  - 查询级 `memory_limit`
+  - 查询策略 `spill_mode`
   - `parallel_segment_scan`
   - 扩展私有目录自动初始化
 - 当前已经补齐：
@@ -143,7 +144,15 @@ FROM pg_flashback(
      - 保留全局 checkpoint 首锚点
      - 对缺页基线 block 采用共享的按-block 更早 FPI 回溯
      - 主表与 TOAST relation 统一走同一套补锚逻辑
-     - 若更早 WAL 中仍无可恢复页基线，则继续明确报错
+   - 若更早 WAL 中仍无可恢复页基线，则继续明确报错
+
+当前已拍板的 TOAST truncate 边界补充为：
+
+- 主表 truncate / rewrite / relfilenode 变化仍直接报错
+- standalone `STANDBY LOCK` 不再单独作为 flashback 阻塞条件
+- 仅对关联 TOAST relation 的 `SMGR TRUNCATE`，不再 relation 级直接拒绝
+- 当前实现允许继续 replay，并依赖历史 TOAST chunk store 重建目标值
+- 若目标历史 tuple 需要的 chunk 最终仍无法重建，继续明确报错
 
 ## 当前验证状态
 
@@ -214,11 +223,16 @@ FROM pg_flashback(
 ## 运行时前置配置
 
 - `pg_flashback.archive_dest`
-  - 当前首选归档来源配置
+  - 当前首选归档来源配置，优先级最高
 - `pg_flashback.archive_dir`
   - 当前保留为兼容回退配置
+- PostgreSQL 内核 `archive_command`
+  - 当 `pg_flashback.archive_dest` / `archive_dir` 都未设置时，当前会尝试自动推断本地归档目录
+  - 仅支持可安全识别的本地复制命令与本地 `pg_probackup archive-push`
+  - `archive_library` 非空或复杂命令时，不自动猜测，要求显式配置
 - 当前实现会同时解析：
   - `archive_dest`
+  - `archive_command` 自动推断出的 archive 目录
   - `pg_wal`
   - `recovered_wal`
 - 内嵌缺失 WAL 恢复目录固定为 `DataDir/pg_flashback/recovered_wal/`
@@ -244,8 +258,9 @@ FROM pg_flashback(
   - 首版物理内核依赖 checkpoint 后首次修改产生 FPI
   - 若无法从 checkpoint 锚点为目标 block 建立安全页基线，则直接报错
 
-- `pg_flashback.memory_limit_kb`
+- `pg_flashback.memory_limit`
   - 新增查询级内存硬上限
+  - 当前默认值固定为 `1048576KB`（1GB）
   - 用于限制当前查询内最重的几类结构：
     - `RecordRef` 数组
     - FPI image
@@ -254,7 +269,13 @@ FROM pg_flashback(
     - `BlockReplayStore` 中的 page state
   - 达到上限时直接报错，不做静默降级
   - 该上限当前是“热路径已跟踪内存”的硬限制，不等价于整个 backend 的总内存
+  - 当前之所以把默认值抬到 1GB，是因为 bounded spill 还没有完全覆盖 WAL 索引 / replay 主链
   - 后续若引入 spool / spill，则该 GUC 仍作为“内存层”上限保留
+
+- `pg_flashback.spill_mode`
+  - 控制当 preflight estimate 超出 `memory_limit` 时，是否允许继续走磁盘 spill
+  - `auto` / `memory` 会提前报错
+  - `disk` 允许继续使用当前 reverse-op spill 路径
 
 ## 外部参考
 
