@@ -214,6 +214,16 @@ fb_spool_read_exact(FbSpoolLog *log, void *data, size_t len, off_t offset)
 				 errdetail("path=%s: %m", log->path)));
 }
 
+static void
+fb_spool_append_raw_bytes(FbSpoolLog *log, const void *data, size_t len)
+{
+	if (log == NULL || data == NULL || len == 0)
+		return;
+
+	fb_spool_write_exact(log, data, len, log->size);
+	log->size += (off_t) len;
+}
+
 FbSpoolSession *
 fb_spool_session_create(void)
 {
@@ -261,6 +271,12 @@ fb_spool_session_destroy(FbSpoolSession *session)
 		fb_spool_remove_tree(session->dir);
 }
 
+const char *
+fb_spool_session_dir(const FbSpoolSession *session)
+{
+	return (session == NULL) ? NULL : session->dir;
+}
+
 FbSpoolLog *
 fb_spool_log_create(FbSpoolSession *session, const char *label)
 {
@@ -288,6 +304,82 @@ fb_spool_log_create(FbSpoolSession *session, const char *label)
 	return log;
 }
 
+FbSpoolLog *
+fb_spool_log_create_path(const char *path)
+{
+	FbSpoolLog *log;
+
+	if (path == NULL || path[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid fb spill log path")));
+
+	log = palloc0(sizeof(*log));
+	log->path = pstrdup(path);
+	log->file = PathNameOpenFile(log->path, O_CREAT | O_TRUNC | O_RDWR | PG_BINARY);
+	if (log->file < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create fb spill file"),
+				 errdetail("path=%s: %m", log->path)));
+
+	return log;
+}
+
+FbSpoolLog *
+fb_spool_log_open_readonly(const char *path, uint32 item_count)
+{
+	FbSpoolLog *log;
+	struct stat st;
+
+	if (path == NULL || path[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid fb spill log path")));
+
+	log = palloc0(sizeof(*log));
+	log->path = pstrdup(path);
+	log->file = PathNameOpenFile(log->path, O_RDONLY | PG_BINARY);
+	if (log->file < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open fb spill file"),
+				 errdetail("path=%s: %m", log->path)));
+	if (stat(log->path, &st) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not stat fb spill file"),
+				 errdetail("path=%s: %m", log->path)));
+
+	log->size = st.st_size;
+	log->item_count = item_count;
+	return log;
+}
+
+void
+fb_spool_log_close(FbSpoolLog *log)
+{
+	if (log == NULL)
+		return;
+
+	if (log->file >= 0)
+	{
+		FileClose(log->file);
+		log->file = -1;
+	}
+	if (log->path != NULL)
+		pfree(log->path);
+	if (log->anchors != NULL)
+		pfree(log->anchors);
+	pfree(log);
+}
+
+const char *
+fb_spool_log_path(const FbSpoolLog *log)
+{
+	return (log == NULL) ? NULL : log->path;
+}
+
 void
 fb_spool_log_append(FbSpoolLog *log, const void *data, uint32 len)
 {
@@ -304,6 +396,108 @@ fb_spool_log_append(FbSpoolLog *log, const void *data, uint32 len)
 						 log->size + sizeof(len) + len);
 	log->size += (off_t) sizeof(len) + (off_t) len + (off_t) sizeof(trailer);
 	log->item_count++;
+}
+
+void
+fb_spool_log_append_file(FbSpoolLog *dest, const char *path, uint32 item_count)
+{
+	File source;
+	char buf[1 << 20];
+	off_t source_size;
+	off_t offset = 0;
+	struct stat st;
+
+	if (dest == NULL || path == NULL || path[0] == '\0' || item_count == 0)
+		return;
+
+	if (stat(path, &st) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not stat fb spill file"),
+				 errdetail("path=%s: %m", path)));
+	source_size = st.st_size;
+	if (source_size <= 0)
+		return;
+
+	source = PathNameOpenFile(path, O_RDONLY | PG_BINARY);
+	if (source < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open fb spill file"),
+				 errdetail("path=%s: %m", path)));
+
+	PG_TRY();
+	{
+		while (offset < source_size)
+		{
+			size_t chunk = (size_t) Min((off_t) sizeof(buf), source_size - offset);
+
+			if (FileRead(source, buf, chunk, offset, WAIT_EVENT_BUFFILE_READ) != (int) chunk)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not read fb spill file"),
+						 errdetail("path=%s: %m", path)));
+			fb_spool_append_raw_bytes(dest, buf, chunk);
+			offset += (off_t) chunk;
+		}
+		dest->item_count += item_count;
+	}
+	PG_FINALLY();
+	{
+		FileClose(source);
+	}
+	PG_END_TRY();
+}
+
+void
+fb_spool_log_rebuild_anchors(FbSpoolLog *log)
+{
+	off_t offset = 0;
+	uint32 item_index = 0;
+
+	if (log == NULL || log->item_count == 0)
+		return;
+
+	if (log->anchors != NULL)
+	{
+		pfree(log->anchors);
+		log->anchors = NULL;
+	}
+	log->anchor_count = 0;
+	log->anchor_capacity = 0;
+
+	while (item_index < log->item_count)
+	{
+		uint32 len = 0;
+		uint32 suffix = 0;
+
+		if (item_index % FB_SPOOL_ANCHOR_STRIDE == 0)
+			fb_spool_append_anchor(log);
+
+		fb_spool_read_exact(log, &len, sizeof(len), offset);
+		offset += (off_t) sizeof(len) + (off_t) len;
+		fb_spool_read_exact(log, &suffix, sizeof(suffix), offset);
+		if (suffix != len)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("fb spill record length trailer mismatch"),
+					 errdetail("path=%s offset=%lld expected=%u actual=%u",
+							   log->path,
+							   (long long) (offset - sizeof(len) - len),
+							   len,
+							   suffix)));
+		offset += (off_t) sizeof(suffix);
+		item_index++;
+	}
+
+	if (offset != log->size)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("fb spill file size mismatch after rebuilding anchors"),
+				 errdetail("path=%s expected=%lld actual=%lld",
+						   log->path,
+						   (long long) log->size,
+						   (long long) offset)));
 }
 
 uint32

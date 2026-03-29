@@ -53,7 +53,8 @@ FROM pg_flashback(
 
 CREATE TABLE fb_custom_scan_probe (
 	result_count bigint NOT NULL,
-	temp_bytes_delta bigint NOT NULL
+	temp_bytes_delta bigint NOT NULL,
+	executor_growth_bytes bigint NOT NULL
 );
 
 DO $$
@@ -88,10 +89,51 @@ BEGIN
 	WHERE datname = current_database();
 
 	INSERT INTO fb_custom_scan_probe
-	VALUES (result_count, GREATEST(after_bytes - before_bytes, 0));
+	VALUES (result_count, GREATEST(after_bytes - before_bytes, 0), 0);
 END;
 $$;
 
 SELECT result_count = 20000 AS count_ok,
 	   temp_bytes_delta = 0 AS no_temp_spill
+FROM fb_custom_scan_probe;
+
+TRUNCATE fb_custom_scan_probe;
+
+DO $$
+DECLARE
+	cur refcursor;
+	before_bytes bigint;
+	after_bytes bigint;
+BEGIN
+	cur := 'fb_flashback_mem_cur';
+
+	OPEN cur FOR
+	SELECT *
+	FROM pg_flashback(
+		NULL::public.fb_custom_scan_target,
+		(SELECT target_ts::text FROM fb_custom_scan_mark)
+	);
+
+	MOVE FORWARD 1000 IN cur;
+
+	SELECT COALESCE(MAX(used_bytes), 0)
+	INTO before_bytes
+	FROM pg_get_backend_memory_contexts()
+	WHERE name = 'ExecutorState';
+
+	MOVE FORWARD 8000 IN cur;
+
+	SELECT COALESCE(MAX(used_bytes), 0)
+	INTO after_bytes
+	FROM pg_get_backend_memory_contexts()
+	WHERE name = 'ExecutorState';
+
+	CLOSE cur;
+
+	INSERT INTO fb_custom_scan_probe
+	VALUES (0, 0, GREATEST(after_bytes - before_bytes, 0));
+END;
+$$;
+
+SELECT executor_growth_bytes <= 2097152 AS bounded_executor_growth
 FROM fb_custom_scan_probe;

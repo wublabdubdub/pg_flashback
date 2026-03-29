@@ -10,7 +10,17 @@ SET pg_flashback.show_progress = off;
 CREATE TABLE fb_runtime_table (id integer);
 SELECT *
 FROM pg_flashback(NULL::public.fb_runtime_table, now()::text);
-ERROR:  neither pg_flashback.archive_dest nor legacy pg_flashback.archive_dir is set
+ id 
+----
+(0 rows)
+
+SELECT count(*)
+FROM pg_flashback(NULL::public.fb_runtime_table, now()::text);
+ count 
+-------
+     0
+(1 row)
+
 SET pg_flashback.archive_dir = '/__definitely_missing_pg_flashback_archive__';
 SELECT *
 FROM pg_flashback(NULL::public.fb_runtime_table, now()::text);
@@ -35,4 +45,3 @@ FROM pg_flashback(NULL::public.fb_runtime_table, now()::text);
  id 
 ----
 (0 rows)
-

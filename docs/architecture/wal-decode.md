@@ -81,7 +81,14 @@ WAL 层当前只做三件大事：
 - anchor：`anchor_checkpoint_lsn`、`anchor_redo_lsn`、`anchor_time`
 - 来源统计：`pg_wal_segment_count`、`archive_segment_count`、`ckwal_segment_count`
 - sidecar / hint：`anchor_hint_found`、`checkpoint_sidecar_entries`
-- 并行预筛选：`parallel_segment_scan_enabled`、`segment_prefilter_used`
+- 并行参数与命中窗口：`parallel_workers`、`segment_prefilter_used`
+
+当前口径补充：
+
+- `pg_flashback.parallel_workers` 是 flashback 主链总 worker 参数
+- `0` 表示串行，`> 0` 表示允许并行且参数值即 worker 上限
+- WAL 层内允许并行的阶段都受这个统一 worker 参数控制
+- 旧的 `pg_flashback.parallel_segment_scan` 已进入删除路径，不再作为长期参数口径
 
 ### `FbRecordRef`
 
@@ -165,6 +172,14 @@ WAL 层当前只做三件大事：
 ### 第三步：顺序扫描 record
 
 当前仍以 `XLogReader` 顺序读 record 为主。
+
+当前正式主路径已拆成两段：
+
+- metadata phase
+  - Phase A 可以按 window 并行，只收集 checkpoint / touched_xids / unsafe
+  - Phase B 固定由 leader 串行只扫 `RM_XACT_ID`，回填 `xid_statuses`
+- payload phase
+  - 在 anchor 已确定后，再按 payload window 物化 `RecordRef`
 
 这一步会：
 
@@ -253,7 +268,7 @@ WAL 层当前只做三件大事：
 
 开关：
 
-- `pg_flashback.parallel_segment_scan`
+- `pg_flashback.parallel_workers`
 
 ### 2. recent tail inline
 

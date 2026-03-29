@@ -2,7 +2,7 @@
 
 ## 状态
 
-Accepted
+Superseded by ADR-0016
 
 ## 决策
 
@@ -22,4 +22,3 @@ Accepted
 - 保证首版风险可控
 - 避免触发器、权限、RLS、副作用问题
 - 保持 `pg_flashback` 的查询型扩展定位
-

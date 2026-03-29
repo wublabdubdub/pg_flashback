@@ -53,6 +53,20 @@ typedef struct FbReplayStore
 	HTAB *blocks;
 } FbReplayStore;
 
+struct FbReplayDiscoverState
+{
+	HTAB *backtrack_blocks;
+	TupleDesc toast_tupdesc;
+};
+
+struct FbReplayWarmState
+{
+	FbReplayStore store;
+	FbToastStore *toast_store;
+	TupleDesc toast_tupdesc;
+	uint64 warm_tracked_bytes;
+};
+
 typedef enum FbReplayPhase
 {
 	FB_REPLAY_PHASE_DISCOVER = 1,
@@ -218,6 +232,21 @@ fb_replay_create_block_hash(void)
 
 	return hash_create("fb replay blocks", 128, &ctl,
 					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+static TupleDesc
+fb_replay_open_toast_tupdesc(const FbRelationInfo *info)
+{
+	Relation toast_rel;
+	TupleDesc toast_tupdesc = NULL;
+
+	if (info == NULL || !info->has_toast_locator || !OidIsValid(info->toast_relid))
+		return NULL;
+
+	toast_rel = relation_open(info->toast_relid, AccessShareLock);
+	toast_tupdesc = CreateTupleDescCopy(toast_rel->rd_att);
+	relation_close(toast_rel, AccessShareLock);
+	return toast_tupdesc;
 }
 
 /*
@@ -2207,6 +2236,7 @@ fb_replay_run_pass(const FbRelationInfo *info,
 				   FbReplayResult *result,
 				   FbReverseOpSource *source,
 				   FbPendingReverseOpQueue *pending_ops,
+				   uint32 start_record_index,
 				   XLogRecPtr lower_bound,
 				   XLogRecPtr upper_bound)
 {
@@ -2219,6 +2249,9 @@ fb_replay_run_pass(const FbRelationInfo *info,
 		progress_stride = Max((uint32) 1, index->record_count / 1024);
 
 	cursor = fb_wal_record_cursor_open(index, FB_SPOOL_FORWARD);
+	if (start_record_index > 0 &&
+		!fb_wal_record_cursor_seek(cursor, start_record_index))
+		elog(ERROR, "failed to seek WAL cursor to record %u", start_record_index);
 	while (fb_wal_record_cursor_read(cursor, &record, &record_index))
 	{
 		if (!XLogRecPtrIsInvalid(lower_bound) && record.lsn < lower_bound)
@@ -2346,6 +2379,7 @@ fb_replay_warm_store(const FbRelationInfo *info,
 	warm_control.missing_blocks = backtrack_blocks;
 	fb_replay_run_pass(info, index, NULL, toast_tupdesc, toast_store,
 					   store, &warm_control, result, NULL, NULL,
+					   min_anchor_index,
 					   warm_start, index->anchor_redo_lsn);
 	fb_progress_update_percent(FB_PROGRESS_STAGE_REPLAY_WARM, 100, NULL);
 }
@@ -2364,6 +2398,163 @@ fb_replay_init_result(const FbWalRecordIndex *index,
 	result->memory_limit_bytes = index->memory_limit_bytes;
 }
 
+FbReplayDiscoverState *
+fb_replay_discover(const FbRelationInfo *info,
+				   const FbWalRecordIndex *index)
+{
+	FbReplayDiscoverState *state;
+	uint32 iteration;
+
+	state = palloc0(sizeof(*state));
+	state->toast_tupdesc = fb_replay_open_toast_tupdesc(info);
+	state->backtrack_blocks = fb_replay_create_missing_block_hash();
+
+	for (iteration = 0; iteration < 8; iteration++)
+	{
+		MemoryContext discover_ctx;
+		MemoryContext oldctx;
+		FbReplayStore discover_store;
+		FbReplayControl discover_control;
+		FbReplayResult discover_result;
+		FbToastStore *discover_toast_store = NULL;
+		HTAB *iteration_missing;
+
+		discover_ctx = AllocSetContextCreate(CurrentMemoryContext,
+											 "fb replay discover",
+											 ALLOCSET_DEFAULT_SIZES);
+		oldctx = MemoryContextSwitchTo(discover_ctx);
+		MemSet(&discover_store, 0, sizeof(discover_store));
+		discover_store.blocks = fb_replay_create_block_hash();
+		if (state->toast_tupdesc != NULL)
+			discover_toast_store = fb_toast_store_create();
+		fb_replay_init_result(index, &discover_result);
+		MemoryContextSwitchTo(oldctx);
+
+		fb_replay_warm_store(info, index, state->toast_tupdesc, discover_toast_store,
+							 &discover_store, state->backtrack_blocks, &discover_result);
+
+		iteration_missing = fb_replay_create_missing_block_hash();
+		MemSet(&discover_control, 0, sizeof(discover_control));
+		discover_control.phase = FB_REPLAY_PHASE_DISCOVER;
+		discover_control.round_no = iteration + 1;
+		discover_control.missing_blocks = iteration_missing;
+		fb_replay_progress_enter(&discover_control);
+		fb_replay_run_pass(info, index, NULL, state->toast_tupdesc, discover_toast_store,
+						   &discover_store, &discover_control, &discover_result,
+						   NULL, NULL, 0, index->anchor_redo_lsn, InvalidXLogRecPtr);
+		{
+			char *detail = psprintf("round=%u", iteration + 1);
+
+			fb_progress_update_percent(FB_PROGRESS_STAGE_REPLAY_DISCOVER, 100, detail);
+			pfree(detail);
+		}
+
+		if (fb_replay_missing_block_count(iteration_missing) == 0)
+		{
+			hash_destroy(iteration_missing);
+			if (discover_toast_store != NULL)
+				fb_toast_store_destroy(discover_toast_store);
+			MemoryContextDelete(discover_ctx);
+			break;
+		}
+
+		fb_replay_resolve_missing_anchors(index, iteration_missing);
+		fb_replay_raise_unresolved_missing_fpi(index, iteration_missing);
+		fb_replay_merge_missing_blocks(state->backtrack_blocks, iteration_missing);
+		hash_destroy(iteration_missing);
+		if (discover_toast_store != NULL)
+			fb_toast_store_destroy(discover_toast_store);
+		MemoryContextDelete(discover_ctx);
+
+		if (iteration == 7)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("too many shared backtracking rounds while resolving missing FPI")));
+	}
+
+	return state;
+}
+
+void
+fb_replay_discover_destroy(FbReplayDiscoverState *state)
+{
+	if (state == NULL)
+		return;
+
+	if (state->backtrack_blocks != NULL)
+		hash_destroy(state->backtrack_blocks);
+	if (state->toast_tupdesc != NULL)
+		FreeTupleDesc(state->toast_tupdesc);
+	pfree(state);
+}
+
+FbReplayWarmState *
+fb_replay_warm(const FbRelationInfo *info,
+			   const FbWalRecordIndex *index,
+			   const FbReplayDiscoverState *discover,
+			   FbReplayResult *result)
+{
+	FbReplayWarmState *state;
+
+	state = palloc0(sizeof(*state));
+	state->toast_tupdesc = (discover != NULL) ? discover->toast_tupdesc : NULL;
+	state->store.blocks = fb_replay_create_block_hash();
+	fb_replay_init_result(index, result);
+	if (state->toast_tupdesc != NULL)
+		state->toast_store = fb_toast_store_create();
+
+	fb_progress_enter_stage(FB_PROGRESS_STAGE_REPLAY_WARM, NULL);
+	fb_replay_warm_store(info, index, state->toast_tupdesc, state->toast_store,
+						 &state->store,
+						 (discover != NULL) ? discover->backtrack_blocks : NULL,
+						 result);
+	state->warm_tracked_bytes = Max(index->tracked_bytes, result->tracked_bytes);
+	return state;
+}
+
+void
+fb_replay_warm_destroy(FbReplayWarmState *state)
+{
+	if (state == NULL)
+		return;
+
+	if (state->toast_store != NULL)
+		fb_toast_store_destroy(state->toast_store);
+	if (state->store.blocks != NULL)
+		hash_destroy(state->store.blocks);
+	pfree(state);
+}
+
+void
+fb_replay_final_build_reverse_source(const FbRelationInfo *info,
+									 const FbWalRecordIndex *index,
+									 TupleDesc tupdesc,
+									 const FbReplayWarmState *warm,
+									 FbReplayResult *result,
+									 FbReverseOpSource *source)
+{
+	FbReplayControl final_control;
+	FbPendingReverseOpQueue pending_ops;
+
+	if (warm == NULL)
+		elog(ERROR, "FbReplayWarmState must not be NULL");
+
+	fb_replay_init_result(index, result);
+	result->tracked_bytes = warm->warm_tracked_bytes;
+
+	MemSet(&final_control, 0, sizeof(final_control));
+	MemSet(&pending_ops, 0, sizeof(pending_ops));
+	final_control.phase = FB_REPLAY_PHASE_FINAL;
+	fb_replay_progress_enter(&final_control);
+	fb_replay_run_pass(info, index, tupdesc, warm->toast_tupdesc, warm->toast_store,
+					   (FbReplayStore *) &warm->store, &final_control, result,
+					   source, &pending_ops, 0, index->anchor_redo_lsn,
+					   InvalidXLogRecPtr);
+	fb_pending_reverse_op_flush(&pending_ops, info, tupdesc, warm->toast_store,
+								result, source);
+	fb_progress_update_percent(FB_PROGRESS_STAGE_REPLAY_FINAL, 100, NULL);
+}
+
 /*
  * fb_replay_execute_internal
  *    Replay helper.
@@ -2376,120 +2567,15 @@ fb_replay_execute_internal(const FbRelationInfo *info,
 						   FbReplayResult *result,
 						   FbReverseOpSource *source)
 {
-	FbReplayStore store;
-	FbToastStore *toast_store = NULL;
-	FbToastStore *discover_toast_store = NULL;
-	Relation toast_rel = NULL;
-	TupleDesc toast_tupdesc = NULL;
-	HTAB *backtrack_blocks;
-	uint32 iteration;
-	uint64 warm_tracked_bytes;
+	FbReplayDiscoverState *discover = NULL;
+	FbReplayWarmState *warm = NULL;
 
-	if (info->has_toast_locator && OidIsValid(info->toast_relid))
-	{
-		toast_rel = relation_open(info->toast_relid, AccessShareLock);
-		toast_tupdesc = CreateTupleDescCopy(toast_rel->rd_att);
-		relation_close(toast_rel, AccessShareLock);
-	}
-
-	backtrack_blocks = fb_replay_create_missing_block_hash();
-
-	for (iteration = 0; iteration < 8; iteration++)
-	{
-		MemoryContext discover_ctx;
-		MemoryContext oldctx;
-		FbReplayStore discover_store;
-		FbReplayControl discover_control;
-		FbReplayResult discover_result;
-		HTAB *iteration_missing;
-
-		discover_ctx = AllocSetContextCreate(CurrentMemoryContext,
-											 "fb replay discover",
-											 ALLOCSET_DEFAULT_SIZES);
-		oldctx = MemoryContextSwitchTo(discover_ctx);
-		MemSet(&discover_store, 0, sizeof(discover_store));
-		discover_store.blocks = fb_replay_create_block_hash();
-		if (toast_tupdesc != NULL)
-			discover_toast_store = fb_toast_store_create();
-		fb_replay_init_result(index, &discover_result);
-		MemoryContextSwitchTo(oldctx);
-
-		fb_replay_warm_store(info, index, toast_tupdesc, discover_toast_store,
-							 &discover_store, backtrack_blocks, &discover_result);
-
-		iteration_missing = fb_replay_create_missing_block_hash();
-		MemSet(&discover_control, 0, sizeof(discover_control));
-		discover_control.phase = FB_REPLAY_PHASE_DISCOVER;
-		discover_control.round_no = iteration + 1;
-		discover_control.missing_blocks = iteration_missing;
-		fb_replay_progress_enter(&discover_control);
-		fb_replay_run_pass(info, index, NULL, toast_tupdesc, discover_toast_store,
-						   &discover_store, &discover_control, &discover_result,
-						   NULL, NULL, index->anchor_redo_lsn, InvalidXLogRecPtr);
-		{
-			char *detail = psprintf("round=%u", iteration + 1);
-
-			fb_progress_update_percent(FB_PROGRESS_STAGE_REPLAY_DISCOVER, 100, detail);
-			pfree(detail);
-		}
-
-			if (fb_replay_missing_block_count(iteration_missing) == 0)
-			{
-				hash_destroy(iteration_missing);
-				if (discover_toast_store != NULL)
-					fb_toast_store_destroy(discover_toast_store);
-				discover_toast_store = NULL;
-				MemoryContextDelete(discover_ctx);
-				break;
-			}
-
-			fb_replay_resolve_missing_anchors(index, iteration_missing);
-			fb_replay_raise_unresolved_missing_fpi(index, iteration_missing);
-			fb_replay_merge_missing_blocks(backtrack_blocks, iteration_missing);
-			hash_destroy(iteration_missing);
-			if (discover_toast_store != NULL)
-				fb_toast_store_destroy(discover_toast_store);
-			discover_toast_store = NULL;
-			MemoryContextDelete(discover_ctx);
-
-		if (iteration == 7)
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("too many shared backtracking rounds while resolving missing FPI")));
-	}
-
-	MemSet(&store, 0, sizeof(store));
-	store.blocks = fb_replay_create_block_hash();
-	fb_replay_init_result(index, result);
-	if (toast_tupdesc != NULL)
-		toast_store = fb_toast_store_create();
-
-	fb_progress_enter_stage(FB_PROGRESS_STAGE_REPLAY_WARM, NULL);
-	fb_replay_warm_store(info, index, toast_tupdesc, toast_store,
-						 &store, backtrack_blocks, result);
-	warm_tracked_bytes = Max(index->tracked_bytes, result->tracked_bytes);
-	fb_replay_init_result(index, result);
-	result->tracked_bytes = warm_tracked_bytes;
-
-	{
-		FbReplayControl final_control;
-		FbPendingReverseOpQueue pending_ops;
-
-		MemSet(&final_control, 0, sizeof(final_control));
-		MemSet(&pending_ops, 0, sizeof(pending_ops));
-		final_control.phase = FB_REPLAY_PHASE_FINAL;
-		fb_replay_progress_enter(&final_control);
-		fb_replay_run_pass(info, index, tupdesc, toast_tupdesc, toast_store,
-						   &store, &final_control, result, source, &pending_ops,
-						   index->anchor_redo_lsn, InvalidXLogRecPtr);
-		fb_pending_reverse_op_flush(&pending_ops, info, tupdesc, toast_store,
-									result, source);
-		fb_progress_update_percent(FB_PROGRESS_STAGE_REPLAY_FINAL, 100, NULL);
-	}
-
-		if (toast_store != NULL)
-			fb_toast_store_destroy(toast_store);
-	}
+	discover = fb_replay_discover(info, index);
+	warm = fb_replay_warm(info, index, discover, result);
+	fb_replay_final_build_reverse_source(info, index, tupdesc, warm, result, source);
+	fb_replay_warm_destroy(warm);
+	fb_replay_discover_destroy(discover);
+}
 
 /*
  * fb_replay_execute

@@ -97,12 +97,16 @@ uint64 fb_get_memory_limit_bytes(void);
 
 FbSpillMode fb_get_spill_mode(void);
 const char *fb_spill_mode_name(FbSpillMode mode);
+int fb_runtime_retention_seconds(void);
+int fb_recovered_wal_retention_seconds(void);
+int fb_meta_retention_seconds(void);
 /*
- * fb_parallel_segment_scan_enabled
+ * fb_parallel_workers
  *    GUC API.
  */
 
-bool fb_parallel_segment_scan_enabled(void);
+int fb_parallel_workers(void);
+int fb_export_parallel_workers(void);
 /*
  * fb_show_progress_enabled
  *    GUC API.

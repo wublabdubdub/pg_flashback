@@ -1,6 +1,6 @@
 # STATUS.md
 
-## 当前代码口径（2026-03-26）
+## 当前代码口径（2026-03-29）
 
 - 当前版本支持目标已扩展为：
   - 源码/构建目标 `PG10-18`
@@ -9,17 +9,26 @@
 - 当前安装脚本只对外安装：
   - `fb_version()`
   - `fb_check_relation(regclass)`
+  - `pg_flashback_to(regclass, text)`
   - `pg_flashback(anyelement, text)`
 - 当前用户调用形态固定为：
+  - `SELECT pg_flashback_to('schema.table'::regclass, target_ts_text);`
   - `SELECT * FROM pg_flashback(NULL::schema.table, target_ts_text);`
 - 当前结果模型固定为：
-  - 不创建结果表
-  - 不返回结果表名
-  - 默认仍是直接查询型 SRF
-  - 扩展内部统一只走 `ValuePerCall`
-  - `FROM pg_flashback(...)` 已改由扩展自带 `CustomScan` 接管，不再走 PostgreSQL 默认 `FunctionScan -> tuplestore`
+  - `pg_flashback()`：
+    - 不创建结果表
+    - 不返回结果表名
+    - 默认仍是直接查询型 SRF
+    - 扩展内部统一只走 `ValuePerCall`
+    - `FROM pg_flashback(...)` 已改由扩展自带多节点 `CustomScan` 算子树接管，不再走 PostgreSQL 默认 `FunctionScan -> tuplestore`
+  - `pg_flashback_to()`：
+    - 直接修改原表，把原表回退到目标时间点
+    - 当前只支持 keyed + 单列稳定键
+    - 执行时拿 `AccessExclusiveLock`
+    - 当前检测到外键与用户触发器直接报错
 - 当前旧入口与旧中间层已删除：
   - `pg_flashback(text, text, text)`
+  - `pg_flashback_rewind(regclass, text)`
   - `fb_parallel`
   - `parallel_apply_workers`
   - 公开安装面的 `fb_flashback_materialize(...)`
@@ -40,15 +49,277 @@
   - `archive_dir` 兼容回退
   - `debug_pg_wal_dir`
   - `memory_limit`
+  - `runtime_retention`
+  - `recovered_wal_retention`
+  - `meta_retention`
   - `spill_mode`
-  - `parallel_segment_scan`
+  - `parallel_workers`
   - `show_progress`
   - 未显式设置 `archive_dest` 时，可按 PostgreSQL 内核 `archive_command` 自动推断本地归档目录
   - 自动初始化 `DataDir/pg_flashback/{runtime,recovered_wal,meta}`
+  - 会在运行时按目录类型做保洁：
+    - `runtime/`：清理死 backend 遗留的 `fbspill-*` 目录，并对超保留期遗留目录做兜底淘汰
+    - `recovered_wal/`：按保留期淘汰旧恢复段
+    - `meta/`：按保留期淘汰旧 prefilter / checkpoint sidecar
 - 当前 `pg_flashback()` 进度显示固定为 9 段：
   - stage `9` 已改为 residual 历史行发射
+- 开发期调试约定补充：
+  - 手工导出 / 保留 core dump、gdb 临时 core 文件时，统一使用 `/isoTest/tmp`
+  - 不再使用 `/tmp` 作为本项目的临时 core 落盘路径
 
 ## 本轮完成
+
+- 已修复两处 `pg_flashback()` 查询面 correctness / stability 问题：
+  - `FbApplyScan` 已改为把 apply 内部结果 copy 到 `ss_ScanTupleSlot` 后再返回
+  - 修复了“历史 residual 行参与上层表达式投影/排序时，CustomScan 直接返回内部 slot 导致 executor 读错 scan tuple 并崩溃”的问题
+  - 最小复现 `fb_delete_fpw_target`：
+    - 删除后查询 `SELECT id, length(pad) ... FROM pg_flashback(...) ORDER BY 1;` 不再触发 `SIGSEGV`
+    - 已恢复正确返回历史行
+  - keyed 单列 typed-key fast path 的单 key hash 现已与通用 keyed-entry hash 保持一致
+  - 修复了 `WHERE id = const` / `WHERE id IN (...)` 快路径漏命中 changed-key entry、误返回当前行或漏发已删除历史行的问题
+  - 用户 case `scenario_oa_12t_50000r.documents` 已确认：
+    - `target_ts='2026-03-29 20:00:13' AND id=10` 现已返回 `1` 行
+    - 反向 delete 对应 commit 时间为 `2026-03-29 22:42:32.744216+08`
+    - `target_ts='2026-03-29 22:40:13' AND id=10` 返回 `1` 行，`target_ts='2026-03-29 22:45:00' AND id=10` 返回 `0` 行，边界符合 WAL 事实
+  - 已补强回归：
+    - `fb_keyed_fast_path` 追加“deleted residual row + 表达式投影”检查
+    - `fb_flashback_hot_update_fpw` / `fb_custom_scan` 复跑通过
+
+- 已继续收敛 `FbApplyScan` 串行热路径：
+  - keyed 单列 typed key 的当前表扫描命中路径已改成 direct probe，不再每行都走 `Datum[]/bool[] + hash_combine + 通用 typed lookup`
+  - 单列 typed key 的 miss 负判定已升级为双 hash bloom 风格过滤，进一步减少“未变化 key”误入精确索引
+  - `FbApplyScan` 的 zero-copy 输出已改成“直接把真实结果 slot 交给 `ExecScan`”：
+    - 当前行原样返回时直接复用 scan slot
+    - replacement / residual 行回落到 apply 自有 relation slot
+    - 避免把 buffer heap tuple 强塞进 executor 的 virtual scan slot
+  - 当前在 `scenario_oa_12t_50000r.documents`、`parallel_workers=0`、`memory_limit='6GB'` 的 fresh 单 backend 观测中：
+    - stage `8 apply` 从上一轮观测约 `49.4s` 压到约 `29.2s`
+    - 当前已先拿到 apply 串行热路径上的显著收益
+
+- 已新增主链并行改造实施计划：
+  - 计划文件：`docs/superpowers/plans/2026-03-29-flashback-parallel-main-pipeline-plan.md`
+  - 固定分阶段顺序：
+    - Phase 1：`parallel_workers=0` 仍保留串行 prefilter 基线
+    - Phase 2：WAL payload / materialize pass 并行
+    - Phase 3：WAL metadata 两段式并行
+    - Phase 4：replay / reverse-source 分片并行
+    - Phase 5：apply 通用并行
+  - 当前所有阶段都必须保持：
+    - 相同的 `anchor`
+    - 相同的 `unsafe`
+    - 相同的 `xid_statuses`
+    - 相同的 `RecordRef` 语义
+    - 相同的最终历史结果
+
+- 已拍板将 flashback 主链并行控制统一收口为：
+  - 新参数固定为 `pg_flashback.parallel_workers`
+  - 语义固定为：
+    - `0`：flashback 主链强制串行
+    - `> 0`：允许 flashback 主链进入并行实现，参数值即并行 worker 上限
+    - `< 0`：非法
+  - 旧的 `pg_flashback.parallel_segment_scan` 将删除，不再保留兼容
+  - 当前不改变 `pg_flashback.export_parallel_workers` 的 keyed 导出 worker 语义
+  - 当前并行改造目标固定为 flashback 主链中“可在不改变语义前提下并行”的阶段：
+    - resolver / sidecar
+    - WAL segment prefilter
+    - WAL metadata scan
+    - WAL payload / materialize
+  - 当前明确不做：
+    - 单条 `XLogReader` 顺序流内部并行
+    - `pg_flashback_to` keyed 导出 worker 体系改口到新总开关
+  - 决策记录：`docs/decisions/ADR-0017-unified-flashback-parallel-switch.md`
+
+- 已完成 flashback 并行控制第一阶段落地：
+  - `pg_flashback.parallel_workers` 已进入代码与回归
+  - `pg_flashback.parallel_segment_scan` 已从正式 GUC 面删除
+  - 现有 WAL segment prefilter 已切到统一 worker 参数
+  - `pg_wal` 段身份校验已增加安全的文件级并行
+  - checkpoint sidecar anchor hint 扫描已增加安全的文件级并行
+  - `pg_flashback_to` export worker 当前会继承新的 `parallel_workers` 会话值，但不受其 worker 启停语义接管
+  - 当前仍未完成：
+    - replay / reverse-source 的主路径并行
+    - apply 的主路径并行
+
+- 已完成主链并行 Phase 1：
+  - `parallel_workers=0` 不再关闭 prefilter，而是保留串行 prefilter 基线
+  - 当前 `parallel_workers` 只决定 worker fanout 数，不再决定 prefilter 是否启用
+  - `fb_recordref_debug` 已追加：
+    - `parallel=on|off`
+    - `prefilter=on|off`
+    - `visited_segments=x/y`
+  - 活跃回归 `fb_recordref` / `fb_wal_sidecar` 已覆盖默认 `parallel=off + prefilter=on`
+
+- 已完成 `DataDir/pg_flashback/*` 目录删除机制首版：
+  - 新增 GUC：
+    - `pg_flashback.runtime_retention`
+    - `pg_flashback.recovered_wal_retention`
+    - `pg_flashback.meta_retention`
+  - 默认策略固定为：
+    - `runtime_retention = 1d`
+    - `recovered_wal_retention = 7d`
+    - `meta_retention = 7d`
+  - 当前删除口径：
+    - `runtime/`：
+      - 死 backend 遗留的 `fbspill-*` 目录会被自动清理
+      - 其余遗留目录/文件在超过 `runtime_retention` 后做兜底清理
+      - 活跃 backend 对应的 `fbspill-*` 目录不按 age 误删
+    - `recovered_wal/`：
+      - 超过 `recovered_wal_retention` 的旧恢复段自动删除
+    - `meta/`：
+      - 超过 `meta_retention` 的旧 sidecar 自动删除
+  - 当前 cleanup 节流口径：
+    - 同一 backend 至多每 `60s` 扫一次目录
+    - 回归专用 debug 入口可强制触发 cleanup
+  - 当前已补验证：
+    - `fb_guc_defaults`
+    - `fb_runtime_cleanup`（手工逐条执行确认旧文件删除、新文件保留）
+
+## 当前进行中
+
+- 目标回归当前状态：
+  - `fb_keyed_fast_path`
+  - `fb_flashback_hot_update_fpw`
+  - `fb_custom_scan`
+  - 逻辑输出已对齐；当前 `installcheck` 仅剩 `expected/fb_keyed_fast_path.out` 文件末尾空白尾行格式差异，非结果内容差异
+- flashback 主链并行改造当前处于：
+  - Phase 2 已进入稳定增益阶段
+  - Phase 3 prototype 已回收，等待更低开销实现
+  - Phase 5 prototype 继续关闭
+  - apply 串行热路径继续收敛中，下一步是在无干扰环境下补稳态复测，并继续压 residual / stage 9 尾段
+- Phase 2 当前正式主路径：
+  - WAL payload / materialize 并行已经进入稳定主路径
+  - 当前实现固定为：
+    - 进程级 payload worker
+    - leader 共享 resolved segment snapshot，去掉 worker 侧重复 resolver/prepare
+    - worker 本地 spool，leader 按 window/LSN 顺序 merge
+    - raw spool file merge + anchor rebuild，减少 leader 二次解帧开销
+    - 对连续大 payload window 再按 segment 切分，提高 worker 利用率
+    - 切分窗口采用“reader overlap + logical emit boundary”模型，避免跨 segment record 丢失
+  - 已新增自动化回归 `fb_wal_parallel_payload`
+  - 合同固定为：
+    - 多 payload window 下串行/并行核心摘要一致
+    - `payload_windows` 与 `payload_parallel_workers` 可观测
+    - `pg_flashback(...)` 串行/并行结果集 diff 为 `0`
+  - 当前 live case 结果：
+    - `scenario_oa_12t_50000r.documents`
+    - `parallel_workers=8` 时 `payload_windows=10 payload_parallel_workers=5`
+    - `FbWalIndexScan` 从约 `41.0s` 压到约 `19.8s`
+    - 同环境 `parallel_workers=0` 对照约 `28.8s`
+    - 总时长从约 `75.5s` 压到约 `66.0s`
+- Phase 3 当前状态：
+  - WAL metadata 两段式并行 prototype 仍保留在代码里，但当前保持关闭
+  - 关闭原因固定为：
+    - live case 上额外 metadata worker 启停 + 二次 `RM_XACT_ID` fill 开销未打赢串行基线
+  - 已保留的工作成果：
+    - `fb_recordref` safe/unsafe 串并行合同回归
+    - touched/unsafe/xid_status 收敛路径验证
+  - 当前正式主路径仍然使用 metadata 串行扫描
+- Phase 5 当前状态：
+  - 已做过 keyed query-side apply 并行 prototype
+  - 方案是 shared reverse-source + parallel table scan + per-worker tuple spool + leader residual merge
+  - 当前已补齐并固定：
+    - SRF / CustomScan 两条 query 路径都会在 apply 并行候选下构建 shareable reverse-source
+    - worker 不再强制 `force_string_keys=true`
+    - leader 已支持 typed seen-key merge
+    - apply worker 数已收口到 `parallel_workers / max_parallel_workers_per_gather / max_worker_processes` 的安全上限，并在 worker 申请失败时回退串行
+    - 当前已新增大表保护阈值，超出阈值的 relation 暂不进入 apply 并行，避免 live case 被未成熟模型拖慢
+  - 当前 correctness 路径已打通，并新增 `fb_apply_parallel` 回归覆盖：
+    - `fb_apply_debug(...)` 可观测 `apply_parallel=on`
+    - keyed + 单列 typed key 串并行结果集 diff 为 `0`
+  - 但 live case 仍未打赢稳定基线
+  - 当前正式主路径也仍保持关闭，不进入默认稳定路径
+  - 当前已确定下一轮收敛方向：
+    - 第一阶段只继续收敛 keyed + 单列 typed key 的 apply 并行
+    - 串行 apply 热路径已先补：
+      - direct single-typed probe
+      - bloom 风格 negative filter
+      - CustomScan raw slot return
+    - 当前 live case 的主要瓶颈已确认是“per-worker tuple spool + leader 回读”的文件传输模型
+    - 下一轮优先把 worker -> leader tuple 结果传输改成基于 `shm_mq` 的流式模型，seen-key 先继续保留小 spool
+    - 再评估是否继续保留 tuple spool 兜底
+  - 当前仍待补：
+    - 更广 live/deep 对比，确认 Phase 2 收益稳定
+    - 重新设计 Phase 3，避免 worker 启停和额外 WAL pass 抵消收益
+    - 重新设计低开销 Phase 5，消除“全量物化当前历史结果再回读”这类会拖慢通用 SQL 的方案
+  - 当前本机回归还存在一个与本轮无关的已观测 blocker：
+    - 某些 `pg_flashback()` 查询会在 `fb_apply_next_output_slot()` 上因 `slot=NULL` 崩溃
+    - coredump 栈落点：
+      - `src/fb_apply.c`
+      - `src/fb_custom_scan.c`
+    - 该问题会干扰 `fb_runtime_gate` / `fb_user_surface` 这类会实际执行 `pg_flashback()` 的回归
+
+- 已完成将 `FROM pg_flashback(...)` 从单个 `Custom Scan (FbFlashbackScan)` 拆成可观测的多节点算子树：
+  - 当前目标计划树固定为：
+    - `FbApplyScan`
+    - `FbReverseSourceScan`
+    - `FbReplayFinalScan`
+    - `FbReplayWarmScan`
+    - `FbReplayDiscoverScan`
+    - `FbWalIndexScan`
+  - 目标是让用户在 `EXPLAIN ANALYZE` 下直接看到 WAL / replay / reverse / apply 各段耗时
+  - 不改变公开 SQL 入口，只重构 `FROM pg_flashback(...)` 的 planner / executor 内部结构
+  - 当前 `EXPLAIN (VERBOSE, COSTS OFF)` 已可稳定展开整棵多节点树
+  - 当前手工 `EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, SUMMARY OFF)` 已确认每个节点都有独立 `actual time`
+  - `fb_custom_scan` / `fb_keyed_fast_path` 回归已同步切到新的 plan 基线
+  - 设计稿：`docs/superpowers/specs/2026-03-29-multi-custom-scan-explain-design.md`
+  - 实施计划：`docs/superpowers/plans/2026-03-29-multi-custom-scan-explain-plan.md`
+  - 决策记录：`docs/decisions/ADR-0014-custom-operator-tree-for-explain-analyze.md`
+
+- 已将原表闪回公开入口统一收口为 `pg_flashback_to(regclass, text)`：
+  - 当前定位固定为“大表 keyed 全表闪回优先走原表回退，而不是导出新表”
+  - 当前范围固定为：
+    - 仅 keyed relation
+    - 仅单列稳定键
+    - 执行时拿 `AccessExclusiveLock`
+    - 当前检测到外键或用户触发器直接报错
+  - 当前实现方向固定为：
+    - 只构建一次 `ReverseOpSource`
+    - keyed apply 只汇总变化 key 在目标时间点的终态
+    - 不再扫描当前整表
+    - 通过“批量 update existing + insert missing + delete removed”直接改写原表
+  - 旧的 `pg_flashback_rewind(regclass, text)` 名称已删除
+  - 旧的持久表导出公开入口已下线，不再对外安装
+  - 当前新增回归口径：
+    - `fb_flashback_to`
+    - `fb_user_surface`
+    - `fb_flashback_keyed`
+  - 已补齐 keyed 主键变化场景的原表回退回归
+  - 已修复 guard 检查中的 backend SIGSEGV：
+    - 根因是 `fb_rewind_spi_relation_flag()` 将 `NULL` 传给 `SPI_getbinval(..., isnull)`
+    - PG18 下会在 `fastgetattr()` 解引用空指针
+    - 现已改为传入有效 `bool isnull`
+  - 决策记录：`docs/decisions/ADR-0016-pg-flashback-rewind-inplace.md`
+
+- 已完成 keyed fast path：
+  - 目标统一覆盖三类高收益查询：
+    - `WHERE 主键 = const`
+    - `WHERE 主键 IN (const, ...)`
+    - `ORDER BY 主键/稳定唯一键 ASC|DESC LIMIT N`
+  - 第一阶段范围固定为：
+    - 仅 keyed relation
+    - 仅单列稳定主键/唯一键
+    - 不安全或无法证明正确的场景自动回退到现有全量 flashback 路径
+  - planner / `CustomScan` / apply 当前共享一份内部 `FbFastPathSpec`
+  - `WHERE 主键 = const` 与 `WHERE 主键 IN (...)` 已切到主键索引点查，不再扫当前整表
+  - `ORDER BY 主键 ... LIMIT N` 已切到主键索引有序扫描 + residual merge + 早停
+  - `EXPLAIN` 会在 `Custom Scan (FbFlashbackScan)` 下直接显示 `Fast Path: key_eq|key_in|key_topn`
+  - 已修复 live case `ORDER BY id DESC LIMIT N` 在 `key_topn` 路径上的 backend SIGSEGV：
+    - 根因是 `index_beginscan(..., 0, 0)` 后漏掉 `index_rescan(..., NULL, 0, NULL, 0)`
+    - btree no-key backward scan 会带着未初始化扫描态进入 `index_getnext_slot()`，最终崩在 `_bt_start_array_keys()`
+    - 现已补齐初始化；`scenario_oa_12t_50000r.documents ORDER BY id DESC LIMIT 50` live 复测可稳定返回
+  - 新增回归 `fb_keyed_fast_path`
+  - 设计稿：`docs/superpowers/specs/2026-03-29-keyed-fast-path-design.md`
+  - 实施计划：`docs/superpowers/plans/2026-03-29-keyed-fast-path-plan.md`
+  - 决策记录：`docs/decisions/ADR-0012-keyed-fast-path-for-point-set-topn.md`
+
+- 已完成 `CustomScan` 输出内存模型修复：
+  - `FROM pg_flashback(...)` 现有大内存 live case 已确认不是 `pgsql_tmp`，而是 `CustomScan` 输出链路经由 `Datum -> ExecStoreHeapTupleDatum()` 造成 `ExecutorState` 线性膨胀
+  - 当前 `fb_apply` 新增 slot-native 输出路径，`fb_entry` 暴露 `fb_flashback_query_next_slot()`，`fb_custom_scan` 不再经过 `ExecStoreHeapTupleDatum()`
+  - 新增 `fb_custom_scan` 游标回归，直接用 `pg_get_backend_memory_contexts()` 校验继续 `FETCH` 时 `ExecutorState` 不再线性增长
+  - live 复测 `scenario_oa_12t_50000r.documents order by id desc limit 10` 时，backend RSS 约在 `2.1GB` 左右封顶，不再继续爬升到 `5GB+ / 10GB+`
+  - 本轮仍未实现 `ORDER BY/LIMIT` 下推，剩余内存主要反映 flashback 工作集与上层必须等待完整输入的排序语义
+  - 设计稿：`docs/superpowers/specs/2026-03-29-customscan-slot-native-output-design.md`
+  - 实施计划：`docs/superpowers/plans/2026-03-29-customscan-slot-native-output-plan.md`
 
 - 已完成 `FROM pg_flashback(...)` 的 temp-file 根修：
   - 新增 `fb_custom_scan` 模块，通过 planner hook + `CustomScan` 接管 `RTE_FUNCTION`
@@ -198,7 +469,13 @@
 
 - `make PG_CONFIG=/home/18pg/local/bin/pg_config clean`：通过
 - `make PG_CONFIG=/home/18pg/local/bin/pg_config install`：通过
+- `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_flashback_to pg_flashback fb_user_surface fb_flashback_keyed'`：`All 4 tests passed.`
+- `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_keyed_fast_path fb_custom_scan fb_flashback_keyed pg_flashback'`：`All 4 tests passed.`
 - `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_custom_scan fb_value_per_call fb_guc_defaults pg_flashback fb_user_surface fb_progress fb_preflight fb_memory_limit fb_spill fb_toast_flashback'`：`All 10 tests passed.`
+- `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_custom_scan fb_keyed_fast_path fb_value_per_call pg_flashback'`：`All 4 tests passed.`
+- `psql -h /tmp -p 5832 -U 18pg postgres` 手工 `EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, SUMMARY OFF)`：
+  - 已确认 `FbApplyScan -> FbReverseSourceScan -> FbReplayFinalScan -> FbReplayWarmScan -> FbReplayDiscoverScan -> FbWalIndexScan`
+  - 已确认每个节点都显示独立 `actual time`
 - `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_value_per_call pg_flashback fb_user_surface fb_progress'`：`All 4 tests passed.`
 - `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_flashback_keyed fb_flashback_bag fb_toast_flashback fb_memory_limit fb_spill fb_preflight'`：`All 6 tests passed.`
 - `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_guc_defaults fb_memory_limit fb_spill'`：`All 3 tests passed.`
@@ -265,20 +542,26 @@
 
 - [x] `pg_flashback.memory_limit` 用户侧 rename 与 `32GB` 上限收敛
 - [x] `pg_flashback.spill_mode` 与 preflight 内存/磁盘选择
+- [x] `pg_flashback_to` 已收口为唯一原表闪回入口，并完成公开安装面/回归/文档迁移
+- [x] 全量 `installcheck` 已按当前工作区重跑通过
 - `PG10/11` 环境级正式复验
 - batch B / residual `missing FPI` 收敛
 - `fb_export_undo`
 - WAL 索引 / replay 主链继续向 bounded spill 演进
 - 更多 PG18 heap WAL 与主键变化正确性补齐
-- install / installcheck / deep 级别验证尚未按本轮恢复后的代码重新补跑
+- deep 级别验证尚未按本轮接口收口后重新补跑
 - 当前可继续恢复 / 对照的稳定临时树为：
   - `/tmp/pgfb_stageA_clean`
   - `/tmp/pgfb_exact_probe`
 
 ## 下一步
 
+- 继续评估是否要把 `validate` / `prepare wal` 进一步拆成更细的 explain 节点
+- 观察多节点 `CustomScan` 树在更大时间窗和 deep case 下的 `EXPLAIN ANALYZE` 可读性与稳定性
 - 观察首次 `2026-03-28 01:00 CST` 自动提交结果，确认日志与推送行为符合预期
 - 在具备环境后补齐 `PG10/11` 的正式编译/回归复验
+- 补齐 `pg_flashback_to` 在 sequence / serial default 场景下的独立化与边界验证
+- 继续清理旧持久表导出路径的剩余死代码与历史文档
 - 继续补更多 `archive_command` 本地模式的自动识别与诊断输出
 - 继续处理 deep pilot batch B blocker
 - 评估大 live case 在默认 `memory_limit=65536` 下的 bounded spill / 内存收敛路径

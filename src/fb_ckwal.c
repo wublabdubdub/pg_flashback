@@ -5,11 +5,13 @@
 
 #include "postgres.h"
 
+#include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "access/xlog_internal.h"
 #include "common/file_perm.h"
+#include "miscadmin.h"
 #include "storage/copydir.h"
 #include "storage/fd.h"
 #include "utils/elog.h"
@@ -155,17 +157,30 @@ static bool
 fb_ckwal_copy_file(const char *src_path, const char *dst_path)
 {
 	struct stat st;
+	char temp_path[MAXPGPATH];
 
 	if (stat(src_path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
 		return false;
 
-	if (stat(dst_path, &st) == 0)
+	if (stat(dst_path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0)
+		return true;
+
+	snprintf(temp_path, sizeof(temp_path), "%s.tmp.%d", dst_path, MyProcPid);
+	(void) unlink(temp_path);
+	copy_file(src_path, temp_path);
+
+	if (stat(temp_path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
+		return false;
+
+	if (rename(temp_path, dst_path) != 0)
 	{
-		if (unlink(dst_path) != 0)
+		int save_errno = errno;
+
+		(void) unlink(temp_path);
+		if (save_errno != EEXIST)
 			return false;
 	}
 
-	copy_file(src_path, dst_path);
 	if (stat(dst_path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
 		return false;
 

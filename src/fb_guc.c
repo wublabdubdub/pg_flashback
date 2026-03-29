@@ -29,7 +29,11 @@ static char *fb_memory_limit_setting = NULL;
 static char *fb_spill_mode_setting = NULL;
 static uint64 fb_memory_limit_kb = UINT64CONST(1048576);
 static FbSpillMode fb_spill_mode = FB_SPILL_MODE_AUTO;
-static bool fb_parallel_segment_scan = false;
+static int	fb_parallel_workers_setting = 0;
+static int	fb_export_parallel_workers_setting = 0;
+static int	fb_runtime_retention_setting = 24 * 60 * 60;
+static int	fb_recovered_wal_retention_setting = 7 * 24 * 60 * 60;
+static int	fb_meta_retention_setting = 7 * 24 * 60 * 60;
 static bool fb_show_progress = true;
 
 #define FB_MEMORY_LIMIT_GUC_NAME "pg_flashback.memory_limit"
@@ -148,16 +152,70 @@ _PG_init(void)
 							   fb_spill_mode_assign_hook,
 							   NULL);
 
-	DefineCustomBoolVariable("pg_flashback.parallel_segment_scan",
-							 "Enable segment-level parallel prefiltering before ordered WAL parsing.",
-							 "When on, pg_flashback performs a conservative segment hit prefilter before the final ordered XLogReader pass.",
-							 &fb_parallel_segment_scan,
-							 false,
-							 PGC_USERSET,
-							 0,
-							 NULL,
-							 NULL,
-							 NULL);
+	DefineCustomIntVariable("pg_flashback.runtime_retention",
+							"Retention window for stale pg_flashback runtime spill directories.",
+							"Applies to DataDir/pg_flashback/runtime. Dead backend fbspill directories are cleaned automatically; this setting also removes old leftover entries after the configured age. Set to 0 to disable age-based runtime cleanup.",
+							&fb_runtime_retention_setting,
+							24 * 60 * 60,
+							0,
+							30 * 24 * 60 * 60,
+							PGC_USERSET,
+							GUC_UNIT_S,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_flashback.recovered_wal_retention",
+							"Retention window for recovered WAL copies in DataDir/pg_flashback/recovered_wal.",
+							"Recovered WAL segments older than this age are deleted during pg_flashback runtime initialization. Set to 0 to disable recovered_wal age cleanup.",
+							&fb_recovered_wal_retention_setting,
+							7 * 24 * 60 * 60,
+							0,
+							30 * 24 * 60 * 60,
+							PGC_USERSET,
+							GUC_UNIT_S,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_flashback.meta_retention",
+							"Retention window for cached metadata sidecars in DataDir/pg_flashback/meta.",
+							"Prefilter and checkpoint sidecars older than this age are deleted during pg_flashback runtime initialization. Set to 0 to disable meta age cleanup.",
+							&fb_meta_retention_setting,
+							7 * 24 * 60 * 60,
+							0,
+							30 * 24 * 60 * 60,
+							PGC_USERSET,
+							GUC_UNIT_S,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_flashback.parallel_workers",
+							"Control flashback-stage parallel worker count where the implementation supports parallel execution.",
+							"When 0, the flashback pipeline stays serial. When greater than 0, pg_flashback may run safe flashback stages in parallel up to the configured worker count.",
+							&fb_parallel_workers_setting,
+							0,
+							0,
+							16,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_flashback.export_parallel_workers",
+							"Enable keyed-only parallel workers for pg_flashback_to.",
+							"When greater than 1, keyed single-column relations may use independent export workers and a finalizer to build the flashback table.",
+							&fb_export_parallel_workers_setting,
+							0,
+							0,
+							8,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
 
 	DefineCustomBoolVariable("pg_flashback.show_progress",
 							 "Show pg_flashback stage progress via NOTICE messages.",
@@ -385,15 +443,39 @@ fb_spill_mode_name(FbSpillMode mode)
 	}
 }
 
+int
+fb_runtime_retention_seconds(void)
+{
+	return fb_runtime_retention_setting;
+}
+
+int
+fb_recovered_wal_retention_seconds(void)
+{
+	return fb_recovered_wal_retention_setting;
+}
+
+int
+fb_meta_retention_seconds(void)
+{
+	return fb_meta_retention_setting;
+}
+
 /*
- * fb_parallel_segment_scan_enabled
+ * fb_parallel_workers
  *    GUC entry point.
  */
 
-bool
-fb_parallel_segment_scan_enabled(void)
+int
+fb_parallel_workers(void)
 {
-	return fb_parallel_segment_scan;
+	return fb_parallel_workers_setting;
+}
+
+int
+fb_export_parallel_workers(void)
+{
+	return fb_export_parallel_workers_setting;
 }
 
 /*

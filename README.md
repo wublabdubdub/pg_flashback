@@ -1,14 +1,19 @@
 # pg_flashback
 
-`pg_flashback` 是一个 PostgreSQL 只读历史查询扩展，用于直接查询业务表在过去某个时间点的结果集。
+`pg_flashback` 是一个 PostgreSQL 历史查询与原表闪回扩展，用于查询业务表过去某个时间点的结果集，或直接把 keyed 原表回退到目标时间点。
 
 它面向的典型场景是：
 
 - 排查误更新、误删除后的历史状态
 - 对账、审计、取证
-- 在不恢复整库、不改业务表的前提下查看历史结果
+- 在不恢复整库的前提下查看历史结果或回退单表
 
-当前安装包对外提供的能力是“历史结果集查询”。扩展保持严格只读，不会自动执行 undo SQL，也不会改写业务表。
+当前安装包对外提供两类能力：
+
+- `pg_flashback(anyelement, text)`：不落地的历史结果集查询
+- `pg_flashback_to(regclass, text)`：直接改写 keyed 原表，把它回退到目标时间点
+
+扩展不会自动执行 undo SQL，但 `pg_flashback_to()` 会真实改写业务表。
 
 ## 版本支持
 
@@ -30,9 +35,17 @@
 
 - `fb_version()`
 - `fb_check_relation(regclass)`
+- `pg_flashback_to(regclass, text)`
 - `pg_flashback(anyelement, text)`
 
-其中真正的客户入口是：
+其中两个客户入口分别是：
+
+```sql
+SELECT pg_flashback_to(
+  'public.orders'::regclass,
+  '2026-03-26 10:00:00+08'
+);
+```
 
 ```sql
 SELECT *
@@ -47,12 +60,19 @@ FROM pg_flashback(
 - 第一个参数：目标表的复合类型锚点，固定写法 `NULL::schema.table`
 - 第二个参数：目标时间点，`text`
 
-这个接口的目标是：
+`pg_flashback()` 的目标是：
 
 - 不要求手写 `AS t(...)`
 - 不要求手写 `::regclass`
 - 不要求手写 `::timestamptz`
 - 直接返回结果集，不创建结果表
+
+`pg_flashback_to()` 的限制是：
+
+- 只支持 keyed relation
+- 当前只支持单列稳定键
+- 执行时会拿 `AccessExclusiveLock`
+- 检测到外键或用户触发器直接报错
 
 ## 安装
 
@@ -168,9 +188,19 @@ SET pg_flashback.show_progress = off;
 - `disk`
   - 允许继续走当前的 spool / spill 路径
 
-### `pg_flashback.parallel_segment_scan`
+### `pg_flashback.parallel_workers`
 
-控制 WAL segment 级预筛选是否并行执行。属于高级调优项，默认是否开启请结合你的实例负载评估。
+控制整个 flashback 主链允许使用的并行 worker 数。
+
+- `0`
+  - 默认值
+  - flashback 主链强制串行
+- `1..16`
+  - 允许 flashback 主链在当前已实现的安全阶段使用并行
+  - 参数值即并行 worker 上限；实际使用数仍不会超过可分任务数
+
+`pg_flashback.parallel_workers` 只接管 flashback 主链，不接管
+`pg_flashback.export_parallel_workers`。
 
 ### `pg_flashback.show_progress`
 

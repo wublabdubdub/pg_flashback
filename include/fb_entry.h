@@ -7,8 +7,19 @@
 #define FB_ENTRY_H
 
 #include "fb_common.h"
+#include "fb_reverse_ops.h"
+#include "fb_spool.h"
 
 typedef struct FbFlashbackQueryState FbFlashbackQueryState;
+typedef struct TupleTableSlot TupleTableSlot;
+
+typedef struct FbFlashbackReverseBuildState
+{
+	FbRelationInfo info;
+	TupleDesc tupdesc;
+	FbSpoolSession *spool;
+	FbReverseOpSource *reverse;
+} FbFlashbackReverseBuildState;
 
 /*
  * fb_version
@@ -41,9 +52,17 @@ Datum fb_export_undo(PG_FUNCTION_ARGS);
  */
 
 FbFlashbackQueryState *fb_flashback_query_begin(Oid source_relid,
-												text *target_ts_text);
+												text *target_ts_text,
+												const FbFastPathSpec *fast_path);
+void fb_flashback_build_reverse_state(Oid source_relid,
+									  text *target_ts_text,
+									  bool shareable_reverse,
+									  FbFlashbackReverseBuildState *state);
+void fb_flashback_release_reverse_state(FbFlashbackReverseBuildState *state);
 bool fb_flashback_query_next_datum(FbFlashbackQueryState *state,
 								   Datum *result);
+bool fb_flashback_query_next_slot(FbFlashbackQueryState *state,
+								  TupleTableSlot *slot);
 TupleDesc fb_flashback_query_tupdesc(FbFlashbackQueryState *state);
 void fb_flashback_query_finish(FbFlashbackQueryState *state);
 void fb_flashback_query_abort(FbFlashbackQueryState *state);

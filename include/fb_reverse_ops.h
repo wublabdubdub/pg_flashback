@@ -63,12 +63,19 @@ FbReverseOpSource *fb_reverse_source_create(FbSpoolSession *session,
 											 uint64 memory_limit_bytes);
 void fb_reverse_source_append(FbReverseOpSource *source, const FbReverseOp *op);
 void fb_reverse_source_finish(FbReverseOpSource *source);
+void fb_reverse_source_materialize(FbReverseOpSource *source);
 void fb_reverse_source_destroy(FbReverseOpSource *source);
 uint64 fb_reverse_source_tracked_bytes(const FbReverseOpSource *source);
 uint64 fb_reverse_source_memory_limit_bytes(const FbReverseOpSource *source);
 uint64 fb_reverse_source_total_count(const FbReverseOpSource *source);
+Size fb_reverse_source_shared_size(const FbReverseOpSource *source);
+void fb_reverse_source_write_shared(const FbReverseOpSource *source,
+									void *dest,
+									Size dest_size);
+uint64 fb_reverse_source_shared_total_count(const void *shared_data);
 
 FbReverseOpReader *fb_reverse_reader_open(const FbReverseOpSource *source);
+FbReverseOpReader *fb_reverse_reader_open_shared(const void *shared_data);
 bool fb_reverse_reader_next(FbReverseOpReader *reader, FbReverseOp *op);
 void fb_reverse_reader_close(FbReverseOpReader *reader);
 

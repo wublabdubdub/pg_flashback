@@ -29,6 +29,26 @@ typedef struct FbReplayResult
 	uint64 memory_limit_bytes;
 } FbReplayResult;
 
+typedef struct FbReplayDiscoverState FbReplayDiscoverState;
+typedef struct FbReplayWarmState FbReplayWarmState;
+
+FbReplayDiscoverState *fb_replay_discover(const FbRelationInfo *info,
+										  const FbWalRecordIndex *index);
+void fb_replay_discover_destroy(FbReplayDiscoverState *state);
+
+FbReplayWarmState *fb_replay_warm(const FbRelationInfo *info,
+								  const FbWalRecordIndex *index,
+								  const FbReplayDiscoverState *discover,
+								  FbReplayResult *result);
+void fb_replay_warm_destroy(FbReplayWarmState *state);
+
+void fb_replay_final_build_reverse_source(const FbRelationInfo *info,
+										  const FbWalRecordIndex *index,
+										  TupleDesc tupdesc,
+										  const FbReplayWarmState *warm,
+										  FbReplayResult *result,
+										  FbReverseOpSource *source);
+
 /*
  * fb_replay_execute
  *    Replay API.

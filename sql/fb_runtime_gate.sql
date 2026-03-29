@@ -13,6 +13,9 @@ CREATE TABLE fb_runtime_table (id integer);
 SELECT *
 FROM pg_flashback(NULL::public.fb_runtime_table, now()::text);
 
+SELECT count(*)
+FROM pg_flashback(NULL::public.fb_runtime_table, now()::text);
+
 SET pg_flashback.archive_dir = '/__definitely_missing_pg_flashback_archive__';
 SELECT *
 FROM pg_flashback(NULL::public.fb_runtime_table, now()::text);

@@ -5,6 +5,12 @@
 
 #include "postgres.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include <utime.h>
+
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "catalog/pg_type_d.h"
@@ -12,11 +18,14 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
+#include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "nodes/supportnodes.h"
 #include "parser/parse_type.h"
+#include "port.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -32,6 +41,7 @@
 #include "fb_progress.h"
 #include "fb_replay.h"
 #include "fb_reverse_ops.h"
+#include "fb_runtime.h"
 #include "fb_wal.h"
 
 /*
@@ -42,6 +52,7 @@
 struct FbFlashbackQueryState
 {
 	FbRelationInfo info;
+	FbFastPathSpec fast_path;
 	TupleDesc tupdesc;
 	FbSpoolSession *spool;
 	FbReverseOpSource *reverse;
@@ -65,7 +76,12 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(fb_version);
 PG_FUNCTION_INFO_V1(fb_check_relation);
 PG_FUNCTION_INFO_V1(fb_archive_resolve_debug);
+PG_FUNCTION_INFO_V1(fb_apply_debug);
+PG_FUNCTION_INFO_V1(fb_keyed_key_debug);
 PG_FUNCTION_INFO_V1(fb_recordref_debug);
+PG_FUNCTION_INFO_V1(fb_runtime_cleanup_debug);
+PG_FUNCTION_INFO_V1(fb_runtime_retention_debug);
+PG_FUNCTION_INFO_V1(fb_runtime_touch_debug);
 PG_FUNCTION_INFO_V1(fb_progress_debug_set_clock);
 PG_FUNCTION_INFO_V1(fb_progress_debug_reset_clock);
 PG_FUNCTION_INFO_V1(fb_srf_mode_debug);
@@ -131,6 +147,54 @@ fb_parse_target_ts_text(text *target_ts_text)
 												   CStringGetDatum(target_ts_cstr),
 												   ObjectIdGetDatum(InvalidOid),
 												   Int32GetDatum(-1)));
+}
+
+static void
+fb_runtime_debug_set_mtime(const char *path, int age_seconds)
+{
+	struct utimbuf times;
+	time_t now = time(NULL);
+
+	if (path == NULL || path[0] == '\0')
+		return;
+
+	times.actime = now - age_seconds;
+	times.modtime = now - age_seconds;
+	if (utime(path, &times) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not adjust pg_flashback debug path mtime"),
+				 errdetail("path=%s: %m", path)));
+}
+
+static void
+fb_runtime_debug_write_file(const char *path)
+{
+	static const char payload[] = "pg_flashback-debug";
+	int fd;
+
+	fd = open(path,
+			  O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
+			  S_IRUSR | S_IWUSR);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create pg_flashback debug file"),
+				 errdetail("path=%s: %m", path)));
+
+	PG_TRY();
+	{
+		if (write(fd, payload, sizeof(payload) - 1) != sizeof(payload) - 1)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write pg_flashback debug file"),
+					 errdetail("path=%s: %m", path)));
+	}
+	PG_FINALLY();
+	{
+		close(fd);
+	}
+	PG_END_TRY();
 }
 
 static const char *
@@ -245,6 +309,32 @@ fb_estimate_tuple_bytes(TupleDesc tupdesc)
 	}
 
 	return MAXALIGN(HEAPTUPLESIZE + SizeofHeapTupleHeader + data_width);
+}
+
+static void
+fb_copy_fast_path_spec(FbFastPathSpec *dst, const FbFastPathSpec *src)
+{
+	int16 typlen = -1;
+	bool typbyval = false;
+	int i;
+
+	MemSet(dst, 0, sizeof(*dst));
+	if (src == NULL || src->mode == FB_FAST_PATH_NONE)
+		return;
+
+	*dst = *src;
+	if (src->key_count <= 0 || src->key_values == NULL)
+		return;
+
+	get_typlenbyval(src->key_type_oid, &typlen, &typbyval);
+	dst->key_values = palloc0(sizeof(Datum) * src->key_count);
+	dst->key_nulls = palloc0(sizeof(bool) * src->key_count);
+
+	for (i = 0; i < src->key_count; i++)
+	{
+		dst->key_nulls[i] = src->key_nulls[i];
+		dst->key_values[i] = datumCopy(src->key_values[i], typbyval, typlen);
+	}
 }
 
 static void
@@ -425,6 +515,7 @@ fb_build_flashback_reverse_ops(TimestampTz target_ts,
 							   const FbRelationInfo *info,
 							   TupleDesc tupdesc,
 							   FbSpoolSession *spool,
+							   bool shareable_reverse,
 							   FbReverseOpSource **reverse_out)
 {
 	FbWalScanContext scan_ctx;
@@ -452,12 +543,70 @@ fb_build_flashback_reverse_ops(TimestampTz target_ts,
 	MemSet(&replay_result, 0, sizeof(replay_result));
 	replay_result.tracked_bytes = index.tracked_bytes;
 	replay_result.memory_limit_bytes = index.memory_limit_bytes;
-	reverse = fb_reverse_source_create(allow_disk_spill ? spool : NULL,
+	reverse = fb_reverse_source_create((allow_disk_spill || shareable_reverse) ? spool : NULL,
 									   &replay_result.tracked_bytes,
 									   replay_result.memory_limit_bytes);
 	fb_replay_build_reverse_source(info, &index, tupdesc, &replay_result, reverse);
 	fb_reverse_source_finish(reverse);
+	if (shareable_reverse)
+		fb_reverse_source_materialize(reverse);
 	*reverse_out = reverse;
+}
+
+void
+fb_flashback_build_reverse_state(Oid source_relid,
+								 text *target_ts_text,
+								 bool shareable_reverse,
+								 FbFlashbackReverseBuildState *state)
+{
+	TimestampTz target_ts;
+
+	if (state == NULL)
+		return;
+
+	MemSet(state, 0, sizeof(*state));
+	target_ts = fb_parse_target_ts_text(target_ts_text);
+	fb_progress_begin();
+
+	PG_TRY();
+	{
+		state->spool = fb_spool_session_create();
+		fb_validate_flashback_target(source_relid,
+									 target_ts,
+									 &state->info,
+									 &state->tupdesc);
+		fb_build_flashback_reverse_ops(target_ts,
+									   &state->info,
+									   state->tupdesc,
+									   state->spool,
+									   shareable_reverse,
+									   &state->reverse);
+	}
+	PG_CATCH();
+	{
+		fb_flashback_release_reverse_state(state);
+		fb_progress_abort();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+void
+fb_flashback_release_reverse_state(FbFlashbackReverseBuildState *state)
+{
+	if (state == NULL)
+		return;
+
+	if (state->reverse != NULL)
+	{
+		fb_reverse_source_destroy(state->reverse);
+		state->reverse = NULL;
+	}
+	if (state->spool != NULL)
+	{
+		fb_spool_session_destroy(state->spool);
+		state->spool = NULL;
+	}
 }
 
 static void
@@ -465,16 +614,23 @@ fb_prepare_flashback_query(FbFlashbackQueryState *state,
 						   Oid source_relid,
 						   TimestampTz target_ts)
 {
+	bool shareable_reverse = false;
+
 	state->spool = fb_spool_session_create();
 	fb_validate_flashback_target(source_relid, target_ts, &state->info, &state->tupdesc);
+	shareable_reverse = fb_apply_parallel_candidate(&state->info,
+													 &state->fast_path,
+													 state->info.relid);
 	fb_build_flashback_reverse_ops(target_ts,
 								   &state->info,
 								   state->tupdesc,
 								   state->spool,
+								   shareable_reverse,
 								   &state->reverse);
 	state->apply = fb_apply_begin(&state->info,
 								  state->tupdesc,
-								  state->reverse);
+								  state->reverse,
+								  &state->fast_path);
 	fb_reverse_source_destroy(state->reverse);
 	state->reverse = NULL;
 	fb_spool_session_destroy(state->spool);
@@ -537,12 +693,15 @@ fb_unregister_flashback_cleanup(FbFlashbackQueryState *state)
 }
 
 FbFlashbackQueryState *
-fb_flashback_query_begin(Oid source_relid, text *target_ts_text)
+fb_flashback_query_begin(Oid source_relid,
+						 text *target_ts_text,
+						 const FbFastPathSpec *fast_path)
 {
 	FbFlashbackQueryState *state;
 	TimestampTz target_ts;
 
 	state = palloc0(sizeof(*state));
+	fb_copy_fast_path_spec(&state->fast_path, fast_path);
 	target_ts = fb_parse_target_ts_text(target_ts_text);
 	fb_progress_begin();
 
@@ -567,6 +726,15 @@ fb_flashback_query_next_datum(FbFlashbackQueryState *state, Datum *result)
 		return false;
 
 	return fb_apply_next(state->apply, result);
+}
+
+bool
+fb_flashback_query_next_slot(FbFlashbackQueryState *state, TupleTableSlot *slot)
+{
+	if (state == NULL || state->apply == NULL || slot == NULL)
+		return false;
+
+	return fb_apply_next_slot(state->apply, slot);
 }
 
 TupleDesc
@@ -631,6 +799,118 @@ fb_check_relation(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }
 
+Datum
+fb_runtime_retention_debug(PG_FUNCTION_ARGS)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "runtime=%d recovered_wal=%d meta=%d",
+					 fb_runtime_retention_seconds(),
+					 fb_recovered_wal_retention_seconds(),
+					 fb_meta_retention_seconds());
+
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+Datum
+fb_runtime_cleanup_debug(PG_FUNCTION_ARGS)
+{
+	FbRuntimeCleanupStats stats;
+	StringInfoData buf;
+
+	fb_runtime_ensure_initialized();
+	fb_runtime_cleanup(true, &stats);
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "runtime_removed=%u recovered_wal_removed=%u meta_removed=%u",
+					 stats.runtime_removed,
+					 stats.recovered_wal_removed,
+					 stats.meta_removed);
+
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+Datum
+fb_runtime_touch_debug(PG_FUNCTION_ARGS)
+{
+	text *kind_text = PG_GETARG_TEXT_PP(0);
+	text *name_text = PG_GETARG_TEXT_PP(1);
+	int age_seconds = PG_GETARG_INT32(2);
+	bool live_owner = PG_GETARG_BOOL(3);
+	char *kind = text_to_cstring(kind_text);
+	char *name = text_to_cstring(name_text);
+	char *dir = NULL;
+	char path[MAXPGPATH];
+	char child[MAXPGPATH];
+	char basename[MAXPGPATH];
+
+	if (age_seconds < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("age_seconds must be non-negative")));
+
+	fb_runtime_ensure_initialized();
+
+	if (strcmp(kind, "runtime") == 0)
+	{
+		long owner_pid = live_owner ? (long) MyProcPid : 2147483000L;
+		struct stat st;
+
+		dir = fb_runtime_runtime_dir();
+		snprintf(basename, sizeof(basename), "fbspill-%ld-%s", owner_pid, name);
+		snprintf(path, sizeof(path), "%s/%s", dir, basename);
+		if (lstat(path, &st) == 0)
+		{
+			if (S_ISDIR(st.st_mode))
+				(void) rmtree(path, true);
+			else
+				(void) unlink(path);
+		}
+		if (mkdir(path, S_IRWXU) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not create pg_flashback debug runtime directory"),
+					 errdetail("path=%s: %m", path)));
+
+		snprintf(child, sizeof(child), "%s/marker.bin", path);
+		fb_runtime_debug_write_file(child);
+		fb_runtime_debug_set_mtime(child, age_seconds);
+		fb_runtime_debug_set_mtime(path, age_seconds);
+	}
+	else if (strcmp(kind, "recovered_wal") == 0)
+	{
+		dir = fb_runtime_recovered_wal_dir();
+		snprintf(basename, sizeof(basename), "%s", name);
+		snprintf(path, sizeof(path), "%s/%s", dir, basename);
+		(void) unlink(path);
+		fb_runtime_debug_write_file(path);
+		fb_runtime_debug_set_mtime(path, age_seconds);
+	}
+	else if (strcmp(kind, "meta") == 0)
+	{
+		dir = fb_runtime_meta_dir();
+		snprintf(basename, sizeof(basename), "%s", name);
+		snprintf(path, sizeof(path), "%s/%s", dir, basename);
+		(void) unlink(path);
+		fb_runtime_debug_write_file(path);
+		fb_runtime_debug_set_mtime(path, age_seconds);
+	}
+	else
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("unsupported pg_flashback debug touch kind: %s", kind)));
+	}
+
+	if (dir != NULL)
+		pfree(dir);
+
+	PG_RETURN_TEXT_P(cstring_to_text(basename));
+}
+
 /*
  * fb_archive_resolve_debug
  *    SQL entry point for regression-only archive source diagnostics.
@@ -685,7 +965,7 @@ fb_recordref_debug(PG_FUNCTION_ARGS)
 
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
-						 "anchor=%s unsafe=%s reason=%s meta_refs=%llu payload_refs=%u kept=%llu target_dml=%llu commits=%llu aborts=%llu tail_inline=%s head_gap_refs=%u tail_refs=%u",
+						 "anchor=%s unsafe=%s reason=%s meta_refs=%llu payload_refs=%u kept=%llu target_dml=%llu commits=%llu aborts=%llu tail_inline=%s head_gap_refs=%u tail_refs=%u parallel=%s prefilter=%s visited_segments=%u/%u payload_windows=%u payload_parallel_workers=%u",
 						 index.anchor_found ? "true" : "false",
 						 index.unsafe ? "true" : "false",
 						 fb_wal_unsafe_reason_name(index.unsafe_reason),
@@ -697,7 +977,13 @@ fb_recordref_debug(PG_FUNCTION_ARGS)
 						 (unsigned long long) index.target_abort_count,
 						 index.tail_inline_payload ? "true" : "false",
 						 fb_spool_log_count(index.record_log),
-						 fb_spool_log_count(index.record_tail_log));
+						 fb_spool_log_count(index.record_tail_log),
+						 scan_ctx.parallel_workers > 0 ? "on" : "off",
+						 scan_ctx.segment_prefilter_used ? "on" : "off",
+						 scan_ctx.visited_segment_count,
+						 scan_ctx.progress_segment_total,
+						 index.payload_window_count,
+						 index.payload_parallel_workers);
 
 		fb_spool_session_destroy(spool);
 		spool = NULL;
@@ -707,6 +993,184 @@ fb_recordref_debug(PG_FUNCTION_ARGS)
 	{
 		if (spool != NULL)
 			fb_spool_session_destroy(spool);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+/*
+ * fb_apply_debug
+ *    SQL entry point for regression-only apply diagnostics.
+ */
+
+Datum
+fb_apply_debug(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	FbFlashbackQueryState *state = NULL;
+	StringInfoData buf;
+
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+
+	PG_TRY();
+	{
+		state = palloc0(sizeof(*state));
+		fb_progress_begin();
+		fb_prepare_flashback_query(state, relid, target_ts);
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "mode=%s apply_parallel=%s parallel_logs=%d fast_path=%s",
+						 state->info.mode == FB_APPLY_KEYED ? "keyed" : "bag",
+						 fb_apply_parallel_materialized(state->apply) ? "on" : "off",
+						 fb_apply_parallel_log_count(state->apply),
+						 state->fast_path.mode == FB_FAST_PATH_NONE ? "off" : "on");
+
+		fb_flashback_query_release(state);
+		state->finished = true;
+		fb_progress_finish();
+		PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+	}
+	PG_CATCH();
+	{
+		if (state != NULL)
+			fb_flashback_query_abort(state);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+/*
+ * fb_keyed_key_debug
+ *    SQL entry point for regression-only keyed state diagnostics.
+ */
+
+Datum
+fb_keyed_key_debug(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	int64 key = PG_GETARG_INT64(2);
+	FbFlashbackQueryState *state = NULL;
+	void *keyed_state = NULL;
+	FbKeyedResidualItem *residual_items = NULL;
+	FbKeyedDeleteKey *delete_keys = NULL;
+	uint64 residual_count = 0;
+	uint64 delete_count = 0;
+	bool supports_single_typed = false;
+	bool target_in_residual = false;
+	bool target_in_delete = false;
+	bool emitted = false;
+	int64 emitted_tuple_id = 0;
+	bool emitted_tuple_id_isnull = true;
+	char *emitted_code = NULL;
+	FbApplyEmit emit = {0};
+	StringInfoData buf;
+	uint64 i;
+
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+
+	PG_TRY();
+	{
+		state = palloc0(sizeof(*state));
+		fb_progress_begin();
+		fb_prepare_flashback_query(state, relid, target_ts);
+
+		if (state->info.mode != FB_APPLY_KEYED)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("fb_keyed_key_debug only supports keyed relations")));
+
+		keyed_state = fb_keyed_apply_begin(&state->info,
+										   state->tupdesc,
+										   state->reverse);
+		supports_single_typed = fb_keyed_apply_supports_single_typed_key(keyed_state);
+		residual_items = fb_keyed_apply_collect_residual_items(keyed_state, &residual_count);
+		delete_keys = fb_keyed_apply_collect_delete_keys(keyed_state, &delete_count);
+
+		for (i = 0; i < residual_count; i++)
+		{
+			bool tuple_id_isnull = true;
+			int64 tuple_id = DatumGetInt64(heap_getattr(residual_items[i].tuple,
+														1,
+														state->tupdesc,
+														&tuple_id_isnull));
+
+			if (!residual_items[i].key_isnull &&
+				DatumGetInt64(residual_items[i].key_value) == key)
+			{
+				target_in_residual = true;
+				if (!tuple_id_isnull)
+				{
+					emitted_tuple_id = tuple_id;
+					emitted_tuple_id_isnull = false;
+				}
+			}
+		}
+
+		for (i = 0; i < delete_count; i++)
+		{
+			if (!delete_keys[i].key_isnull &&
+				DatumGetInt64(delete_keys[i].key_value) == key)
+			{
+				target_in_delete = true;
+				break;
+			}
+		}
+
+		emitted = fb_keyed_apply_emit_missing_key(keyed_state,
+												  Int64GetDatum(key),
+												  false,
+												  &emit);
+		if (emitted && emit.kind == FB_APPLY_EMIT_TUPLE && emit.tuple != NULL)
+		{
+			bool tuple_id_isnull = true;
+			bool code_isnull = true;
+			Datum code_value;
+
+			emitted_tuple_id = DatumGetInt64(heap_getattr(emit.tuple,
+														  1,
+														  state->tupdesc,
+														  &tuple_id_isnull));
+			emitted_tuple_id_isnull = tuple_id_isnull;
+			code_value = heap_getattr(emit.tuple,
+									  9,
+									  state->tupdesc,
+									  &code_isnull);
+			if (!code_isnull)
+				emitted_code = TextDatumGetCString(code_value);
+		}
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "supports_single_typed=%s residual_count=%llu delete_count=%llu target_in_residual=%s target_in_delete=%s emit_missing_key=%s emitted_tuple_id=%s%s%s emitted_code=%s",
+						 supports_single_typed ? "true" : "false",
+						 (unsigned long long) residual_count,
+						 (unsigned long long) delete_count,
+						 target_in_residual ? "true" : "false",
+						 target_in_delete ? "true" : "false",
+						 emitted ? "true" : "false",
+						 emitted_tuple_id_isnull ? "NULL" : psprintf("%lld", (long long) emitted_tuple_id),
+						 target_in_residual ? " residual_tuple_id=" : "",
+						 (target_in_residual && !emitted_tuple_id_isnull) ? psprintf("%lld", (long long) emitted_tuple_id) : "",
+						 emitted_code != NULL ? emitted_code : "NULL");
+
+		if (keyed_state != NULL)
+			fb_keyed_apply_end(keyed_state);
+		fb_flashback_query_release(state);
+		state->finished = true;
+		fb_progress_finish();
+		PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+	}
+	PG_CATCH();
+	{
+		if (keyed_state != NULL)
+			fb_keyed_apply_end(keyed_state);
+		if (state != NULL)
+			fb_flashback_query_abort(state);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();

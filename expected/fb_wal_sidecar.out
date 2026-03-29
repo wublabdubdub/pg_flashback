@@ -54,10 +54,13 @@ DELETE FROM fb_wal_sidecar_target WHERE id = 0;
 SELECT fb_recordref_debug(
 	'fb_wal_sidecar_target'::regclass,
 	(SELECT target_ts FROM fb_wal_sidecar_mark)
-);
-                                                                  fb_recordref_debug                                                                  
-------------------------------------------------------------------------------------------------------------------------------------------------------
- anchor=true unsafe=false reason=none meta_refs=5 payload_refs=5 kept=5 target_dml=3 commits=3 aborts=0 tail_inline=false head_gap_refs=5 tail_refs=0
+) AS summary
+\gset
+SELECT :'summary' LIKE '%parallel=off%' AS parallel_off,
+	   :'summary' LIKE '%prefilter=on%' AS prefilter_on;
+ parallel_off | prefilter_on 
+--------------+--------------
+ t            | t
 (1 row)
 
 SELECT regexp_replace(

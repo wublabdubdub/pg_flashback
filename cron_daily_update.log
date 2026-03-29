@@ -1,0 +1,64 @@
+[2026-03-29 01:00:01 CST] committing changes to origin/main
+[main 71a60cf] update
+ 83 files changed, 9352 insertions(+), 1401 deletions(-)
+ rewrite docs/architecture/error-model.md (89%)
+ rewrite docs/architecture/overview.md (95%)
+ rewrite docs/architecture/reverse-op-stream.md (87%)
+ rewrite docs/architecture/row-identity.md (84%)
+ rewrite docs/architecture/wal-decode.md (98%)
+ rewrite docs/architecture/wal-source-resolution.md (96%)
+ rewrite "docs/architecture/\346\240\270\345\277\203\345\205\245\345\217\243\346\272\220\347\240\201\345\257\274\350\257\273.md" (84%)
+ rewrite "docs/architecture/\346\272\220\347\240\201\347\272\247\347\273\264\346\212\244\346\211\213\345\206\214.md" (90%)
+ rewrite "docs/architecture/\350\260\203\350\257\225\344\270\216\351\252\214\350\257\201\346\211\213\345\206\214.md" (64%)
+ create mode 100644 docs/decisions/ADR-0008-toast-truncate-recovery.md
+ create mode 100644 docs/decisions/ADR-0009-value-per-call-only-srf.md
+ create mode 100644 docs/decisions/ADR-0010-custom-scan-for-pg-flashback-from.md
+ create mode 100644 docs/specs/2026-03-28-toast-truncate-recovery-design.md
+ create mode 100644 docs/superpowers/plans/2026-03-28-core-archive-autodiscovery-plan.md
+ create mode 100644 docs/superpowers/plans/2026-03-28-functionscan-customscan-plan.md
+ create mode 100644 docs/superpowers/plans/2026-03-28-memory-limit-error-format-plan.md
+ create mode 100644 docs/superpowers/plans/2026-03-28-memory-limit-guc-units-plan.md
+ create mode 100644 docs/superpowers/plans/2026-03-28-memory-limit-rename-32gb-plan.md
+ create mode 100644 docs/superpowers/plans/2026-03-28-memory-vs-disk-selection-plan.md
+ create mode 100644 docs/superpowers/plans/2026-03-28-progress-elapsed-timing-plan.md
+ create mode 100644 docs/superpowers/plans/2026-03-28-toast-truncate-recovery-plan.md
+ create mode 100644 docs/superpowers/plans/2026-03-28-value-per-call-only-srf-plan.md
+ create mode 100644 docs/superpowers/specs/2026-03-28-functionscan-customscan-design.md
+ create mode 100644 docs/superpowers/specs/2026-03-28-memory-vs-disk-selection-design.md
+ create mode 100644 docs/superpowers/specs/2026-03-28-value-per-call-only-srf-design.md
+ create mode 100644 expected/fb_custom_scan.out
+ create mode 100644 expected/fb_flashback_bag.out
+ create mode 100644 expected/fb_flashback_hot_update_fpw.out
+ create mode 100644 expected/fb_flashback_keyed.out
+ create mode 100644 expected/fb_flashback_main_truncate.out
+ create mode 100644 expected/fb_flashback_standby_lock.out
+ create mode 100644 expected/fb_flashback_storage_boundary.out
+ create mode 100644 expected/fb_flashback_toast_storage_boundary.out
+ create mode 100644 expected/fb_guc_defaults.out
+ create mode 100644 expected/fb_memory_limit.out
+ create mode 100644 expected/fb_preflight.out
+ create mode 100644 expected/fb_progress.out
+ create mode 100644 expected/fb_relation_gate.out
+ create mode 100644 expected/fb_relation_unsupported.out
+ create mode 100644 expected/fb_runtime_gate.out
+ create mode 100644 expected/fb_smoke.out
+ create mode 100644 expected/fb_spill.out
+ create mode 100644 expected/fb_toast_flashback.out
+ create mode 100644 expected/fb_user_surface.out
+ create mode 100644 expected/fb_value_per_call.out
+ create mode 100644 expected/fb_wal_source_policy.out
+ create mode 100644 expected/pg_flashback.out
+ create mode 100644 include/fb_custom_scan.h
+ create mode 100644 sql/fb_custom_scan.sql
+ create mode 100644 sql/fb_flashback_hot_update_fpw.sql
+ create mode 100644 sql/fb_flashback_main_truncate.sql
+ create mode 100644 sql/fb_flashback_standby_lock.sql
+ create mode 100644 sql/fb_guc_defaults.sql
+ create mode 100644 sql/fb_preflight.sql
+ create mode 100644 sql/fb_value_per_call.sql
+ rewrite sql/fb_wal_source_policy.sql (93%)
+ create mode 100644 src/fb_custom_scan.c
+[2026-03-29 01:00:01 CST] pushing to origin/main
+To github.com:wublabdubdub/pg_flashback.git
+   e8ad9ef..71a60cf  main -> main
+[2026-03-29 01:00:05 CST] auto update finished

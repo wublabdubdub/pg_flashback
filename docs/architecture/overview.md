@@ -2,7 +2,14 @@
 
 本文描述当前仓库主线代码的真实结构，不覆盖已经删除的“结果表物化 / 并行结果表写入”旧模型，也不把尚未完成的设计稿当成现状。
 
-当前用户入口固定为：
+当前用户入口为：
+
+```sql
+SELECT pg_flashback_to(
+  'public.t1'::regclass,
+  '2026-03-28 10:00:00+08'
+);
+```
 
 ```sql
 SELECT *
@@ -16,6 +23,7 @@ FROM pg_flashback(
 
 - `fb_version()`
 - `fb_check_relation(regclass)`
+- `pg_flashback_to(regclass, text)`
 - `pg_flashback(anyelement, text)`
 
 对应安装脚本：
@@ -36,6 +44,17 @@ pg_flashback(anyelement, text)
   -> ReverseOpSource
   -> keyed/bag streaming apply
   -> SRF rows
+```
+
+`FROM pg_flashback(...)` 的 planner / executor 主链当前已经不是单节点黑盒，而是：
+
+```text
+Custom Scan (FbApplyScan)
+  -> Custom Scan (FbReverseSourceScan)
+    -> Custom Scan (FbReplayFinalScan)
+      -> Custom Scan (FbReplayWarmScan)
+        -> Custom Scan (FbReplayDiscoverScan)
+          -> Custom Scan (FbWalIndexScan)
 ```
 
 如果要再补一句当前大窗口实现特点，就是：
@@ -105,8 +124,12 @@ pg_flashback(anyelement, text)
 - `pg_flashback.archive_dir`
 - `pg_flashback.debug_pg_wal_dir`
 - `pg_flashback.memory_limit`
+- `pg_flashback.runtime_retention`
+- `pg_flashback.recovered_wal_retention`
+- `pg_flashback.meta_retention`
 - `pg_flashback.spill_mode`
-- `pg_flashback.parallel_segment_scan`
+- `pg_flashback.parallel_workers`
+- `pg_flashback.export_parallel_workers`
 - `pg_flashback.show_progress`
 
 ### `fb_runtime`
@@ -119,6 +142,8 @@ pg_flashback(anyelement, text)
 职责：
 
 - 初始化和校验扩展私有目录
+- 对 `runtime/recovered_wal/meta` 执行轻量目录保洁
+- 为不同目录应用不同的保留/删除策略
 
 当前固定目录：
 
@@ -176,6 +201,7 @@ pg_flashback(anyelement, text)
 - 提供 query 级 spill 目录
 - 提供 append-only spool log / cursor / anchor
 - 给 `RecordRef` payload、reverse-op runs、sidecar 调试路径提供顺序读写介质
+- 给 `pg_flashback_to()` keyed 并行导出提供跨 backend 共享的 reverse-source 顺序读介质
 
 ### `fb_wal`
 
@@ -210,6 +236,7 @@ pg_flashback(anyelement, text)
 
 - 当 archive 与 `pg_wal` 都无法直接提供可信 segment 时，尝试从可见目录中复制/纠正 WAL 段
 - 将恢复结果统一落到 `recovered_wal`
+- 支持并发 worker 共享 `recovered_wal` 缓存，不因同一 segment 的同时恢复而互相撞文件
 - 让 resolver 在同一轮中继续消费恢复后的段
 
 ### `fb_replay`
@@ -254,7 +281,11 @@ pg_flashback(anyelement, text)
 
 - 协调 relation scan 与 reverse-op apply
 - 管理 scan / residual 两阶段
-- 统一通过 `ValuePerCall` SRF 发射历史结果
+- 向 SQL SRF 提供 datum 输出
+- 向 `CustomScan` 提供 slot-native 输出
+- 对 keyed relation 执行单列 stable key fast path：
+  - key eq / key in 的索引点查
+  - key order + limit 的有序索引扫描与早停
 
 ### `fb_custom_scan`
 
@@ -266,9 +297,11 @@ pg_flashback(anyelement, text)
 职责：
 
 - 通过 planner hook 识别 `FROM pg_flashback(...)` 的 `RTE_FUNCTION`
-- 输出 `CustomPath / CustomScan`
-- 在 executor 中直接复用 `fb_flashback_query_begin/next/finish`
+- 输出多层 `CustomPath / CustomScan` 算子树
+- 将 `wal index / replay discover / replay warm / replay final / reverse finish / apply` 拆成独立 executor 节点
 - 绕开 PostgreSQL 默认 `FunctionScan -> ExecMakeTableFunctionResult() -> tuplestore`
+- 根节点 `FbApplyScan` 直接把当前历史结果写入 scan slot，不再走 `Datum -> ExecStoreHeapTupleDatum()`
+- 在规划期识别 keyed fast path，并把内部 `FbFastPathSpec` 传到根节点 executor / apply
 
 ### `fb_apply_keyed`
 
@@ -280,6 +313,9 @@ pg_flashback(anyelement, text)
 
 - 对有主键/稳定唯一键的表，按 key 反向应用变化集
 - 只跟踪变化 key，不再构造整表 hash
+- 为 fast path 提供：
+  - 缺失 key 的 replacement tuple 直取
+  - residual key 列表与有序 merge 所需的 keyed state 访问接口
 
 ### `fb_apply_bag`
 
@@ -317,15 +353,19 @@ pg_flashback(anyelement, text)
 - `src/fb_export.c`
 - `include/fb_export.h`
 
-职责现状：
+职责：
 
-- 仅占位
+- `pg_flashback_to(regclass, text)` 用户入口
+- 对 keyed + 单列稳定键 relation，支持不扫当前整表的原表回退：
+  - 先汇总变化 key 在目标时间点的终态
+  - 再以批量 `UPDATE / INSERT / DELETE` 直接改写原表
 
 说明：
 
 - `fb_export_undo()` 在 `src/fb_entry.c` 中已有入口骨架
 - 当前仍直接报 `not implemented`
-- 还未安装到公开 SQL 面
+- `pg_flashback_to()` 已安装到公开 SQL 面
+- 旧的 `pg_flashback_rewind()` 与持久表导出公开入口已下线
 
 ### `fb_compat`
 
@@ -356,6 +396,7 @@ pg_flashback(anyelement, text)
 - `relid`
 - `toast_relid`
 - `locator`
+- `key_index_oid`
 - `toast_locator`
 - `mode`
 - `mode_name`
@@ -386,7 +427,7 @@ pg_flashback(anyelement, text)
 - `resolved_segments`
 - `using_archive_dest`
 - `ckwal_invoked`
-- `parallel_segment_scan_enabled`
+- `parallel_workers`
 
 ### `FbRecordRef`
 
@@ -534,9 +575,11 @@ pg_flashback(anyelement, text)
 
 直接调用 `pg_flashback()` 时，入口仍是 `ValuePerCall` SRF。
 
-`FROM pg_flashback(...)` 场景下，当前会先通过 `pg_flashback` 的 planner support function 提前加载模块，再由 `fb_custom_scan` 将默认 `FunctionScan` 替换为 `CustomScan`。
+`FROM pg_flashback(...)` 场景下，当前会先通过 `pg_flashback` 的 planner support function 提前加载模块，再由 `fb_custom_scan` 将默认 `FunctionScan` 替换为多层 `CustomScan` 算子树。
 
-因此默认语义仍是直接查询结果集，不创建结果表，也不再经过 PostgreSQL 默认 table-function `tuplestore` materialize。
+因此 `pg_flashback()` 的默认语义仍是直接查询结果集，不创建结果表，也不再经过 PostgreSQL 默认 table-function `tuplestore` materialize。
+
+另外，根节点 `FbApplyScan` 当前会直接以 slot-native 方式接收 `fb_apply` 的当前行结果，不再先构造复合 `Datum` 再反解回 slot；这样 `ExecutorState` 不会再随着已输出历史行线性膨胀。
 
 ## 五、当前内存边界
 

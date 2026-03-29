@@ -8,6 +8,14 @@ $$;
 CREATE EXTENSION pg_flashback;
 SET pg_flashback.show_progress = off;
 
+DO $$
+BEGIN
+	IF to_regprocedure('fb_recordref_debug(regclass,timestamptz)') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_recordref_debug(regclass, timestamptz)';
+	END IF;
+END;
+$$;
+
 SELECT to_regprocedure('fb_runtime_dir_debug()') IS NULL AS no_runtime_debug,
 	   to_regprocedure('fb_wal_source_debug()') IS NULL AS no_source_debug,
 	   to_regprocedure('fb_scan_wal_debug(regclass,timestamptz)') IS NULL AS no_scan_debug,
@@ -15,6 +23,8 @@ SELECT to_regprocedure('fb_runtime_dir_debug()') IS NULL AS no_runtime_debug,
 	   to_regprocedure('fb_replay_debug(regclass,timestamptz)') IS NULL AS no_replay_debug,
 	   to_regprocedure('fb_wal_window_debug(timestamptz)') IS NULL AS no_window_debug,
 	   to_regprocedure('fb_decode_insert_debug(regclass,timestamptz)') IS NULL AS no_decode_debug,
+	   to_regprocedure('pg_flashback_to(regclass,text)') IS NOT NULL AS has_to_entry,
+	   to_regprocedure('pg_flashback_rewind(regclass,text)') IS NULL AS no_rewind_entry,
 	   to_regprocedure('pg_flashback(anyelement,text)') IS NOT NULL AS has_query_entry,
 	   to_regprocedure('pg_flashback(text,text,text)') IS NULL AS no_result_table_entry,
 	   to_regprocedure('fb_flashback_materialize(regclass,timestamptz,text)') IS NULL AS no_materialize_helper,

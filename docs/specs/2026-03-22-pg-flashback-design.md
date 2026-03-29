@@ -2,14 +2,18 @@
 
 ## 产品目标
 
-`pg_flashback` 提供类似 Oracle Flashback Query 的只读历史查询能力：
+`pg_flashback` 提供类似 Oracle Flashback Query 的历史查询与原表闪回能力：
 
 - 输入当前表的复合类型锚点与目标时间点
 - 从 WAL 重建 `target_ts` 时刻的逻辑结果
 - 直接返回结果集
-- 不落最终结果表
+- 或直接将 keyed 原表回退到目标时间点
 
 当前用户入口固定为：
+
+```sql
+SELECT pg_flashback_to('public.t1'::regclass, '2026-03-22 10:00:00+08');
+```
 
 ```sql
 SELECT *
@@ -21,8 +25,8 @@ FROM pg_flashback(
 
 ## 已确认约束
 
-- 首版严格只读
 - 同时支持历史结果查询与 undo SQL / reverse op 导出
+- 支持 `pg_flashback_to(regclass, text)` 直接修改 keyed 原表
 - 无主键表按 `bag/multiset` 语义处理
 - `target_ts -> query_now_ts` 期间 WAL 必须完整
 - 时间窗内若检测到 DDL / rewrite / truncate / relfilenode 变化，直接报错
@@ -37,6 +41,7 @@ FROM pg_flashback(
 
 - `fb_version()`
 - `fb_check_relation(regclass)`
+- `pg_flashback_to(regclass, text)`
 - `pg_flashback(anyelement, text)`
 
 当前未对外安装：
@@ -97,12 +102,17 @@ FROM pg_flashback(NULL::schema.table, target_ts_text);
 
 ## 输出模型
 
-当前输出模型已经固定为：
+当前输出模型已经固定为两种：
 
-- 不创建结果表
-- 不走 `tuplestore`
-- 不保留“返回结果表名”的公开入口
-- 查询结束后即结束，不保留最终结果副本
+- `pg_flashback(anyelement, text)`：
+  - 不创建结果表
+  - 不走 `tuplestore`
+  - 查询结束后即结束，不保留最终结果副本
+- `pg_flashback_to(regclass, text)`：
+  - 直接修改 keyed 原表
+  - 执行时拿 `AccessExclusiveLock`
+  - 当前只支持单列稳定键
+  - 检测到外键与用户触发器直接报错
 
 ## 内存模型
 
@@ -146,6 +156,10 @@ FROM pg_flashback(NULL::schema.table, target_ts_text);
 - `pg_wal` 只补 archive 尚未覆盖的 recent tail
 - 发生 `pg_wal` 错配时，转入扩展内部 `recovered_wal/`
 - 扩展自动维护 `DataDir/pg_flashback/{runtime,recovered_wal,meta}`
+- 扩展会按目录类型执行保洁：
+  - `runtime/` 清理死 backend 遗留 `fbspill-*` 目录，并对超保留期残留做兜底淘汰
+  - `recovered_wal/` 按 `recovered_wal_retention` 淘汰旧恢复段
+  - `meta/` 按 `meta_retention` 淘汰旧 sidecar
 
 ## 不支持场景
 

@@ -84,7 +84,7 @@ typedef struct FbWalScanContext
 	bool using_archive_dest;
 	bool using_legacy_archive_dir;
 	bool ckwal_invoked;
-	bool parallel_segment_scan_enabled;
+	int parallel_workers;
 	bool segment_prefilter_ready;
 	bool segment_prefilter_used;
 	uint32 prefilter_hit_segments;
@@ -199,6 +199,8 @@ typedef struct FbWalRecordIndex
 	uint64 tracked_bytes;
 	uint64 memory_limit_bytes;
 	uint32 record_count;
+	uint32 payload_window_count;
+	uint32 payload_parallel_workers;
 	bool tail_inline_payload;
 	XLogRecPtr tail_cutover_lsn;
 	HTAB *xid_statuses;

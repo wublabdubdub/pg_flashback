@@ -18,6 +18,18 @@ typedef struct FbReverseRun
 	struct FbReverseRun *next;
 } FbReverseRun;
 
+typedef struct FbSharedReverseSourceHeader
+{
+	uint64 total_count;
+	uint32 run_count;
+} FbSharedReverseSourceHeader;
+
+typedef struct FbSharedReverseRunDesc
+{
+	uint32 count;
+	char path[MAXPGPATH];
+} FbSharedReverseRunDesc;
+
 typedef struct FbSerializedRowImageHeader
 {
 	uint32 tuple_len;
@@ -55,6 +67,7 @@ struct FbReverseOpSource
 typedef struct FbReverseRunReader
 {
 	FbReverseRun *run;
+	FbSpoolLog *owned_log;
 	FbSpoolCursor *cursor;
 	MemoryContext rowctx;
 	FbReverseOp current;
@@ -73,6 +86,9 @@ struct FbReverseOpReader
 
 static int fb_reverse_op_cmp(const void *lhs, const void *rhs);
 static void fb_reverse_source_detach_tracking(FbReverseOpSource *source);
+static void fb_reverse_reader_init_run(FbReverseRunReader *reader,
+										 FbReverseRun *run,
+										 FbSpoolLog *owned_log);
 
 static Size
 fb_row_image_owned_bytes(const FbRowImage *row)
@@ -362,9 +378,23 @@ fb_reverse_source_finish(FbReverseOpSource *source)
 }
 
 void
+fb_reverse_source_materialize(FbReverseOpSource *source)
+{
+	if (source == NULL || source->count == 0)
+		return;
+	if (source->session == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("reverse source cannot be shared without a spool session")));
+
+	fb_reverse_run_append(source);
+}
+
+void
 fb_reverse_source_destroy(FbReverseOpSource *source)
 {
 	uint32 i;
+	FbReverseRun *run;
 
 	if (source == NULL)
 		return;
@@ -380,6 +410,14 @@ fb_reverse_source_destroy(FbReverseOpSource *source)
 		fb_memory_release_bytes(source->tracked_bytes, source->array_bytes);
 	if (source->ops != NULL)
 		pfree(source->ops);
+	run = source->runs_head;
+	while (run != NULL)
+	{
+		FbReverseRun *next = run->next;
+
+		pfree(run);
+		run = next;
+	}
 	pfree(source);
 }
 
@@ -402,6 +440,74 @@ uint64
 fb_reverse_source_total_count(const FbReverseOpSource *source)
 {
 	return (source == NULL) ? 0 : source->total_count;
+}
+
+Size
+fb_reverse_source_shared_size(const FbReverseOpSource *source)
+{
+	uint32 run_count = (source == NULL) ? 0 : source->run_count;
+
+	return MAXALIGN(sizeof(FbSharedReverseSourceHeader)) +
+		MAXALIGN(sizeof(FbSharedReverseRunDesc) * run_count);
+}
+
+void
+fb_reverse_source_write_shared(const FbReverseOpSource *source,
+								 void *dest,
+								 Size dest_size)
+{
+	FbSharedReverseSourceHeader *hdr;
+	FbSharedReverseRunDesc *runs;
+	FbReverseRun *run;
+	uint32 i = 0;
+	Size needed;
+
+	if (source == NULL || dest == NULL)
+		return;
+	if (source->count > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("reverse source must be materialized before sharing")));
+
+	needed = fb_reverse_source_shared_size(source);
+	if (dest_size < needed)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("shared reverse source buffer is too small")));
+
+	MemSet(dest, 0, needed);
+	hdr = (FbSharedReverseSourceHeader *) dest;
+	hdr->total_count = source->total_count;
+	hdr->run_count = source->run_count;
+	runs = (FbSharedReverseRunDesc *) ((char *) dest +
+										 MAXALIGN(sizeof(FbSharedReverseSourceHeader)));
+
+	for (run = source->runs_head; run != NULL; run = run->next)
+	{
+		const char *path = fb_spool_log_path(run->log);
+
+		if (i >= hdr->run_count)
+			elog(ERROR, "reverse source run count mismatch");
+		runs[i].count = run->count;
+		if (path == NULL || strlen(path) >= sizeof(runs[i].path))
+			ereport(ERROR,
+					(errcode(ERRCODE_NAME_TOO_LONG),
+					 errmsg("reverse source spill path is too long to share")));
+		strlcpy(runs[i].path, path, sizeof(runs[i].path));
+		i++;
+	}
+}
+
+uint64
+fb_reverse_source_shared_total_count(const void *shared_data)
+{
+	const FbSharedReverseSourceHeader *hdr;
+
+	if (shared_data == NULL)
+		return 0;
+
+	hdr = (const FbSharedReverseSourceHeader *) shared_data;
+	return hdr->total_count;
 }
 
 static bool
@@ -440,6 +546,23 @@ fb_reverse_run_reader_advance(FbReverseRunReader *reader)
 	return true;
 }
 
+static void
+fb_reverse_reader_init_run(FbReverseRunReader *reader,
+							 FbReverseRun *run,
+							 FbSpoolLog *owned_log)
+{
+	FbSpoolLog *log;
+
+	reader->run = run;
+	reader->owned_log = owned_log;
+	log = (run != NULL) ? run->log : owned_log;
+	reader->cursor = fb_spool_cursor_open(log, FB_SPOOL_FORWARD);
+	reader->rowctx = AllocSetContextCreate(CurrentMemoryContext,
+										   "fb reverse run row",
+										   ALLOCSET_SMALL_SIZES);
+	fb_reverse_run_reader_advance(reader);
+}
+
 FbReverseOpReader *
 fb_reverse_reader_open(const FbReverseOpSource *source)
 {
@@ -463,13 +586,43 @@ fb_reverse_reader_open(const FbReverseOpSource *source)
 	reader->runs = palloc0(sizeof(FbReverseRunReader) * reader->run_count);
 	for (run = source->runs_head; run != NULL; run = run->next)
 	{
-		reader->runs[i].run = run;
-		reader->runs[i].cursor = fb_spool_cursor_open(run->log, FB_SPOOL_FORWARD);
-		reader->runs[i].rowctx = AllocSetContextCreate(CurrentMemoryContext,
-													   "fb reverse run row",
-													   ALLOCSET_SMALL_SIZES);
-		fb_reverse_run_reader_advance(&reader->runs[i]);
+		fb_reverse_reader_init_run(&reader->runs[i], run, NULL);
 		i++;
+	}
+
+	return reader;
+}
+
+FbReverseOpReader *
+fb_reverse_reader_open_shared(const void *shared_data)
+{
+	const FbSharedReverseSourceHeader *hdr;
+	const FbSharedReverseRunDesc *runs;
+	FbReverseOpReader *reader;
+	uint32 i;
+
+	if (shared_data == NULL)
+		return NULL;
+
+	hdr = (const FbSharedReverseSourceHeader *) shared_data;
+	runs = (const FbSharedReverseRunDesc *) ((const char *) shared_data +
+											 MAXALIGN(sizeof(FbSharedReverseSourceHeader)));
+
+	reader = palloc0(sizeof(*reader));
+	reader->emitctx = AllocSetContextCreate(CurrentMemoryContext,
+											 "fb reverse emit row",
+											 ALLOCSET_SMALL_SIZES);
+	reader->in_memory = false;
+	reader->run_count = hdr->run_count;
+	if (reader->run_count == 0)
+		return reader;
+
+	reader->runs = palloc0(sizeof(FbReverseRunReader) * reader->run_count);
+	for (i = 0; i < reader->run_count; i++)
+	{
+		FbSpoolLog *log = fb_spool_log_open_readonly(runs[i].path, runs[i].count);
+
+		fb_reverse_reader_init_run(&reader->runs[i], NULL, log);
 	}
 
 	return reader;
@@ -535,6 +688,8 @@ fb_reverse_reader_close(FbReverseOpReader *reader)
 	{
 		if (reader->runs[i].cursor != NULL)
 			fb_spool_cursor_close(reader->runs[i].cursor);
+		if (reader->runs[i].owned_log != NULL)
+			fb_spool_log_close(reader->runs[i].owned_log);
 		if (reader->runs[i].rowctx != NULL)
 			MemoryContextDelete(reader->runs[i].rowctx);
 	}

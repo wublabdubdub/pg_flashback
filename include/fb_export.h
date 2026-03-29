@@ -1,14 +1,14 @@
 /*
  * fb_export.h
- *    Undo export interfaces.
+ *    Flashback mutation and export entry points.
  */
 
 #ifndef FB_EXPORT_H
 #define FB_EXPORT_H
 
-/*
- * Placeholder for undo SQL / reverse-op export interfaces.
- */
+#include "fb_common.h"
+
+Datum pg_flashback_to(PG_FUNCTION_ARGS);
+Datum pg_flashback_rewind(PG_FUNCTION_ARGS);
 
 #endif
-

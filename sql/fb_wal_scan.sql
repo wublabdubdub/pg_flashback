@@ -42,7 +42,7 @@ BEGIN;
 INSERT INTO fb_wal_scan_target VALUES (2, repeat('abort', 128));
 ROLLBACK;
 
-SET pg_flashback.parallel_segment_scan = off;
+SET pg_flashback.parallel_workers = 0;
 SELECT fb_scan_wal_debug('fb_wal_scan_target'::regclass,
 						 (SELECT target_ts FROM fb_wal_scan_mark)) AS summary
 \gset
@@ -52,7 +52,7 @@ SELECT :'summary' LIKE '%parallel=off%' AS parallel_off,
 	   :'summary' ~ 'visited_segments=[0-9]+/[0-9]+' AS visited_seen,
 	   :'summary' LIKE '%complete=true%' AS complete_seen;
 
-SET pg_flashback.parallel_segment_scan = on;
+SET pg_flashback.parallel_workers = 4;
 SELECT fb_scan_wal_debug('fb_wal_scan_target'::regclass,
 						 (SELECT target_ts FROM fb_wal_scan_mark)) AS summary
 \gset
@@ -85,12 +85,12 @@ WITH scans AS (
 	SELECT 'off' AS mode,
 		   fb_scan_wal_debug('fb_wal_scan_target'::regclass,
 							(SELECT target_ts FROM fb_wal_scan_switch_mark)) AS summary
-	FROM (SELECT set_config('pg_flashback.parallel_segment_scan', 'off', false)) AS _
+	FROM (SELECT set_config('pg_flashback.parallel_workers', '0', false)) AS _
 	UNION ALL
 	SELECT 'on' AS mode,
 		   fb_scan_wal_debug('fb_wal_scan_target'::regclass,
 							(SELECT target_ts FROM fb_wal_scan_switch_mark)) AS summary
-	FROM (SELECT set_config('pg_flashback.parallel_segment_scan', 'on', false)) AS _
+	FROM (SELECT set_config('pg_flashback.parallel_workers', '4', false)) AS _
 ),
 parsed AS (
 	SELECT mode,

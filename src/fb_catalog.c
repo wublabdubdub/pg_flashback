@@ -49,6 +49,7 @@ fb_catalog_find_stable_unique_key(Relation rel, FbRelationInfo *info)
 			int i;
 
 			found = true;
+			info->key_index_oid = index_oid;
 			info->key_natts = FB_INDEX_NKEYATTS(index_form);
 			for (i = 0; i < info->key_natts; i++)
 				info->key_attnums[i] = index_rel->rd_index->indkey.values[i];

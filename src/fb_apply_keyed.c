@@ -72,9 +72,15 @@ typedef struct FbKeyedApplyState
 	uint64 residual_total;
 	uint64 tracked_bytes;
 	uint64 memory_limit_bytes;
+	bool force_string_keys;
 	bool use_typed_keys;
 	int key_natts;
 	int max_key_attnum;
+	uint32 entry_count;
+	uint32 single_typed_index_mask;
+	FbKeyedEntry **single_typed_index;
+	uint32 single_typed_filter_mask;
+	uint64 *single_typed_filter_bits;
 	FbKeyedAttrMeta key_meta[INDEX_MAX_KEYS];
 } FbKeyedApplyState;
 
@@ -317,6 +323,8 @@ fb_keyed_init_key_meta(FbKeyedApplyState *state)
 	int i;
 
 	state->use_typed_keys = false;
+	if (state->force_string_keys)
+		return;
 	state->key_natts = (state->info != NULL) ? state->info->key_natts : 0;
 	state->max_key_attnum = 0;
 	if (state->key_natts <= 0 || state->tupdesc == NULL)
@@ -498,6 +506,138 @@ fb_keyed_extract_slot_values(FbKeyedApplyState *state,
 }
 
 static uint32
+fb_keyed_single_typed_hash_value(FbKeyedApplyState *state,
+								 Datum key_value,
+								 bool key_isnull)
+{
+	uint32 part_hash;
+
+	if (key_isnull)
+		part_hash = hash_bytes_uint32(0x9e3779b9U);
+	else
+		part_hash = fb_keyed_fast_hash(&state->key_meta[0], key_value);
+
+	/*
+	 * Keep the single-key fast-path hash identical to the generic keyed-entry
+	 * hash built by fb_keyed_hash_values(); otherwise fast lookups miss
+	 * changed keys and leak current rows instead of historical replacements.
+	 */
+	return hash_combine(0, part_hash);
+}
+
+static void
+fb_keyed_extract_single_typed_slot_value(FbKeyedApplyState *state,
+										 TupleTableSlot *slot,
+										 Datum *value_out,
+										 bool *isnull_out)
+{
+	int attr_index;
+
+	if (state == NULL || slot == NULL || value_out == NULL || isnull_out == NULL)
+		elog(ERROR, "fb keyed apply could not extract single typed slot value");
+
+	if (state->max_key_attnum > 0)
+		slot_getsomeattrs(slot, state->max_key_attnum);
+
+	attr_index = state->key_meta[0].attnum - 1;
+	*value_out = slot->tts_values[attr_index];
+	*isnull_out = slot->tts_isnull[attr_index];
+}
+
+static uint32
+fb_keyed_single_typed_probe(uint32 hash_value, uint32 mask)
+{
+	return hash_value & mask;
+}
+
+static bool
+fb_keyed_single_typed_filter_maybe_contains(FbKeyedApplyState *state,
+											 uint32 hash_value)
+{
+	uint32 bitno1;
+	uint32 bitno2;
+	uint32 wordno1;
+	uint32 wordno2;
+	uint64 bitmask1;
+	uint64 bitmask2;
+	uint32 hash2;
+
+	if (state == NULL || state->single_typed_filter_bits == NULL)
+		return true;
+
+	bitno1 = hash_value & state->single_typed_filter_mask;
+	wordno1 = bitno1 >> 6;
+	bitmask1 = UINT64CONST(1) << (bitno1 & 63);
+	if ((state->single_typed_filter_bits[wordno1] & bitmask1) == 0)
+		return false;
+
+	hash2 = murmurhash32(hash_value ^ 0x85ebca6bU);
+	bitno2 = hash2 & state->single_typed_filter_mask;
+	wordno2 = bitno2 >> 6;
+	bitmask2 = UINT64CONST(1) << (bitno2 & 63);
+	return (state->single_typed_filter_bits[wordno2] & bitmask2) != 0;
+}
+
+static FbKeyedEntry *
+fb_keyed_find_single_typed_entry_hashed(FbKeyedApplyState *state,
+										uint32 hash_value,
+										Datum key_value,
+										bool key_isnull)
+{
+	uint32 mask;
+	uint32 probe;
+	FbKeyedEntry *entry;
+
+	if (state == NULL ||
+		state->single_typed_index == NULL ||
+		state->key_natts != 1)
+		return NULL;
+
+	if (!fb_keyed_single_typed_filter_maybe_contains(state, hash_value))
+		return NULL;
+
+	mask = state->single_typed_index_mask;
+	probe = fb_keyed_single_typed_probe(hash_value, mask);
+	for (;;)
+	{
+		entry = state->single_typed_index[probe];
+
+		if (entry == NULL)
+			return NULL;
+		if (entry->hash_value == hash_value &&
+			entry->key_nulls[0] == key_isnull &&
+			(key_isnull ||
+			 fb_keyed_fast_equal(&state->key_meta[0],
+								 entry->key_values[0],
+								 key_value)))
+			return entry;
+		probe = (probe + 1) & mask;
+	}
+}
+
+static FbKeyedEntry *
+fb_keyed_find_single_typed_entry_slot(FbKeyedApplyState *state,
+									  TupleTableSlot *slot,
+									  Datum *key_value_out,
+									  bool *key_isnull_out)
+{
+	Datum key_value;
+	bool key_isnull;
+	uint32 hash_value;
+
+	fb_keyed_extract_single_typed_slot_value(state, slot, &key_value, &key_isnull);
+	hash_value = fb_keyed_single_typed_hash_value(state, key_value, key_isnull);
+	if (key_value_out != NULL)
+		*key_value_out = key_value;
+	if (key_isnull_out != NULL)
+		*key_isnull_out = key_isnull;
+	return fb_keyed_find_single_typed_entry_hashed(state,
+												   hash_value,
+												   key_value,
+												   key_isnull);
+}
+
+static uint32
 fb_keyed_hash_values(FbKeyedApplyState *state,
 					 const Datum *values,
 					 const bool *nulls)
@@ -551,6 +691,12 @@ fb_keyed_find_typed_entry(FbKeyedApplyState *state,
 	FbKeyedBucket *bucket;
 	FbKeyedEntry *entry;
 
+	if (state->single_typed_index != NULL && state->key_natts == 1)
+		return fb_keyed_find_single_typed_entry_hashed(state,
+													   hash_value,
+													   values[0],
+													   nulls[0]);
+
 	bucket = (FbKeyedBucket *) hash_search(state->buckets,
 										   &hash_value,
 										   HASH_FIND,
@@ -568,6 +714,27 @@ fb_keyed_find_typed_entry(FbKeyedApplyState *state,
 	}
 
 	return NULL;
+}
+
+static FbKeyedEntry *
+fb_keyed_find_single_typed_entry(FbKeyedApplyState *state,
+								 Datum key_value,
+								 bool key_isnull)
+{
+	Datum values[INDEX_MAX_KEYS];
+	bool nulls[INDEX_MAX_KEYS];
+	uint32 hash_value;
+
+	if (state == NULL || !state->use_typed_keys || state->key_natts != 1)
+		return NULL;
+
+	values[0] = key_value;
+	nulls[0] = key_isnull;
+	hash_value = fb_keyed_single_typed_hash_value(state, key_value, key_isnull);
+	return fb_keyed_find_single_typed_entry_hashed(state,
+												   hash_value,
+												   values[0],
+												   nulls[0]);
 }
 
 /*
@@ -608,6 +775,7 @@ fb_keyed_create_entry(FbKeyedApplyState *state,
 
 	entry = palloc0(sizeof(*entry));
 	fb_keyed_charge_bytes(state, sizeof(*entry), "apply keyed changed-key entry");
+	state->entry_count++;
 	entry->hash_value = hash_value;
 	bucket = (FbKeyedBucket *) hash_search(state->buckets, &hash_value, HASH_ENTER, &found);
 	if (!found)
@@ -622,6 +790,54 @@ fb_keyed_create_entry(FbKeyedApplyState *state,
 	state->entries_tail = entry;
 
 	return entry;
+}
+
+static void
+fb_keyed_build_single_typed_index(FbKeyedApplyState *state)
+{
+	uint32 size = 1;
+	uint32 filter_size = 64;
+	uint32 filter_words;
+	FbKeyedEntry *entry;
+
+	if (state == NULL ||
+		!state->use_typed_keys ||
+		state->key_natts != 1 ||
+		state->entry_count == 0 ||
+		state->single_typed_index != NULL)
+		return;
+
+	while (size < state->entry_count * 2)
+		size <<= 1;
+	state->single_typed_index = palloc0(sizeof(FbKeyedEntry *) * size);
+	state->single_typed_index_mask = size - 1;
+	fb_keyed_charge_bytes(state,
+						  sizeof(FbKeyedEntry *) * size,
+						  "apply keyed single typed index");
+	while (filter_size < state->entry_count * 16)
+		filter_size <<= 1;
+	filter_words = filter_size / 64;
+	state->single_typed_filter_bits = palloc0(sizeof(uint64) * filter_words);
+	state->single_typed_filter_mask = filter_size - 1;
+	fb_keyed_charge_bytes(state,
+						  sizeof(uint64) * filter_words,
+						  "apply keyed single typed filter");
+
+	for (entry = state->entries_head; entry != NULL; entry = entry->all_next)
+	{
+		uint32 probe = fb_keyed_single_typed_probe(entry->hash_value,
+												   state->single_typed_index_mask);
+		uint32 bitno1 = entry->hash_value & state->single_typed_filter_mask;
+		uint32 bitno2 =
+			murmurhash32(entry->hash_value ^ 0x85ebca6bU) &
+			state->single_typed_filter_mask;
+
+		while (state->single_typed_index[probe] != NULL)
+			probe = (probe + 1) & state->single_typed_index_mask;
+		state->single_typed_index[probe] = entry;
+		state->single_typed_filter_bits[bitno1 >> 6] |= UINT64CONST(1) << (bitno1 & 63);
+		state->single_typed_filter_bits[bitno2 >> 6] |= UINT64CONST(1) << (bitno2 & 63);
+	}
 }
 
 static FbKeyedEntry *
@@ -750,10 +966,131 @@ fb_keyed_record_state(FbKeyedApplyState *state,
 	fb_keyed_replace_tuple(state, entry, replacement_tuple);
 }
 
+static bool
+fb_keyed_tuple_matches_shard(FbKeyedApplyState *state,
+							 HeapTuple tuple,
+							 int shard_id,
+							 int shard_count)
+{
+	if (tuple == NULL)
+		return false;
+	if (shard_id < 0 || shard_count <= 1)
+		return true;
+
+	if (state->use_typed_keys)
+	{
+		Datum values[INDEX_MAX_KEYS];
+		bool nulls[INDEX_MAX_KEYS];
+		uint32 hash_value;
+
+		fb_keyed_extract_tuple_values(state, tuple, values, nulls);
+		hash_value = fb_keyed_hash_values(state, values, nulls);
+		return ((int) (hash_value % (uint32) shard_count)) == shard_id;
+	}
+	else
+	{
+		char *identity;
+		uint32 hash_value;
+		bool matched;
+
+		identity = fb_apply_build_key_identity(state->info, tuple, state->tupdesc);
+		hash_value = fb_apply_hash_identity(identity);
+		matched = ((int) (hash_value % (uint32) shard_count)) == shard_id;
+		pfree(identity);
+		return matched;
+	}
+}
+
 /*
  * fb_keyed_apply_begin
  *    Keyed apply entry point.
  */
+
+void *
+fb_keyed_apply_begin_reader_ex(const FbRelationInfo *info,
+								 TupleDesc tupdesc,
+								 FbReverseOpReader *reader,
+								 long bucket_target,
+								 uint64 tracked_bytes,
+								 uint64 memory_limit_bytes,
+								 int shard_id,
+								 int shard_count,
+								 bool force_string_keys)
+{
+	FbKeyedApplyState *state;
+	FbReverseOp op;
+
+	state = palloc0(sizeof(*state));
+	state->info = info;
+	state->tupdesc = tupdesc;
+	state->tracked_bytes = tracked_bytes;
+	state->memory_limit_bytes = memory_limit_bytes;
+	state->force_string_keys = force_string_keys;
+	state->buckets = fb_apply_create_bucket_hash("fb keyed changed keys",
+												 bucket_target);
+	fb_keyed_init_key_meta(state);
+
+	while (fb_reverse_reader_next(reader, &op))
+	{
+		switch (op.type)
+		{
+			case FB_REVERSE_REMOVE:
+				if (fb_keyed_tuple_matches_shard(state,
+												 op.new_row.tuple,
+												 shard_id,
+												 shard_count))
+					fb_keyed_record_state(state, op.new_row.tuple, NULL);
+				break;
+			case FB_REVERSE_ADD:
+				if (fb_keyed_tuple_matches_shard(state,
+												 op.old_row.tuple,
+												 shard_id,
+												 shard_count))
+					fb_keyed_record_state(state,
+										  op.old_row.tuple,
+										  op.old_row.tuple);
+				break;
+			case FB_REVERSE_REPLACE:
+				if (fb_keyed_tuple_matches_shard(state,
+												 op.new_row.tuple,
+												 shard_id,
+												 shard_count))
+					fb_keyed_record_state(state, op.new_row.tuple, NULL);
+				if (fb_keyed_tuple_matches_shard(state,
+												 op.old_row.tuple,
+												 shard_id,
+												 shard_count))
+					fb_keyed_record_state(state,
+										  op.old_row.tuple,
+										  op.old_row.tuple);
+				break;
+		}
+	}
+
+	fb_keyed_build_single_typed_index(state);
+	return state;
+}
+
+void *
+fb_keyed_apply_begin_reader(const FbRelationInfo *info,
+							  TupleDesc tupdesc,
+							  FbReverseOpReader *reader,
+							  long bucket_target,
+							  uint64 tracked_bytes,
+							  uint64 memory_limit_bytes,
+							  int shard_id,
+							  int shard_count)
+{
+	return fb_keyed_apply_begin_reader_ex(info,
+										  tupdesc,
+										  reader,
+										  bucket_target,
+										  tracked_bytes,
+										  memory_limit_bytes,
+										  shard_id,
+										  shard_count,
+										  false);
+}
 
 void *
 fb_keyed_apply_begin(const FbRelationInfo *info,
@@ -762,36 +1099,17 @@ fb_keyed_apply_begin(const FbRelationInfo *info,
 {
 	FbKeyedApplyState *state;
 	FbReverseOpReader *reader;
-	FbReverseOp op;
-
-	state = palloc0(sizeof(*state));
-	state->info = info;
-	state->tupdesc = tupdesc;
-	state->buckets = fb_apply_create_bucket_hash("fb keyed changed keys",
-												 fb_keyed_bucket_target(source));
-	state->tracked_bytes = fb_reverse_source_tracked_bytes(source);
-	state->memory_limit_bytes = fb_reverse_source_memory_limit_bytes(source);
-	fb_keyed_init_key_meta(state);
 
 	reader = fb_reverse_reader_open(source);
-	while (fb_reverse_reader_next(reader, &op))
-	{
-		switch (op.type)
-		{
-			case FB_REVERSE_REMOVE:
-				fb_keyed_record_state(state, op.new_row.tuple, NULL);
-				break;
-			case FB_REVERSE_ADD:
-				fb_keyed_record_state(state, op.old_row.tuple, op.old_row.tuple);
-				break;
-			case FB_REVERSE_REPLACE:
-				fb_keyed_record_state(state, op.new_row.tuple, NULL);
-				fb_keyed_record_state(state, op.old_row.tuple, op.old_row.tuple);
-				break;
-		}
-	}
+	state = fb_keyed_apply_begin_reader(info,
+										 tupdesc,
+										 reader,
+										 fb_keyed_bucket_target(source),
+										 fb_reverse_source_tracked_bytes(source),
+										 fb_reverse_source_memory_limit_bytes(source),
+										 -1,
+										 0);
 	fb_reverse_reader_close(reader);
-
 	return state;
 }
 
@@ -811,13 +1129,18 @@ fb_keyed_apply_process_current(void *arg,
 
 	if (state->use_typed_keys)
 	{
-		Datum values[INDEX_MAX_KEYS];
-		bool nulls[INDEX_MAX_KEYS];
-		uint32 hash_value;
+		if (state->key_natts == 1)
+			entry = fb_keyed_find_single_typed_entry_slot(state, slot, NULL, NULL);
+		else
+		{
+			Datum values[INDEX_MAX_KEYS];
+			bool nulls[INDEX_MAX_KEYS];
+			uint32 hash_value;
 
-		fb_keyed_extract_slot_values(state, slot, values, nulls);
-		hash_value = fb_keyed_hash_values(state, values, nulls);
-		entry = fb_keyed_find_typed_entry(state, hash_value, values, nulls);
+			fb_keyed_extract_slot_values(state, slot, values, nulls);
+			hash_value = fb_keyed_hash_values(state, values, nulls);
+			entry = fb_keyed_find_typed_entry(state, hash_value, values, nulls);
+		}
 	}
 	else
 	{
@@ -844,18 +1167,50 @@ fb_keyed_apply_process_current_emit(void *arg,
 									TupleTableSlot *slot,
 									FbApplyEmit *emit)
 {
+	return fb_keyed_apply_process_current_emit_identity(arg,
+														slot,
+														emit,
+														NULL);
+}
+
+bool
+fb_keyed_apply_process_current_emit_identity(void *arg,
+											 TupleTableSlot *slot,
+											 FbApplyEmit *emit,
+											 char **matched_identity_out)
+{
 	FbKeyedApplyState *state = (FbKeyedApplyState *) arg;
 	FbKeyedEntry *entry;
 
+	if (matched_identity_out != NULL)
+		*matched_identity_out = NULL;
+
 	if (state->use_typed_keys)
 	{
-		Datum values[INDEX_MAX_KEYS];
-		bool nulls[INDEX_MAX_KEYS];
-		uint32 hash_value;
+		Datum key_value = (Datum) 0;
+		bool key_isnull = true;
 
-		fb_keyed_extract_slot_values(state, slot, values, nulls);
-		hash_value = fb_keyed_hash_values(state, values, nulls);
-		entry = fb_keyed_find_typed_entry(state, hash_value, values, nulls);
+		if (state->key_natts == 1)
+			entry = fb_keyed_find_single_typed_entry_slot(state,
+														  slot,
+														  &key_value,
+														  &key_isnull);
+		else
+		{
+			Datum values[INDEX_MAX_KEYS];
+			bool nulls[INDEX_MAX_KEYS];
+			uint32 hash_value;
+
+			fb_keyed_extract_slot_values(state, slot, values, nulls);
+			hash_value = fb_keyed_hash_values(state, values, nulls);
+			entry = fb_keyed_find_typed_entry(state, hash_value, values, nulls);
+			key_value = values[0];
+			key_isnull = nulls[0];
+		}
+		if (entry != NULL && matched_identity_out != NULL)
+			*matched_identity_out = fb_apply_build_key_identity_slot(state->info,
+																	 slot,
+																	 state->tupdesc);
 	}
 	else
 	{
@@ -863,7 +1218,10 @@ fb_keyed_apply_process_current_emit(void *arg,
 
 		identity = fb_apply_build_key_identity_slot(state->info, slot, state->tupdesc);
 		entry = fb_keyed_find_string_entry(state->buckets, identity);
-		pfree(identity);
+		if (entry != NULL && matched_identity_out != NULL)
+			*matched_identity_out = identity;
+		else
+			pfree(identity);
 	}
 
 	return fb_keyed_emit_current(entry, slot, emit);
@@ -927,6 +1285,307 @@ fb_keyed_apply_next_residual_emit(void *arg, FbApplyEmit *emit)
 	FbKeyedApplyState *state = (FbKeyedApplyState *) arg;
 
 	return fb_keyed_emit_residual(state, emit);
+}
+
+bool
+fb_keyed_apply_emit_missing_key(void *arg,
+								   Datum key_value,
+								   bool key_isnull,
+								   FbApplyEmit *emit)
+{
+	FbKeyedApplyState *state = (FbKeyedApplyState *) arg;
+	FbKeyedEntry *entry;
+
+	if (state == NULL || emit == NULL)
+		return false;
+
+	entry = fb_keyed_find_single_typed_entry(state, key_value, key_isnull);
+	if (entry == NULL || entry->current_seen || entry->replacement_tuple == NULL)
+		return false;
+
+	entry->current_seen = true;
+	emit->kind = FB_APPLY_EMIT_TUPLE;
+	emit->slot = NULL;
+	emit->tuple = entry->replacement_tuple;
+	return true;
+}
+
+bool
+fb_keyed_apply_supports_single_typed_key(void *arg)
+{
+	FbKeyedApplyState *state = (FbKeyedApplyState *) arg;
+
+	if (state == NULL)
+		return false;
+
+	return state->use_typed_keys && state->key_natts == 1;
+}
+
+bool
+fb_keyed_apply_supports_parallel_single_typed_key(void *arg)
+{
+	FbKeyedApplyState *state = (FbKeyedApplyState *) arg;
+
+	if (!fb_keyed_apply_supports_single_typed_key(arg))
+		return false;
+
+	return state->key_meta[0].attlen > 0;
+}
+
+bool
+fb_keyed_apply_process_current_emit_typed_key(void *arg,
+											  TupleTableSlot *slot,
+											  FbApplyEmit *emit,
+											  Datum *matched_key_out,
+											  bool *matched_isnull_out,
+											  bool *matched_out)
+{
+	FbKeyedApplyState *state = (FbKeyedApplyState *) arg;
+	Datum values[INDEX_MAX_KEYS];
+	bool nulls[INDEX_MAX_KEYS];
+	uint32 hash_value;
+	FbKeyedEntry *entry;
+
+	if (matched_key_out != NULL)
+		*matched_key_out = (Datum) 0;
+	if (matched_isnull_out != NULL)
+		*matched_isnull_out = true;
+	if (matched_out != NULL)
+		*matched_out = false;
+	if (!fb_keyed_apply_supports_parallel_single_typed_key(arg))
+		return fb_keyed_apply_process_current_emit(arg, slot, emit);
+
+	if (state->key_natts == 1)
+	{
+		entry = fb_keyed_find_single_typed_entry_slot(state,
+													  slot,
+													  values,
+													  nulls);
+	}
+	else
+	{
+		fb_keyed_extract_slot_values(state, slot, values, nulls);
+		hash_value = fb_keyed_hash_values(state, values, nulls);
+		entry = fb_keyed_find_typed_entry(state, hash_value, values, nulls);
+	}
+	if (entry != NULL)
+	{
+		if (matched_key_out != NULL)
+			*matched_key_out = values[0];
+		if (matched_isnull_out != NULL)
+			*matched_isnull_out = nulls[0];
+		if (matched_out != NULL)
+			*matched_out = true;
+	}
+
+	return fb_keyed_emit_current(entry, slot, emit);
+}
+
+void
+fb_keyed_apply_serialize_single_typed_key(void *arg,
+										  Datum key_value,
+										  bool key_isnull,
+										  StringInfo buf)
+{
+	FbKeyedApplyState *state = (FbKeyedApplyState *) arg;
+	const FbKeyedAttrMeta *meta;
+	uint32 payload_len;
+
+	if (!fb_keyed_apply_supports_parallel_single_typed_key(arg) || buf == NULL)
+		elog(ERROR, "fb keyed apply cannot serialize non-fixed typed key");
+
+	meta = &state->key_meta[0];
+	resetStringInfo(buf);
+	appendBinaryStringInfo(buf, (const char *) &key_isnull, sizeof(key_isnull));
+	payload_len = key_isnull ? 0 : (uint32) meta->attlen;
+	appendBinaryStringInfo(buf, (const char *) &payload_len, sizeof(payload_len));
+	if (payload_len == 0)
+		return;
+
+	if (meta->attbyval)
+	{
+		char raw[sizeof(Datum)];
+
+		store_att_byval(raw, key_value, meta->attlen);
+		appendBinaryStringInfo(buf, raw, payload_len);
+	}
+	else
+		appendBinaryStringInfo(buf, DatumGetPointer(key_value), payload_len);
+}
+
+void
+fb_keyed_apply_mark_serialized_single_typed_seen(void *arg,
+												 const void *data,
+												 Size len)
+{
+	FbKeyedApplyState *state = (FbKeyedApplyState *) arg;
+	const FbKeyedAttrMeta *meta;
+	const char *ptr = (const char *) data;
+	bool key_isnull;
+	uint32 payload_len;
+	Datum key_value = (Datum) 0;
+	FbKeyedEntry *entry;
+	void *temp_copy = NULL;
+
+	if (!fb_keyed_apply_supports_parallel_single_typed_key(arg) ||
+		data == NULL || len < sizeof(key_isnull) + sizeof(payload_len))
+		elog(ERROR, "fb keyed apply received invalid typed seen-key payload");
+
+	meta = &state->key_meta[0];
+	memcpy(&key_isnull, ptr, sizeof(key_isnull));
+	ptr += sizeof(key_isnull);
+	memcpy(&payload_len, ptr, sizeof(payload_len));
+	ptr += sizeof(payload_len);
+	if ((Size) (sizeof(key_isnull) + sizeof(payload_len) + payload_len) != len)
+		elog(ERROR, "fb keyed apply typed seen-key payload length mismatch");
+	if (!key_isnull && payload_len != (uint32) meta->attlen)
+		elog(ERROR, "fb keyed apply typed seen-key width mismatch");
+
+	if (!key_isnull)
+	{
+		if (meta->attbyval)
+			key_value = fetch_att(ptr, true, meta->attlen);
+		else
+		{
+			temp_copy = palloc(payload_len);
+			memcpy(temp_copy, ptr, payload_len);
+			key_value = PointerGetDatum(temp_copy);
+		}
+	}
+
+	entry = fb_keyed_find_single_typed_entry(state, key_value, key_isnull);
+	if (temp_copy != NULL)
+		pfree(temp_copy);
+	if (entry == NULL)
+		elog(ERROR, "fb keyed apply missing changed key during parallel merge");
+	if (entry->current_seen)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("fb keyed apply saw duplicate current row for one key")));
+
+	entry->current_seen = true;
+}
+
+FbKeyedResidualItem *
+fb_keyed_apply_collect_residual_items(void *arg, uint64 *count_out)
+{
+	FbKeyedApplyState *state = (FbKeyedApplyState *) arg;
+	FbKeyedEntry *entry;
+	FbKeyedResidualItem *items;
+	uint64 count = 0;
+	uint64 i = 0;
+
+	if (count_out != NULL)
+		*count_out = 0;
+	if (state == NULL || !state->use_typed_keys || state->key_natts != 1)
+		return NULL;
+
+	for (entry = state->entries_head; entry != NULL; entry = entry->all_next)
+	{
+		if (entry->replacement_tuple != NULL)
+			count++;
+	}
+	if (count == 0)
+		return NULL;
+
+	items = palloc0(sizeof(*items) * count);
+	for (entry = state->entries_head; entry != NULL; entry = entry->all_next)
+	{
+		if (entry->replacement_tuple == NULL)
+			continue;
+		items[i].key_value = entry->key_values[0];
+		items[i].key_isnull = entry->key_nulls[0];
+		items[i].tuple = entry->replacement_tuple;
+		items[i].cookie = entry;
+		i++;
+	}
+
+	if (count_out != NULL)
+		*count_out = count;
+	return items;
+}
+
+FbKeyedDeleteKey *
+fb_keyed_apply_collect_delete_keys(void *arg, uint64 *count_out)
+{
+	FbKeyedApplyState *state = (FbKeyedApplyState *) arg;
+	FbKeyedEntry *entry;
+	FbKeyedDeleteKey *items;
+	uint64 count = 0;
+	uint64 i = 0;
+
+	if (count_out != NULL)
+		*count_out = 0;
+	if (state == NULL || !state->use_typed_keys || state->key_natts != 1)
+		return NULL;
+
+	for (entry = state->entries_head; entry != NULL; entry = entry->all_next)
+	{
+		if (entry->replacement_tuple == NULL)
+			count++;
+	}
+	if (count == 0)
+		return NULL;
+
+	items = palloc0(sizeof(*items) * count);
+	for (entry = state->entries_head; entry != NULL; entry = entry->all_next)
+	{
+		if (entry->replacement_tuple != NULL)
+			continue;
+		items[i].key_value = entry->key_values[0];
+		items[i].key_isnull = entry->key_nulls[0];
+		i++;
+	}
+
+	if (count_out != NULL)
+		*count_out = count;
+	return items;
+}
+
+bool
+fb_keyed_apply_residual_item_ready(const FbKeyedResidualItem *item)
+{
+	FbKeyedEntry *entry;
+
+	if (item == NULL || item->cookie == NULL)
+		return false;
+
+	entry = (FbKeyedEntry *) item->cookie;
+	return !entry->current_seen && entry->replacement_tuple != NULL;
+}
+
+void
+fb_keyed_apply_residual_item_mark_emitted(FbKeyedResidualItem *item)
+{
+	FbKeyedEntry *entry;
+
+	if (item == NULL || item->cookie == NULL)
+		return;
+
+	entry = (FbKeyedEntry *) item->cookie;
+	entry->current_seen = true;
+}
+
+void
+fb_keyed_apply_mark_identity_seen(void *arg, const char *identity)
+{
+	FbKeyedApplyState *state = (FbKeyedApplyState *) arg;
+	FbKeyedEntry *entry;
+
+	if (state == NULL || identity == NULL)
+		return;
+	if (state->use_typed_keys)
+		elog(ERROR, "fb keyed apply cannot merge string identities into typed-key state");
+
+	entry = fb_keyed_find_string_entry(state->buckets, identity);
+	if (entry == NULL)
+		elog(ERROR, "fb keyed apply missing changed key during parallel merge");
+	if (entry->current_seen)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("fb keyed apply saw duplicate current row for one key")));
+
+	entry->current_seen = true;
 }
 
 /*
