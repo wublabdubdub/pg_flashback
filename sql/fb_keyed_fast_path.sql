@@ -81,6 +81,63 @@ FROM pg_flashback(
 WHERE id IN (2, 4, 7)
 ORDER BY id;
 
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT *
+FROM pg_flashback(
+	NULL::public.fb_keyed_fast_path_target,
+	(SELECT target_ts::text FROM fb_keyed_fast_path_mark)
+)
+WHERE id BETWEEN 2 AND 4
+ORDER BY id;
+
+SELECT *
+FROM pg_flashback(
+	NULL::public.fb_keyed_fast_path_target,
+	(SELECT target_ts::text FROM fb_keyed_fast_path_mark)
+)
+WHERE id BETWEEN 2 AND 4
+ORDER BY id;
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT *
+FROM pg_flashback(
+	NULL::public.fb_keyed_fast_path_target,
+	(SELECT target_ts::text FROM fb_keyed_fast_path_mark)
+)
+WHERE id > 2 AND id <= 5
+ORDER BY id DESC
+LIMIT 2;
+
+SELECT *
+FROM pg_flashback(
+	NULL::public.fb_keyed_fast_path_target,
+	(SELECT target_ts::text FROM fb_keyed_fast_path_mark)
+)
+WHERE id > 2 AND id <= 5
+ORDER BY id DESC
+LIMIT 2;
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT id,
+	   length(payload) AS payload_len,
+	   amount
+FROM pg_flashback(
+	NULL::public.fb_keyed_fast_path_target,
+	(SELECT target_ts::text FROM fb_keyed_fast_path_mark)
+)
+WHERE 2 < id AND id < 6
+ORDER BY id;
+
+SELECT id,
+	   length(payload) AS payload_len,
+	   amount
+FROM pg_flashback(
+	NULL::public.fb_keyed_fast_path_target,
+	(SELECT target_ts::text FROM fb_keyed_fast_path_mark)
+)
+WHERE 2 < id AND id < 6
+ORDER BY id;
+
 SELECT id,
 	   length(payload) AS payload_len,
 	   amount

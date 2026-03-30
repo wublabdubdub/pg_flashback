@@ -106,11 +106,11 @@ typedef struct FbApplyFastPathState
 	FbFastPathSpec spec;
 	Relation index_rel;
 	IndexScanDesc index_scan;
-	ScanKeyData scankey;
-	bool scankey_ready;
+	ScanKeyData scankeys[2];
+	int scankey_count;
+	bool scankeys_ready;
 	int key_cursor;
 	uint64 emitted_count;
-	TupleTableSlot *buffer_slot;
 	FbKeyedResidualItem *residual_items;
 	uint64 residual_count;
 	uint64 residual_cursor;
@@ -187,6 +187,9 @@ static void fb_apply_parallel_merge_seen(FbApplyContext *ctx,
 										 uint32 item_count);
 static bool fb_apply_parallel_materialize(FbApplyContext *ctx,
 										   const FbReverseOpSource *source);
+static void fb_apply_reset_buffered_emit(FbApplyBufferedEmit *buffer);
+static void fb_apply_take_buffered_emit(FbApplyBufferedEmit *buffer,
+										FbApplyEmit *emit);
 
 static FbApplyParallelTask *
 fb_apply_parallel_tasks(FbApplyParallelShared *shared)
@@ -212,6 +215,32 @@ fb_apply_parallel_tuple_queue(FbApplyParallelShared *shared, int task_index)
 	return (shm_mq *) ((char *) shared +
 					   shared->tuple_queue_offset +
 					   (shared->tuple_queue_stride * task_index));
+}
+
+static void
+fb_apply_reset_buffered_emit(FbApplyBufferedEmit *buffer)
+{
+	if (buffer == NULL)
+		return;
+
+	if (buffer->emit.owned_tuple && buffer->emit.tuple != NULL)
+		heap_freetuple(buffer->emit.tuple);
+	MemSet(buffer, 0, sizeof(*buffer));
+}
+
+static void
+fb_apply_take_buffered_emit(FbApplyBufferedEmit *buffer, FbApplyEmit *emit)
+{
+	if (buffer == NULL || emit == NULL)
+		return;
+
+	*emit = buffer->emit;
+	buffer->ready = false;
+	buffer->emit.kind = FB_APPLY_EMIT_NONE;
+	buffer->emit.slot = NULL;
+	buffer->emit.tuple = NULL;
+	buffer->emit.owned_tuple = false;
+	buffer->residual_item = NULL;
 }
 
 static void
@@ -470,10 +499,15 @@ fb_apply_copy_fast_path_spec(FbFastPathSpec *dst, const FbFastPathSpec *src)
 		return;
 
 	*dst = *src;
+	get_typlenbyval(src->key_type_oid, &typlen, &typbyval);
+
+	if (src->has_lower_bound && !src->lower_isnull)
+		dst->lower_value = datumCopy(src->lower_value, typbyval, typlen);
+	if (src->has_upper_bound && !src->upper_isnull)
+		dst->upper_value = datumCopy(src->upper_value, typbyval, typlen);
+
 	if (src->key_count <= 0 || src->key_values == NULL)
 		return;
-
-	get_typlenbyval(src->key_type_oid, &typlen, &typbyval);
 	dst->key_values = palloc0(sizeof(Datum) * src->key_count);
 	dst->key_nulls = palloc0(sizeof(bool) * src->key_count);
 	for (i = 0; i < src->key_count; i++)
@@ -583,6 +617,47 @@ fb_apply_sort_residual_items(FbApplyFastPathState *fast)
 			  fast);
 }
 
+static bool
+fb_apply_fast_key_in_range(FbApplyFastPathState *fast,
+						   Datum value,
+						   bool isnull)
+{
+	int cmp;
+
+	if (fast == NULL)
+		return false;
+	if (isnull)
+		return false;
+
+	if (fast->spec.has_lower_bound)
+	{
+		cmp = fb_apply_compare_key_values(fast,
+										  value,
+										  isnull,
+										  fast->spec.lower_value,
+										  fast->spec.lower_isnull);
+		if (cmp < 0)
+			return false;
+		if (cmp == 0 && !fast->spec.lower_inclusive)
+			return false;
+	}
+
+	if (fast->spec.has_upper_bound)
+	{
+		cmp = fb_apply_compare_key_values(fast,
+										  value,
+										  isnull,
+										  fast->spec.upper_value,
+										  fast->spec.upper_isnull);
+		if (cmp > 0)
+			return false;
+		if (cmp == 0 && !fast->spec.upper_inclusive)
+			return false;
+	}
+
+	return true;
+}
+
 static void
 fb_apply_extract_key_from_slot(FbApplyContext *ctx,
 								 TupleTableSlot *slot,
@@ -630,22 +705,19 @@ fb_apply_buffer_emit(FbApplyContext *ctx,
 					   FbKeyedResidualItem *residual_item,
 					   FbApplyBufferedEmit *buffer)
 {
-	MemSet(buffer, 0, sizeof(*buffer));
+	fb_apply_reset_buffered_emit(buffer);
 	buffer->ready = true;
 	buffer->residual_item = residual_item;
 
 	if (emit->kind == FB_APPLY_EMIT_SLOT)
 	{
-		ExecClearTuple(ctx->fast_state->buffer_slot);
-		ExecCopySlot(ctx->fast_state->buffer_slot, emit->slot);
-		buffer->emit.kind = FB_APPLY_EMIT_SLOT;
-		buffer->emit.slot = ctx->fast_state->buffer_slot;
+		buffer->emit.kind = FB_APPLY_EMIT_TUPLE;
+		buffer->emit.slot = NULL;
+		buffer->emit.tuple = ExecCopySlotHeapTuple(emit->slot);
+		buffer->emit.owned_tuple = true;
 	}
 	else
-	{
-		buffer->emit.kind = FB_APPLY_EMIT_TUPLE;
-		buffer->emit.tuple = emit->tuple;
-	}
+		buffer->emit = *emit;
 
 	fb_apply_extract_key_from_emit(ctx, &buffer->emit, &buffer->key_value, &buffer->key_isnull);
 }
@@ -1219,11 +1291,8 @@ fb_apply_cleanup_scan_resources(FbApplyContext *ctx)
 
 	if (ctx->fast_state != NULL)
 	{
-		if (ctx->fast_state->buffer_slot != NULL)
-		{
-			ExecDropSingleTupleTableSlot(ctx->fast_state->buffer_slot);
-			ctx->fast_state->buffer_slot = NULL;
-		}
+		fb_apply_reset_buffered_emit(&ctx->fast_state->current_candidate);
+		fb_apply_reset_buffered_emit(&ctx->fast_state->residual_candidate);
 
 		if (ctx->fast_state->index_scan != NULL)
 		{
@@ -1372,7 +1441,6 @@ fb_apply_fast_path_init(FbApplyContext *ctx)
 	fast = palloc0(sizeof(*fast));
 	fb_apply_copy_fast_path_spec(&fast->spec, ctx->fast_path);
 	fast->index_rel = index_open(ctx->info->key_index_oid, AccessShareLock);
-	fast->buffer_slot = table_slot_create(ctx->rel, NULL);
 	fast->key_cursor = 0;
 
 	get_typlenbyval(fast->spec.key_type_oid, &fast->key_typlen, &fast->key_typbyval);
@@ -1385,12 +1453,14 @@ fb_apply_fast_path_init(FbApplyContext *ctx)
 
 	if (fast->spec.ordered_output && fast->spec.mode != FB_FAST_PATH_KEY_EQ)
 		fb_apply_sort_fast_keys(fast);
-	if (fast->spec.mode == FB_FAST_PATH_KEY_TOPN)
+	if (fast->spec.mode == FB_FAST_PATH_KEY_TOPN ||
+		fast->spec.mode == FB_FAST_PATH_KEY_RANGE)
 	{
+		int key_count = 0;
+
 		if (!fast->has_cmp)
 		{
 			index_close(fast->index_rel, AccessShareLock);
-			ExecDropSingleTupleTableSlot(fast->buffer_slot);
 			pfree(fast);
 			return;
 		}
@@ -1398,19 +1468,82 @@ fb_apply_fast_path_init(FbApplyContext *ctx)
 		fast->residual_items = fb_keyed_apply_collect_residual_items(ctx->mode_state,
 																	 &residual_count);
 		fast->residual_count = residual_count;
-		fb_apply_sort_residual_items(fast);
+		if (fast->spec.ordered_output)
+			fb_apply_sort_residual_items(fast);
 		fast->index_scan = index_beginscan(ctx->rel,
 										   fast->index_rel,
 										   GetActiveSnapshot(),
 										   NULL,
-										   0,
+										   (fast->spec.mode == FB_FAST_PATH_KEY_RANGE) ? 2 : 0,
 										   0);
+		if (fast->spec.mode == FB_FAST_PATH_KEY_RANGE)
+		{
+			Oid strategy_op;
+			RegProcedure strategy_proc;
+
+			if (fast->spec.has_lower_bound)
+			{
+				strategy_op = get_opfamily_member(
+					fast->index_rel->rd_opfamily[0],
+					fast->index_rel->rd_opcintype[0],
+					fast->index_rel->rd_opcintype[0],
+					fast->spec.lower_inclusive ?
+					BTGreaterEqualStrategyNumber :
+					BTGreaterStrategyNumber);
+				if (!OidIsValid(strategy_op))
+					elog(ERROR, "fb apply missing lower bound operator for range fast path");
+				strategy_proc = get_opcode(strategy_op);
+				if (!OidIsValid(strategy_proc))
+					elog(ERROR, "fb apply missing lower bound procedure for range fast path");
+
+				ScanKeyInit(&fast->scankeys[key_count],
+							1,
+							fast->spec.lower_inclusive ?
+							BTGreaterEqualStrategyNumber :
+							BTGreaterStrategyNumber,
+							strategy_proc,
+							fast->spec.lower_value);
+				key_count++;
+			}
+
+			if (fast->spec.has_upper_bound)
+			{
+				strategy_op = get_opfamily_member(
+					fast->index_rel->rd_opfamily[0],
+					fast->index_rel->rd_opcintype[0],
+					fast->index_rel->rd_opcintype[0],
+					fast->spec.upper_inclusive ?
+					BTLessEqualStrategyNumber :
+					BTLessStrategyNumber);
+				if (!OidIsValid(strategy_op))
+					elog(ERROR, "fb apply missing upper bound operator for range fast path");
+				strategy_proc = get_opcode(strategy_op);
+				if (!OidIsValid(strategy_proc))
+					elog(ERROR, "fb apply missing upper bound procedure for range fast path");
+
+				ScanKeyInit(&fast->scankeys[key_count],
+							1,
+							fast->spec.upper_inclusive ?
+							BTLessEqualStrategyNumber :
+							BTLessStrategyNumber,
+							strategy_proc,
+							fast->spec.upper_value);
+				key_count++;
+			}
+
+			fast->scankey_count = key_count;
+			fast->scankeys_ready = (key_count > 0);
+		}
 		/*
 		 * Even a no-key ordered btree scan must be explicitly rescanned once
 		 * after index_beginscan(); otherwise the AM can reach index_getnext*
 		 * with uninitialized scan state and crash in _bt_start_array_keys().
 		 */
-		index_rescan(fast->index_scan, NULL, 0, NULL, 0);
+		index_rescan(fast->index_scan,
+					 fast->scankeys_ready ? fast->scankeys : NULL,
+					 fast->scankeys_ready ? fast->scankey_count : 0,
+					 NULL,
+					 0);
 	}
 	else
 	{
@@ -1424,7 +1557,6 @@ fb_apply_fast_path_init(FbApplyContext *ctx)
 		if (!OidIsValid(eqop))
 		{
 			index_close(fast->index_rel, AccessShareLock);
-			ExecDropSingleTupleTableSlot(fast->buffer_slot);
 			pfree(fast);
 			return;
 		}
@@ -1432,12 +1564,11 @@ fb_apply_fast_path_init(FbApplyContext *ctx)
 		if (!OidIsValid(eqproc))
 		{
 			index_close(fast->index_rel, AccessShareLock);
-			ExecDropSingleTupleTableSlot(fast->buffer_slot);
 			pfree(fast);
 			return;
 		}
 
-		ScanKeyInit(&fast->scankey,
+		ScanKeyInit(&fast->scankeys[0],
 					1,
 					BTEqualStrategyNumber,
 					eqproc,
@@ -1448,7 +1579,8 @@ fb_apply_fast_path_init(FbApplyContext *ctx)
 										   NULL,
 										   1,
 										   0);
-		fast->scankey_ready = true;
+		fast->scankey_count = 1;
+		fast->scankeys_ready = true;
 	}
 
 	ctx->fast_state = fast;
@@ -1473,7 +1605,7 @@ fb_apply_emit_as_datum(FbApplyContext *ctx, const FbApplyEmit *emit)
 
 static void
 fb_apply_emit_to_slot(FbApplyContext *ctx,
-					  const FbApplyEmit *emit,
+					  FbApplyEmit *emit,
 					  TupleTableSlot *slot)
 {
 	if (ctx == NULL || emit == NULL || slot == NULL)
@@ -1489,7 +1621,8 @@ fb_apply_emit_to_slot(FbApplyContext *ctx,
 			ExecCopySlot(slot, emit->slot);
 			return;
 		case FB_APPLY_EMIT_TUPLE:
-			ExecForceStoreHeapTuple(emit->tuple, slot, false);
+			ExecForceStoreHeapTuple(emit->tuple, slot, emit->owned_tuple);
+			emit->owned_tuple = false;
 			slot->tts_tableOid = ctx->info->relid;
 			return;
 		case FB_APPLY_EMIT_NONE:
@@ -1504,6 +1637,9 @@ fb_apply_release_emit(FbApplyContext *ctx, const FbApplyEmit *emit)
 {
 	if (ctx == NULL || emit == NULL)
 		return;
+
+	if (emit->owned_tuple && emit->tuple != NULL)
+		heap_freetuple(emit->tuple);
 
 	if (emit->kind == FB_APPLY_EMIT_SLOT &&
 		emit->slot != NULL &&
@@ -1531,8 +1667,8 @@ fb_apply_fast_lookup_next_emit(FbApplyContext *ctx, FbApplyEmit *emit)
 		if (key_isnull)
 			continue;
 
-		fast->scankey.sk_argument = key_value;
-		index_rescan(fast->index_scan, &fast->scankey, 1, NULL, 0);
+		fast->scankeys[0].sk_argument = key_value;
+		index_rescan(fast->index_scan, &fast->scankeys[0], 1, NULL, 0);
 		found_current = index_getnext_slot(fast->index_scan,
 										   ForwardScanDirection,
 										   ctx->slot);
@@ -1583,6 +1719,9 @@ fb_apply_fast_fill_residual_candidate(FbApplyContext *ctx)
 		FbKeyedResidualItem *item = &fast->residual_items[fast->residual_cursor++];
 
 		if (!fb_keyed_apply_residual_item_ready(item))
+			continue;
+		if (fast->spec.mode == FB_FAST_PATH_KEY_RANGE &&
+			!fb_apply_fast_key_in_range(fast, item->key_value, item->key_isnull))
 			continue;
 
 		fast->residual_candidate.ready = true;
@@ -1635,14 +1774,14 @@ fb_apply_fast_topn_next_emit(FbApplyContext *ctx, FbApplyEmit *emit)
 
 	if (choose_current)
 	{
-		*emit = fast->current_candidate.emit;
-		fast->current_candidate.ready = false;
+		fb_apply_take_buffered_emit(&fast->current_candidate, emit);
 	}
 	else
 	{
-		*emit = fast->residual_candidate.emit;
-		fb_keyed_apply_residual_item_mark_emitted(fast->residual_candidate.residual_item);
-		fast->residual_candidate.ready = false;
+		FbKeyedResidualItem *item = fast->residual_candidate.residual_item;
+
+		fb_apply_take_buffered_emit(&fast->residual_candidate, emit);
+		fb_keyed_apply_residual_item_mark_emitted(item);
 	}
 
 	fast->emitted_count++;
@@ -1651,6 +1790,94 @@ fb_apply_fast_topn_next_emit(FbApplyContext *ctx, FbApplyEmit *emit)
 								fast->spec.limit_count,
 								NULL);
 	return true;
+}
+
+static bool
+fb_apply_fast_range_next_emit(FbApplyContext *ctx, FbApplyEmit *emit)
+{
+	FbApplyFastPathState *fast = ctx->fast_state;
+	ScanDirection dir = (!fast->spec.ordered_output || fast->spec.order_asc) ?
+		ForwardScanDirection : BackwardScanDirection;
+
+	if (fast->spec.ordered_output)
+	{
+		int cmp = 0;
+		bool choose_current = false;
+
+		if (fast->spec.limit_count > 0 &&
+			fast->emitted_count >= fast->spec.limit_count)
+			return false;
+
+		if (fast->residual_candidate.ready &&
+			!fb_keyed_apply_residual_item_ready(fast->residual_candidate.residual_item))
+			fast->residual_candidate.ready = false;
+
+		fb_apply_fast_fill_current_candidate(ctx);
+		fb_apply_fast_fill_residual_candidate(ctx);
+
+		if (!fast->current_candidate.ready && !fast->residual_candidate.ready)
+			return false;
+		if (fast->current_candidate.ready && !fast->residual_candidate.ready)
+			choose_current = true;
+		else if (!fast->current_candidate.ready && fast->residual_candidate.ready)
+			choose_current = false;
+		else
+		{
+			cmp = fb_apply_compare_key_values(fast,
+											  fast->current_candidate.key_value,
+											  fast->current_candidate.key_isnull,
+											  fast->residual_candidate.key_value,
+											  fast->residual_candidate.key_isnull);
+			if (!fast->spec.order_asc)
+				cmp = -cmp;
+			choose_current = (cmp <= 0);
+		}
+
+		if (choose_current)
+		{
+			fb_apply_take_buffered_emit(&fast->current_candidate, emit);
+		}
+		else
+		{
+			FbKeyedResidualItem *item = fast->residual_candidate.residual_item;
+
+			fb_apply_take_buffered_emit(&fast->residual_candidate, emit);
+			fb_keyed_apply_residual_item_mark_emitted(item);
+		}
+
+		fast->emitted_count++;
+		if (fast->spec.limit_count > 0)
+			fb_progress_update_fraction(FB_PROGRESS_STAGE_APPLY,
+										fast->emitted_count,
+										fast->spec.limit_count,
+										NULL);
+		return true;
+	}
+
+	while (index_getnext_slot(fast->index_scan, dir, ctx->slot))
+	{
+		if (fb_apply_process_current_emit(ctx, ctx->slot, emit))
+			return true;
+		ExecClearTuple(ctx->slot);
+	}
+
+	while (fast->residual_cursor < fast->residual_count)
+	{
+		FbKeyedResidualItem *item = &fast->residual_items[fast->residual_cursor++];
+
+		if (!fb_keyed_apply_residual_item_ready(item))
+			continue;
+		if (!fb_apply_fast_key_in_range(fast, item->key_value, item->key_isnull))
+			continue;
+
+		emit->kind = FB_APPLY_EMIT_TUPLE;
+		emit->slot = NULL;
+		emit->tuple = item->tuple;
+		fb_keyed_apply_residual_item_mark_emitted(item);
+		return true;
+	}
+
+	return false;
 }
 
 static bool
@@ -1667,6 +1894,9 @@ fb_apply_next_fast_emit(FbApplyContext *ctx, FbApplyEmit *emit)
 		case FB_FAST_PATH_KEY_EQ:
 		case FB_FAST_PATH_KEY_IN:
 			emitted = fb_apply_fast_lookup_next_emit(ctx, emit);
+			break;
+		case FB_FAST_PATH_KEY_RANGE:
+			emitted = fb_apply_fast_range_next_emit(ctx, emit);
 			break;
 		case FB_FAST_PATH_KEY_TOPN:
 			emitted = fb_apply_fast_topn_next_emit(ctx, emit);
@@ -1919,7 +2149,8 @@ fb_apply_next_output_slot(FbApplyContext *ctx)
 		return NULL;
 	}
 
-	if (emit.kind == FB_APPLY_EMIT_SLOT)
+	if (emit.kind == FB_APPLY_EMIT_SLOT &&
+		(!ctx->slot_is_bound_output || emit.slot == output_slot))
 		return emit.slot;
 
 	fb_apply_emit_to_slot(ctx, &emit, output_slot);

@@ -7,6 +7,8 @@
 
 #include "access/genam.h"
 #include "access/relation.h"
+#include "access/stratnum.h"
+#include "access/tableam.h"
 #include "access/tupdesc.h"
 #include "catalog/pg_am_d.h"
 #include "commands/explain.h"
@@ -89,6 +91,12 @@ typedef struct FbPlannerFastPathSpec
 	bool ordered_output;
 	bool order_asc;
 	uint64 limit_count;
+	bool has_lower_bound;
+	bool lower_inclusive;
+	Const *lower_const;
+	bool has_upper_bound;
+	bool upper_inclusive;
+	Const *upper_const;
 	List *key_consts;
 } FbPlannerFastPathSpec;
 
@@ -159,6 +167,8 @@ fb_fast_path_mode_name(FbFastPathMode mode)
 			return "key_eq";
 		case FB_FAST_PATH_KEY_IN:
 			return "key_in";
+		case FB_FAST_PATH_KEY_RANGE:
+			return "key_range";
 		case FB_FAST_PATH_KEY_TOPN:
 			return "key_topn";
 		case FB_FAST_PATH_NONE:
@@ -438,7 +448,8 @@ static bool
 fb_flashback_load_fast_key_meta(Oid source_relid,
 								  FbRelationInfo *info,
 								  Oid *key_type_oid,
-								  Oid *key_collation)
+								  Oid *key_collation,
+								  Oid *key_opfamily)
 {
 	Relation rel;
 	Relation index_rel;
@@ -459,6 +470,8 @@ fb_flashback_load_fast_key_meta(Oid source_relid,
 		attr = TupleDescAttr(RelationGetDescr(rel), info->key_attnums[0] - 1);
 		*key_type_oid = attr->atttypid;
 		*key_collation = attr->attcollation;
+		if (key_opfamily != NULL)
+			*key_opfamily = index_rel->rd_opfamily[0];
 		supported = true;
 	}
 
@@ -577,17 +590,43 @@ fb_flashback_limit_const_u64(Node *node, uint64 *limit_out)
 }
 
 static bool
+fb_flashback_op_matches_family_cmptype(Oid opno,
+									   Oid key_opfamily,
+									   CompareType target_cmptype)
+{
+	List *interpretations;
+	ListCell *lc;
+
+	interpretations = get_op_index_interpretation(opno);
+	foreach(lc, interpretations)
+	{
+		OpIndexInterpretation *interp = lfirst(lc);
+
+		if (interp->opfamily_id == key_opfamily &&
+			interp->cmptype == target_cmptype)
+			return true;
+	}
+
+	return false;
+}
+
+static bool
 fb_flashback_match_key_eq_clause(Node *clause,
 								   PlannerInfo *root,
 								   Index relid,
 								   AttrNumber key_attnum,
 								   Oid key_type_oid,
+								   Oid key_opfamily,
 								   FbPlannerFastPathSpec *spec)
 {
 	OpExpr *op = (OpExpr *) strip_implicit_coercions(clause);
 	Const *key_const;
 
 	if (op == NULL || !IsA(op, OpExpr) || list_length(op->args) != 2)
+		return false;
+	if (!fb_flashback_op_matches_family_cmptype(op->opno,
+												key_opfamily,
+												COMPARE_EQ))
 		return false;
 	if (!fb_flashback_is_key_var(linitial(op->args), relid, key_attnum))
 		return false;
@@ -607,6 +646,7 @@ fb_flashback_match_key_in_clause(Node *clause,
 								   Index relid,
 								   AttrNumber key_attnum,
 								   Oid key_type_oid,
+								   Oid key_opfamily,
 								   FbPlannerFastPathSpec *spec)
 {
 	ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) strip_implicit_coercions(clause);
@@ -625,6 +665,10 @@ fb_flashback_match_key_in_clause(Node *clause,
 	if (saop == NULL || !IsA(saop, ScalarArrayOpExpr) || list_length(saop->args) != 2)
 		return false;
 	if (!saop->useOr)
+		return false;
+	if (!fb_flashback_op_matches_family_cmptype(saop->opno,
+												key_opfamily,
+												COMPARE_EQ))
 		return false;
 	if (!fb_flashback_is_key_var(linitial(saop->args), relid, key_attnum))
 		return false;
@@ -667,6 +711,163 @@ fb_flashback_match_key_in_clause(Node *clause,
 	return true;
 }
 
+static int
+fb_flashback_invert_strategy(int strategy)
+{
+	switch (strategy)
+	{
+		case BTLessStrategyNumber:
+			return BTGreaterStrategyNumber;
+		case BTLessEqualStrategyNumber:
+			return BTGreaterEqualStrategyNumber;
+		case BTGreaterStrategyNumber:
+			return BTLessStrategyNumber;
+		case BTGreaterEqualStrategyNumber:
+			return BTLessEqualStrategyNumber;
+		default:
+			return strategy;
+	}
+}
+
+static bool
+fb_flashback_apply_range_strategy(FbPlannerFastPathSpec *spec,
+								  int strategy,
+								  Const *bound_const)
+{
+	if (spec == NULL || bound_const == NULL || bound_const->constisnull)
+		return false;
+
+	switch (strategy)
+	{
+		case BTLessStrategyNumber:
+		case BTLessEqualStrategyNumber:
+			if (spec->has_upper_bound)
+				return false;
+			spec->has_upper_bound = true;
+			spec->upper_inclusive = (strategy == BTLessEqualStrategyNumber);
+			spec->upper_const = bound_const;
+			return true;
+		case BTGreaterStrategyNumber:
+		case BTGreaterEqualStrategyNumber:
+			if (spec->has_lower_bound)
+				return false;
+			spec->has_lower_bound = true;
+			spec->lower_inclusive = (strategy == BTGreaterEqualStrategyNumber);
+			spec->lower_const = bound_const;
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool
+fb_flashback_range_strategy_for_op(Oid opno,
+								   Oid key_opfamily,
+								   int *strategy_out)
+{
+	List *interpretations;
+	ListCell *lc;
+
+	interpretations = get_op_index_interpretation(opno);
+	foreach(lc, interpretations)
+	{
+		OpIndexInterpretation *interp = lfirst(lc);
+
+		if (interp->opfamily_id != key_opfamily)
+			continue;
+
+		switch (interp->cmptype)
+		{
+			case COMPARE_LT:
+				*strategy_out = BTLessStrategyNumber;
+				return true;
+			case COMPARE_LE:
+				*strategy_out = BTLessEqualStrategyNumber;
+				return true;
+			case COMPARE_GT:
+				*strategy_out = BTGreaterStrategyNumber;
+				return true;
+			case COMPARE_GE:
+				*strategy_out = BTGreaterEqualStrategyNumber;
+				return true;
+			default:
+				break;
+		}
+	}
+
+	return false;
+}
+
+static bool
+fb_flashback_match_key_range_clause(Node *clause,
+									PlannerInfo *root,
+									Index relid,
+									AttrNumber key_attnum,
+									Oid key_type_oid,
+									Oid key_opfamily,
+									FbPlannerFastPathSpec *spec)
+{
+	OpExpr *op = (OpExpr *) strip_implicit_coercions(clause);
+	Node *left;
+	Node *right;
+	Const *bound_const = NULL;
+	int strategy;
+
+	if (op == NULL || !IsA(op, OpExpr) || list_length(op->args) != 2)
+		return false;
+
+	left = linitial(op->args);
+	right = lsecond(op->args);
+	if (!fb_flashback_range_strategy_for_op(op->opno, key_opfamily, &strategy))
+		return false;
+
+	if (fb_flashback_is_key_var(left, relid, key_attnum))
+		bound_const = fb_flashback_match_key_const(root, right, key_type_oid);
+	else if (fb_flashback_is_key_var(right, relid, key_attnum))
+	{
+		bound_const = fb_flashback_match_key_const(root, left, key_type_oid);
+		strategy = fb_flashback_invert_strategy(strategy);
+	}
+	else
+		return false;
+
+	if (bound_const == NULL)
+		return false;
+	return fb_flashback_apply_range_strategy(spec, strategy, bound_const);
+}
+
+static bool
+fb_flashback_collect_fast_clauses(Node *clause, List **clauses)
+{
+	BoolExpr *bool_clause;
+	ListCell *lc;
+
+	if (clause == NULL || clauses == NULL)
+		return false;
+
+	clause = strip_implicit_coercions(clause);
+	if (clause == NULL)
+		return false;
+
+	if (!IsA(clause, BoolExpr))
+	{
+		*clauses = lappend(*clauses, clause);
+		return true;
+	}
+
+	bool_clause = (BoolExpr *) clause;
+	if (bool_clause->boolop != AND_EXPR)
+		return false;
+
+	foreach(lc, bool_clause->args)
+	{
+		if (!fb_flashback_collect_fast_clauses(lfirst(lc), clauses))
+			return false;
+	}
+
+	return true;
+}
+
 static bool
 fb_flashback_match_order_key(PlannerInfo *root,
 							 Index relid,
@@ -698,19 +899,35 @@ fb_flashback_build_planner_fast_path(PlannerInfo *root,
 	FbRelationInfo info;
 	Oid key_type_oid = InvalidOid;
 	Oid key_collation = InvalidOid;
+	Oid key_opfamily = InvalidOid;
 	List *actual_clauses = clauses;
+	List *flat_clauses = NIL;
 	bool has_order = false;
 	bool has_limit = false;
 	uint64 limit_count = 0;
 	bool order_asc = true;
-	Node *only_clause = NULL;
+	ListCell *lc;
 
 	MemSet(spec, 0, sizeof(*spec));
-	if (!fb_flashback_load_fast_key_meta(source_relid, &info, &key_type_oid, &key_collation))
+	if (!fb_flashback_load_fast_key_meta(source_relid,
+										 &info,
+										 &key_type_oid,
+										 &key_collation,
+										 &key_opfamily))
 		return false;
 
 	if (actual_clauses == NIL && rel != NULL)
 		actual_clauses = extract_actual_clauses(rel->baserestrictinfo, false);
+
+	if (actual_clauses != NIL)
+	{
+		foreach(lc, actual_clauses)
+		{
+			if (!fb_flashback_collect_fast_clauses(lfirst(lc), &flat_clauses))
+				return false;
+		}
+		actual_clauses = flat_clauses;
+	}
 
 	spec->key_attnum = info.key_attnums[0];
 	spec->key_type_oid = key_type_oid;
@@ -724,22 +941,48 @@ fb_flashback_build_planner_fast_path(PlannerInfo *root,
 
 	if (actual_clauses != NIL)
 	{
-		if (list_length(actual_clauses) != 1)
+		foreach(lc, actual_clauses)
+		{
+			Node *clause = lfirst(lc);
+
+			if (spec->mode == FB_FAST_PATH_NONE &&
+				fb_flashback_match_key_eq_clause(clause,
+												 root,
+												 rel->relid,
+												 spec->key_attnum,
+												 key_type_oid,
+												 key_opfamily,
+												 spec))
+				continue;
+			
+
+			if (spec->mode == FB_FAST_PATH_NONE &&
+				fb_flashback_match_key_in_clause(clause,
+												 root,
+												 rel->relid,
+												 spec->key_attnum,
+												 key_type_oid,
+												 key_opfamily,
+												 spec))
+				continue;
+			
+
+			if ((spec->mode == FB_FAST_PATH_NONE ||
+				 spec->mode == FB_FAST_PATH_KEY_RANGE) &&
+				fb_flashback_match_key_range_clause(clause,
+													root,
+													rel->relid,
+													spec->key_attnum,
+													key_type_oid,
+													key_opfamily,
+													spec))
+			{
+				spec->mode = FB_FAST_PATH_KEY_RANGE;
+				continue;
+			}
+
 			return false;
-		only_clause = linitial(actual_clauses);
-		if (!fb_flashback_match_key_eq_clause(only_clause,
-											  root,
-											  rel->relid,
-											  spec->key_attnum,
-											  key_type_oid,
-											  spec) &&
-			!fb_flashback_match_key_in_clause(only_clause,
-											  root,
-											  rel->relid,
-											  spec->key_attnum,
-											  key_type_oid,
-											  spec))
-			return false;
+		}
 	}
 
 	if (has_order)
@@ -776,6 +1019,12 @@ fb_flashback_serialize_fast_path(const FbPlannerFastPathSpec *spec)
 	Const *ordered_const;
 	Const *order_const;
 	Const *limit_const;
+	Const *has_lower_const;
+	Const *lower_inclusive_const;
+	Const *has_upper_const;
+	Const *upper_inclusive_const;
+	Node *lower_node = NULL;
+	Node *upper_node = NULL;
 	Node *keys_node = NULL;
 
 	if (spec == NULL)
@@ -796,9 +1045,21 @@ fb_flashback_serialize_fast_path(const FbPlannerFastPathSpec *spec)
 							BoolGetDatum(spec->order_asc), false, true);
 	limit_const = makeConst(INT8OID, -1, InvalidOid, sizeof(int64),
 							Int64GetDatum((int64) spec->limit_count), false, true);
+	has_lower_const = makeConst(BOOLOID, -1, InvalidOid, sizeof(bool),
+								BoolGetDatum(spec->has_lower_bound), false, true);
+	lower_inclusive_const = makeConst(BOOLOID, -1, InvalidOid, sizeof(bool),
+									  BoolGetDatum(spec->lower_inclusive), false, true);
+	has_upper_const = makeConst(BOOLOID, -1, InvalidOid, sizeof(bool),
+								BoolGetDatum(spec->has_upper_bound), false, true);
+	upper_inclusive_const = makeConst(BOOLOID, -1, InvalidOid, sizeof(bool),
+									  BoolGetDatum(spec->upper_inclusive), false, true);
 
 	if (spec->key_consts != NIL)
 		keys_node = (Node *) copyObject(spec->key_consts);
+	if (spec->lower_const != NULL)
+		lower_node = (Node *) copyObject(spec->lower_const);
+	if (spec->upper_const != NULL)
+		upper_node = (Node *) copyObject(spec->upper_const);
 
 	private = lappend(private, mode_const);
 	private = lappend(private, attnum_const);
@@ -807,6 +1068,12 @@ fb_flashback_serialize_fast_path(const FbPlannerFastPathSpec *spec)
 	private = lappend(private, ordered_const);
 	private = lappend(private, order_const);
 	private = lappend(private, limit_const);
+	private = lappend(private, has_lower_const);
+	private = lappend(private, lower_inclusive_const);
+	private = lappend(private, lower_node);
+	private = lappend(private, has_upper_const);
+	private = lappend(private, upper_inclusive_const);
+	private = lappend(private, upper_node);
 	private = lappend(private, keys_node);
 	return private;
 }
@@ -823,6 +1090,12 @@ fb_flashback_deserialize_fast_path(List *custom_private,
 	Const *ordered_const;
 	Const *order_const;
 	Const *limit_const;
+	Const *has_lower_const;
+	Const *lower_inclusive_const;
+	Const *has_upper_const;
+	Const *upper_inclusive_const;
+	Node *lower_node;
+	Node *upper_node;
 	Node *keys_node;
 	List *key_consts = NIL;
 	int16 typlen;
@@ -837,7 +1110,7 @@ fb_flashback_deserialize_fast_path(List *custom_private,
 	mode_const = lfirst_node(Const, lc);
 	if ((FbFastPathMode) DatumGetInt32(mode_const->constvalue) == FB_FAST_PATH_NONE)
 		return;
-	if (list_length(custom_private) < 10)
+	if (list_length(custom_private) < 16)
 		return;
 
 	lc = lnext(custom_private, lc);
@@ -853,6 +1126,18 @@ fb_flashback_deserialize_fast_path(List *custom_private,
 	lc = lnext(custom_private, lc);
 	limit_const = lfirst_node(Const, lc);
 	lc = lnext(custom_private, lc);
+	has_lower_const = lfirst_node(Const, lc);
+	lc = lnext(custom_private, lc);
+	lower_inclusive_const = lfirst_node(Const, lc);
+	lc = lnext(custom_private, lc);
+	lower_node = lfirst(lc);
+	lc = lnext(custom_private, lc);
+	has_upper_const = lfirst_node(Const, lc);
+	lc = lnext(custom_private, lc);
+	upper_inclusive_const = lfirst_node(Const, lc);
+	lc = lnext(custom_private, lc);
+	upper_node = lfirst(lc);
+	lc = lnext(custom_private, lc);
 	keys_node = lfirst(lc);
 
 	state->fast_path.mode = (FbFastPathMode) DatumGetInt32(mode_const->constvalue);
@@ -862,6 +1147,28 @@ fb_flashback_deserialize_fast_path(List *custom_private,
 	state->fast_path.ordered_output = DatumGetBool(ordered_const->constvalue);
 	state->fast_path.order_asc = DatumGetBool(order_const->constvalue);
 	state->fast_path.limit_count = (uint64) DatumGetInt64(limit_const->constvalue);
+	state->fast_path.has_lower_bound = DatumGetBool(has_lower_const->constvalue);
+	state->fast_path.lower_inclusive = DatumGetBool(lower_inclusive_const->constvalue);
+	state->fast_path.has_upper_bound = DatumGetBool(has_upper_const->constvalue);
+	state->fast_path.upper_inclusive = DatumGetBool(upper_inclusive_const->constvalue);
+
+	get_typlenbyval(state->fast_path.key_type_oid, &typlen, &typbyval);
+	if (state->fast_path.has_lower_bound && lower_node != NULL && IsA(lower_node, Const))
+	{
+		Const *lower_const = (Const *) lower_node;
+
+		state->fast_path.lower_isnull = lower_const->constisnull;
+		if (!lower_const->constisnull)
+			state->fast_path.lower_value = datumCopy(lower_const->constvalue, typbyval, typlen);
+	}
+	if (state->fast_path.has_upper_bound && upper_node != NULL && IsA(upper_node, Const))
+	{
+		Const *upper_const = (Const *) upper_node;
+
+		state->fast_path.upper_isnull = upper_const->constisnull;
+		if (!upper_const->constisnull)
+			state->fast_path.upper_value = datumCopy(upper_const->constvalue, typbyval, typlen);
+	}
 
 	if (keys_node == NULL || !IsA(keys_node, List))
 		return;
@@ -871,7 +1178,6 @@ fb_flashback_deserialize_fast_path(List *custom_private,
 	if (state->fast_path.key_count <= 0)
 		return;
 
-	get_typlenbyval(state->fast_path.key_type_oid, &typlen, &typbyval);
 	state->fast_path.key_values = palloc0(sizeof(Datum) * state->fast_path.key_count);
 	state->fast_path.key_nulls = palloc0(sizeof(bool) * state->fast_path.key_count);
 
@@ -1559,13 +1865,14 @@ fb_flashback_apply_next(ScanState *scanstate)
 		if (wal_state == NULL || reverse_state == NULL || reverse_state->reverse == NULL)
 			elog(ERROR, "fb custom apply node missing prerequisite state");
 
-			state->apply = fb_apply_begin(&wal_state->info,
-										  wal_state->tupdesc,
-										  reverse_state->reverse,
-										  (state->fast_path.mode == FB_FAST_PATH_NONE) ?
-										  NULL : &state->fast_path);
-			state->stage_ready = true;
-		}
+		state->apply = fb_apply_begin(&wal_state->info,
+									  wal_state->tupdesc,
+									  reverse_state->reverse,
+									  (state->fast_path.mode == FB_FAST_PATH_NONE) ?
+									  NULL : &state->fast_path);
+		fb_apply_bind_output_slot(state->apply, scanstate->ss_ScanTupleSlot);
+		state->stage_ready = true;
+	}
 
 	slot = fb_apply_next_output_slot(state->apply);
 	if (slot == NULL || TupIsNull(slot))
@@ -1577,10 +1884,7 @@ fb_flashback_apply_next(ScanState *scanstate)
 
 	if (slot == scanstate->ss_ScanTupleSlot)
 		return slot;
-
-	ExecClearTuple(scanstate->ss_ScanTupleSlot);
-	ExecCopySlot(scanstate->ss_ScanTupleSlot, slot);
-	return scanstate->ss_ScanTupleSlot;
+	return slot;
 }
 
 static bool
@@ -1618,6 +1922,23 @@ fb_flashback_begin_custom_scan(CustomScanState *node,
 	source_relid_const = lsecond_node(Const, cscan->custom_private);
 	state->source_relid = DatumGetObjectId(source_relid_const->constvalue);
 	fb_flashback_deserialize_fast_path(cscan->custom_private, state);
+
+	if (state->kind == FB_CUSTOM_NODE_APPLY && OidIsValid(state->source_relid))
+	{
+		Relation rel;
+
+		rel = relation_open(state->source_relid, AccessShareLock);
+		ExecInitScanTupleSlot(estate,
+							  &state->css.ss,
+							  RelationGetDescr(rel),
+							  table_slot_callbacks(rel));
+		if (cscan->scan.scanrelid > 0)
+			ExecAssignScanProjectionInfoWithVarno(&state->css.ss,
+												  cscan->scan.scanrelid);
+		else
+			ExecAssignScanProjectionInfo(&state->css.ss);
+		relation_close(rel, AccessShareLock);
+	}
 
 	foreach(lc, cscan->custom_plans)
 	{

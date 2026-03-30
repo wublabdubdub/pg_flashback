@@ -5,11 +5,7 @@
 
 #include "postgres.h"
 
-#include <dirent.h>
-#include <errno.h>
-#include <signal.h>
 #include <sys/stat.h>
-#include <unistd.h>
 
 #include "common/file_perm.h"
 #include "miscadmin.h"
@@ -57,105 +53,6 @@ struct FbSpoolCursor
 };
 
 static uint64 fb_spool_session_counter = 0;
-
-static void
-fb_spool_remove_tree(const char *path)
-{
-	DIR *dir;
-	struct dirent *entry;
-
-	dir = AllocateDir(path);
-	if (dir == NULL)
-	{
-		if (errno == ENOENT)
-			return;
-
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open fb spill directory"),
-				 errdetail("path=%s: %m", path)));
-	}
-
-	while ((entry = ReadDir(dir, path)) != NULL)
-	{
-		char *child;
-		struct stat st;
-
-		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-			continue;
-
-		child = psprintf("%s/%s", path, entry->d_name);
-		if (lstat(child, &st) != 0)
-		{
-			pfree(child);
-			continue;
-		}
-
-		if (S_ISDIR(st.st_mode))
-			fb_spool_remove_tree(child);
-		else
-			unlink(child);
-
-		pfree(child);
-	}
-
-	FreeDir(dir);
-	rmdir(path);
-}
-
-static bool
-fb_spool_pid_is_live(pid_t pid)
-{
-	if (pid <= 0)
-		return false;
-
-	if (kill(pid, 0) == 0)
-		return true;
-
-	return errno != ESRCH;
-}
-
-static void
-fb_spool_cleanup_stale_dirs(void)
-{
-	char *runtime_dir;
-	DIR *dir;
-	struct dirent *entry;
-
-	fb_runtime_ensure_initialized();
-	runtime_dir = fb_runtime_runtime_dir();
-	dir = AllocateDir(runtime_dir);
-	if (dir == NULL)
-	{
-		pfree(runtime_dir);
-		return;
-	}
-
-	while ((entry = ReadDir(dir, runtime_dir)) != NULL)
-	{
-		long pid_value;
-		char *endptr = NULL;
-		char *child;
-
-		if (strncmp(entry->d_name, "fbspill-", 8) != 0)
-			continue;
-
-		pid_value = strtol(entry->d_name + 8, &endptr, 10);
-		if (endptr == entry->d_name + 8 || endptr == NULL || *endptr != '-')
-			continue;
-		if (pid_value == MyProcPid)
-			continue;
-		if (fb_spool_pid_is_live((pid_t) pid_value))
-			continue;
-
-		child = psprintf("%s/%s", runtime_dir, entry->d_name);
-		fb_spool_remove_tree(child);
-		pfree(child);
-	}
-
-	FreeDir(dir);
-	pfree(runtime_dir);
-}
 
 static void
 fb_spool_append_anchor(FbSpoolLog *log)
@@ -230,7 +127,6 @@ fb_spool_session_create(void)
 	FbSpoolSession *session;
 	char *runtime_dir;
 
-	fb_spool_cleanup_stale_dirs();
 	fb_runtime_ensure_initialized();
 	runtime_dir = fb_runtime_runtime_dir();
 
@@ -254,6 +150,7 @@ void
 fb_spool_session_destroy(FbSpoolSession *session)
 {
 	FbSpoolLog *log;
+	FbSpoolLog *next;
 
 	if (session == NULL)
 		return;
@@ -267,8 +164,16 @@ fb_spool_session_destroy(FbSpoolSession *session)
 		}
 	}
 
+	for (log = session->logs; log != NULL; log = next)
+	{
+		next = log->next;
+		fb_spool_log_close(log);
+	}
+
 	if (session->dir != NULL)
-		fb_spool_remove_tree(session->dir);
+		pfree(session->dir);
+
+	pfree(session);
 }
 
 const char *

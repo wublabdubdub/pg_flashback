@@ -62,3 +62,41 @@
 To github.com:wublabdubdub/pg_flashback.git
    e8ad9ef..71a60cf  main -> main
 [2026-03-29 01:00:05 CST] auto update finished
+[2026-03-30 01:00:02 CST] committing changes to origin/main
+[main 53c09b8] update
+ 78 files changed, 13824 insertions(+), 596 deletions(-)
+ create mode 100644 docs/decisions/ADR-0011-custom-scan-slot-native-output.md
+ create mode 100644 docs/decisions/ADR-0012-keyed-fast-path-for-point-set-topn.md
+ create mode 100644 docs/decisions/ADR-0013-pg-flashback-to-persistent-table-export.md
+ create mode 100644 docs/decisions/ADR-0014-custom-operator-tree-for-explain-analyze.md
+ create mode 100644 docs/decisions/ADR-0015-keyed-parallel-pg-flashback-to.md
+ create mode 100644 docs/decisions/ADR-0016-pg-flashback-rewind-inplace.md
+ create mode 100644 docs/decisions/ADR-0017-unified-flashback-parallel-switch.md
+ create mode 100644 docs/superpowers/plans/2026-03-29-customscan-slot-native-output-plan.md
+ create mode 100644 docs/superpowers/plans/2026-03-29-flashback-parallel-main-pipeline-plan.md
+ create mode 100644 docs/superpowers/plans/2026-03-29-keyed-fast-path-plan.md
+ create mode 100644 docs/superpowers/plans/2026-03-29-multi-custom-scan-explain-plan.md
+ create mode 100644 docs/superpowers/plans/2026-03-29-pg-flashback-to-keyed-parallel-plan.md
+ create mode 100644 docs/superpowers/plans/2026-03-29-pg-flashback-to-plan.md
+ create mode 100644 docs/superpowers/specs/2026-03-29-customscan-slot-native-output-design.md
+ create mode 100644 docs/superpowers/specs/2026-03-29-keyed-fast-path-design.md
+ create mode 100644 docs/superpowers/specs/2026-03-29-multi-custom-scan-explain-design.md
+ create mode 100644 docs/superpowers/specs/2026-03-29-pg-flashback-to-design.md
+ create mode 100644 docs/superpowers/specs/2026-03-29-pg-flashback-to-keyed-parallel-design.md
+ create mode 100644 expected/fb_apply_parallel.out
+ create mode 100644 expected/fb_flashback_to.out
+ create mode 100644 expected/fb_keyed_fast_path.out
+ create mode 100644 expected/fb_runtime_cleanup.out
+ create mode 100644 expected/fb_wal_parallel_payload.out
+ create mode 100644 perf.data
+ create mode 100644 perf.data.old
+ create mode 100644 sql/fb_apply_parallel.sql
+ create mode 100644 sql/fb_flashback_to.sql
+ create mode 100644 sql/fb_keyed_fast_path.sql
+ create mode 100644 sql/fb_runtime_cleanup.sql
+ create mode 100644 sql/fb_wal_parallel_payload.sql
+ rewrite src/fb_export.c (66%)
+[2026-03-30 01:00:02 CST] pushing to origin/main
+To github.com:wublabdubdub/pg_flashback.git
+   71a60cf..53c09b8  main -> main
+[2026-03-30 01:00:06 CST] auto update finished

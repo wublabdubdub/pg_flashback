@@ -33,6 +33,18 @@
 
 ## 当前待办
 
+### Summary 预建服务
+
+- [x] 新增 segment 通用 summary 文件格式，优先服务 query-side prefilter
+- [x] 停用 relation-pattern 级 `prefilter-*.meta` sidecar 持续写入
+- [x] 新增 `shared_preload_libraries` 下的 summary launcher
+- [x] 新增 summary shared queue + 多 worker pool
+- [x] launcher 周期扫描 `archive_dest` / `pg_wal` / `recovered_wal`
+- [x] 查询 prefilter 改为 summary-first，缺失时回退旧 `mmap + memmem`
+- [x] 新增 `meta/summary` 容量上限与 summary 专属自动清理
+- [x] 完成 PG18 preload 手工验证
+- [ ] 补齐 summary/service 专项回归与可观测 debug 接口
+
 ### P3 / P4 补齐
 
 - [ ] 将 `fb_decode_insert_debug` 改成基于 `ForwardOp` 的开发期调试出口
@@ -75,10 +87,12 @@
 - [x] `show_progress` 开启时为每条输出追加增量耗时，并在结束时输出总耗时
 - [ ] `fb_export_undo` 对外安装与实现决策
 - [ ] `pg_flashback_to` 的旧导出路径代码清理与剩余死代码收口
-- [x] 给 `DataDir/pg_flashback/{runtime,recovered_wal,meta}` 建立统一删除机制：
-  - `runtime` 清理死 backend 遗留 `fbspill-*`
-  - `recovered_wal` 按保留期淘汰旧恢复段
-  - `meta` 按保留期淘汰旧 sidecar
+- [x] 取消 `DataDir/pg_flashback/{runtime,recovered_wal,meta}` 的自动删除机制：
+  - 删除 `runtime_retention/recovered_wal_retention/meta_retention`
+  - 删除 runtime 初始化与查询结束时的 cleanup
+  - 保留目录创建与产物写入，不再对现有文件做保洁
+- [x] 修复“archive 已有真实 segment 时，recycled / mismatched pg_wal 仍被提前 convert 并白白写入 recovered_wal”的 resolver 问题
+  - 新增回归 `fb_recovered_wal_policy`
 
 ### P5.6 内存与效率
 
@@ -97,6 +111,16 @@
   - `WHERE 主键 IN (const, ...)`
   - `ORDER BY 主键/唯一键 ... LIMIT N`
   - 第一阶段只支持单列稳定主键/唯一键，其余场景自动回退
+- [x] 将 keyed fast path 扩展到单列稳定键 range 谓词：
+  - `BETWEEN`
+  - `< <= > >=`
+  - 两侧 bound 的开闭区间组合
+  - 与 `ORDER BY key` / `LIMIT` 的可安全组合
+- [x] 去掉 `FbApplyScan` 末尾 `ExecCopySlot/tts_virtual_materialize` 输出拷贝链
+- [ ] `3/9` 架构收敛 follow-up：
+  - 减少进入 `XLogDecodeNextRecord` 但最终无 payload 的 record work
+  - 合并 touched-xid / xid-status 的重复 hash bookkeeping
+  - 复用 prefilter / visit-window / materialize-window 的重复 segment-window 计算
 - [x] 从本机会话日志恢复 bounded spill Stage A 代码基线（`fb_spool` / `fb_spill` / `FbReverseOpSource`）
 - [x] 继续从本机会话日志恢复 `2026-03-26 21:10` 后半段到 `2026-03-27` 的 spill follow-up / `fb_wal` sidecar / SRF 主链
 - [x] 统一内存超限报错增加 `pg_flashback.memory_limit` 调参提示与可读单位
@@ -107,6 +131,7 @@
 - [x] 将 flashback 主链并行控制统一收口为 `pg_flashback.parallel_workers`
   - 删除旧的 `pg_flashback.parallel_segment_scan`
   - 当前不接管 `pg_flashback.export_parallel_workers`
+- [x] 将 `pg_flashback.parallel_workers` 默认值从 `0` 调整为 `8`
 - [x] 将 resolver / sidecar 接到统一 flashback 并行参数
 - [x] 将 WAL prefilter 接到统一 flashback 并行参数
 - [x] 将 `parallel_workers=0` 改为“关闭并行但保留串行 prefilter”

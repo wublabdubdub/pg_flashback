@@ -35,6 +35,7 @@
 #include "fb_ckwal.h"
 #include "fb_progress.h"
 #include "fb_runtime.h"
+#include "fb_summary.h"
 #include "fb_wal.h"
 
 #if !defined(HAVE_MEMMEM)
@@ -259,11 +260,11 @@ typedef struct FbWalSegmentPrefilterTask
 	FbWalSegmentEntry *segments;
 	int *indexes;
 	int index_count;
+	const FbRelationInfo *info;
+	int wal_seg_size;
 	FbWalPrefilterPattern patterns[4];
 	int pattern_count;
 	bool *hit_map;
-	char meta_dir[MAXPGPATH];
-	uint64 pattern_hash;
 } FbWalSegmentPrefilterTask;
 
 typedef struct FbWalSegmentValidateTask
@@ -600,6 +601,15 @@ static bool fb_validate_segment_identity_path(const char *path,
 											  TimeLineID timeline_id,
 											  XLogSegNo segno,
 											  int wal_seg_size);
+static bool fb_read_segment_identity_path(const char *path,
+										  TimeLineID *timeline_id,
+										  XLogSegNo *segno,
+										  int wal_seg_size);
+static bool fb_segment_candidate_exists(FbWalSegmentEntry *segments,
+										int segment_count,
+										TimeLineID timeline_id,
+										XLogSegNo segno,
+										const FbWalSegmentEntry *exclude);
 /*
  * fb_try_ckwal_segment
  *    WAL helper.
@@ -1565,45 +1575,36 @@ fb_bytes_contains_pattern(const unsigned char *buf, Size buf_len,
  */
 
 static bool
-fb_segment_path_matches_patterns(const char *path,
-								 const char *meta_dir,
-								 uint64 pattern_hash,
+fb_segment_path_matches_patterns(const FbWalSegmentEntry *entry,
+								 const FbRelationInfo *info,
+								 int wal_seg_size,
 								 FbWalPrefilterPattern *patterns,
 								 int pattern_count)
 {
 	int fd = -1;
 	struct stat st;
 	void *map = MAP_FAILED;
-	char cache_path[MAXPGPATH];
-	uint64 cache_hash;
-	uint64 file_identity_hash = 0;
-	bool cached_hit = false;
+	bool summary_available = false;
+	bool summary_hit = false;
 	int i;
 
 	if (pattern_count <= 0)
 		return true;
+	if (entry == NULL || info == NULL)
+		return true;
 
-	cache_path[0] = '\0';
+	if (fb_summary_segment_matches(entry->path,
+								   entry->bytes,
+								   entry->timeline_id,
+								   entry->segno,
+								   wal_seg_size,
+								   entry->source_kind,
+								   info,
+								   &summary_available,
+								   &summary_hit))
+		return summary_hit;
 
-	if (meta_dir != NULL && meta_dir[0] != '\0' && stat(path, &st) == 0)
-	{
-		file_identity_hash = fb_sidecar_file_identity_hash(path, st.st_size,
-														   st.st_mtime);
-		cache_hash = UINT64CONST(1469598103934665603);
-		cache_hash = fb_prefilter_hash_bytes(cache_hash, &file_identity_hash,
-											 sizeof(file_identity_hash));
-		cache_hash = fb_prefilter_hash_bytes(cache_hash, &pattern_hash, sizeof(pattern_hash));
-		snprintf(cache_path, sizeof(cache_path), "%s/prefilter-%016llx.meta",
-				 meta_dir, (unsigned long long) cache_hash);
-
-		if (fb_prefilter_sidecar_load(cache_path,
-									  file_identity_hash,
-									  pattern_hash,
-									  &cached_hit))
-			return cached_hit;
-	}
-
-	fd = open(path, O_RDONLY | PG_BINARY, 0);
+	fd = open(entry->path, O_RDONLY | PG_BINARY, 0);
 	if (fd < 0)
 		return true;
 
@@ -1630,21 +1631,10 @@ fb_segment_path_matches_patterns(const char *path,
 									  (Size) st.st_size,
 									  &patterns[i]))
 		{
-			if (cache_path[0] != '\0')
-				fb_prefilter_sidecar_store(cache_path,
-										   file_identity_hash,
-										   pattern_hash,
-										   true);
 			munmap(map, st.st_size);
 			return true;
 		}
 	}
-
-	if (cache_path[0] != '\0')
-		fb_prefilter_sidecar_store(cache_path,
-								   file_identity_hash,
-								   pattern_hash,
-								   false);
 
 	munmap(map, st.st_size);
 	return false;
@@ -1665,9 +1655,9 @@ fb_segment_prefilter_worker(void *arg)
 	{
 		int i = task->indexes[n];
 
-		task->hit_map[i] = fb_segment_path_matches_patterns(task->segments[i].path,
-															 task->meta_dir,
-															 task->pattern_hash,
+		task->hit_map[i] = fb_segment_path_matches_patterns(&task->segments[i],
+															 task->info,
+															 task->wal_seg_size,
 															 task->patterns,
 															 task->pattern_count);
 	}
@@ -1764,7 +1754,6 @@ fb_prepare_segment_prefilter(const FbRelationInfo *info, FbWalScanContext *ctx)
 	bool worker_started[FB_WAL_PARALLEL_MAX_WORKERS];
 	FbWalSegmentPrefilterTask tasks[FB_WAL_PARALLEL_MAX_WORKERS];
 	FbWalPrefilterPattern patterns[4];
-	char *meta_dir = NULL;
 	int *pending_indexes = NULL;
 	int pattern_count = 0;
 	int worker_count;
@@ -1794,7 +1783,6 @@ fb_prepare_segment_prefilter(const FbRelationInfo *info, FbWalScanContext *ctx)
 	ctx->segment_hit_map = palloc0(sizeof(bool) * ctx->resolved_segment_count);
 	fb_prepare_prefilter_patterns(info, patterns, &pattern_count);
 	fb_runtime_ensure_initialized();
-	meta_dir = fb_runtime_meta_dir();
 	pattern_hash = fb_prefilter_patterns_hash(patterns, pattern_count);
 	pending_indexes = palloc(sizeof(int) * ctx->resolved_segment_count);
 
@@ -1822,11 +1810,11 @@ fb_prepare_segment_prefilter(const FbRelationInfo *info, FbWalScanContext *ctx)
 		tasks[i].segments = segments;
 		tasks[i].indexes = pending_indexes + start;
 		tasks[i].index_count = end - start;
+		tasks[i].info = info;
+		tasks[i].wal_seg_size = ctx->wal_seg_size;
 		memcpy(tasks[i].patterns, patterns, sizeof(patterns));
 		tasks[i].pattern_count = pattern_count;
 		tasks[i].hit_map = ctx->segment_hit_map;
-		strlcpy(tasks[i].meta_dir, meta_dir, sizeof(tasks[i].meta_dir));
-		tasks[i].pattern_hash = pattern_hash;
 
 		if (start >= end)
 			continue;
@@ -1855,8 +1843,6 @@ fb_prepare_segment_prefilter(const FbRelationInfo *info, FbWalScanContext *ctx)
 	}
 
 finalize_hits:
-	if (meta_dir != NULL)
-		pfree(meta_dir);
 	if (pending_indexes != NULL)
 		pfree(pending_indexes);
 
@@ -2440,6 +2426,40 @@ fb_segment_end_lsn(const FbWalSegmentEntry *entry, int wal_seg_size)
  */
 
 static bool
+fb_read_segment_identity_path(const char *path,
+							  TimeLineID *timeline_id,
+							  XLogSegNo *segno,
+							  int wal_seg_size)
+{
+	PGAlignedXLogBlock buf;
+	int fd;
+	ssize_t bytes_read;
+	XLogLongPageHeader longhdr;
+
+	if (path == NULL || timeline_id == NULL || segno == NULL)
+		return false;
+
+	fd = open(path, O_RDONLY | PG_BINARY, 0);
+	if (fd < 0)
+		return false;
+
+	bytes_read = read(fd, buf.data, XLOG_BLCKSZ);
+	close(fd);
+	if (bytes_read != XLOG_BLCKSZ)
+		return false;
+
+	longhdr = (XLogLongPageHeader) buf.data;
+	if (!IsValidWalSegSize(longhdr->xlp_seg_size))
+		return false;
+	if (longhdr->xlp_seg_size != wal_seg_size)
+		return false;
+
+	*timeline_id = longhdr->std.xlp_tli;
+	XLByteToSeg(longhdr->std.xlp_pageaddr, *segno, wal_seg_size);
+	return true;
+}
+
+static bool
 fb_validate_segment_identity_path(const char *path,
 								  TimeLineID timeline_id,
 								  XLogSegNo segno,
@@ -2485,6 +2505,41 @@ fb_validate_segment_identity(FbWalSegmentEntry *entry, int wal_seg_size)
 											 entry->timeline_id,
 											 entry->segno,
 											 wal_seg_size);
+}
+
+static bool
+fb_segment_candidate_exists(FbWalSegmentEntry *segments,
+							int segment_count,
+							TimeLineID timeline_id,
+							XLogSegNo segno,
+							const FbWalSegmentEntry *exclude)
+{
+	int i;
+
+	if (segments == NULL || segment_count <= 0)
+		return false;
+
+	for (i = 0; i < segment_count; i++)
+	{
+		FbWalSegmentEntry *entry = &segments[i];
+		FbWalSourceKind source_kind;
+
+		if (entry == exclude || entry->ignored)
+			continue;
+		if (entry->timeline_id != timeline_id || entry->segno != segno)
+			continue;
+
+		source_kind = (FbWalSourceKind) entry->source_kind;
+		if (source_kind == FB_WAL_SOURCE_ARCHIVE_DEST ||
+			source_kind == FB_WAL_SOURCE_ARCHIVE_DIR_LEGACY ||
+			source_kind == FB_WAL_SOURCE_CKWAL)
+			return true;
+		if (source_kind == FB_WAL_SOURCE_PG_WAL &&
+			entry->valid && !entry->mismatch)
+			return true;
+	}
+
+	return false;
 }
 
 /*
@@ -2540,11 +2595,11 @@ fb_try_ckwal_segment(FbWalScanContext *ctx,
 	char fname[MAXPGPATH];
 
 	MemSet(entry, 0, sizeof(*entry));
+	XLogFileName(fname, timeline_id, segno, wal_seg_size);
 
 	if (!fb_ckwal_restore_segment(timeline_id, segno, wal_seg_size,
 								  entry->path, sizeof(entry->path)))
 		return false;
-	XLogFileName(fname, timeline_id, segno, wal_seg_size);
 	strlcpy(entry->name, fname, sizeof(entry->name));
 	entry->timeline_id = timeline_id;
 	entry->segno = segno;
@@ -2757,12 +2812,28 @@ fb_collect_archive_segments(FbWalScanContext *ctx)
 	for (i = 0; i < candidate_count; i++)
 	{
 		FbWalSegmentEntry converted_entry;
+		TimeLineID actual_tli;
+		XLogSegNo actual_segno;
 
 		if (candidates[i].timeline_id != ctx->timeline_id)
 			continue;
 		if ((FbWalSourceKind) candidates[i].source_kind != FB_WAL_SOURCE_PG_WAL ||
 			candidates[i].valid || !candidates[i].mismatch)
 			continue;
+		if (!fb_read_segment_identity_path(candidates[i].path,
+										   &actual_tli,
+										   &actual_segno,
+										   ctx->wal_seg_size))
+			continue;
+		if (fb_segment_candidate_exists(candidates,
+										candidate_count,
+										actual_tli,
+										actual_segno,
+										&candidates[i]))
+		{
+			candidates[i].ignored = true;
+			continue;
+		}
 
 		if (fb_convert_mismatched_pg_wal_entry(ctx, &candidates[i],
 											   &converted_entry))

@@ -1,0 +1,93 @@
+DO $$
+BEGIN
+	IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_flashback') THEN
+		EXECUTE 'DROP EXTENSION pg_flashback CASCADE';
+	END IF;
+END;
+$$;
+CREATE EXTENSION pg_flashback;
+
+DO $$
+BEGIN
+	EXECUTE format('SET pg_flashback.archive_dir = %L', current_setting('data_directory') || '/pg_wal');
+END;
+$$;
+SET pg_flashback.parallel_workers = 0;
+
+DO $$
+BEGIN
+	IF to_regprocedure('fb_summary_build_available_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_summary_build_available_debug()';
+	END IF;
+	IF to_regprocedure('fb_summary_meta_stats_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_summary_meta_stats_debug()';
+	END IF;
+END;
+$$;
+
+CREATE FUNCTION fb_summary_build_available_debug()
+RETURNS integer
+AS '$libdir/pg_flashback', 'fb_summary_build_available_debug'
+LANGUAGE C;
+
+CREATE FUNCTION fb_summary_meta_stats_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_summary_meta_stats_debug'
+LANGUAGE C;
+
+DO $$
+DECLARE
+	data_dir text := current_setting('data_directory');
+BEGIN
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'rm -f ' ||
+		data_dir || '/pg_flashback/meta/summary/* ' ||
+		data_dir || '/pg_flashback/meta/prefilter-*.meta');
+END;
+$$;
+
+DROP TABLE IF EXISTS fb_summary_prefilter_mark;
+DROP TABLE IF EXISTS fb_summary_prefilter_target;
+
+CREATE TABLE fb_summary_prefilter_target (
+	id integer PRIMARY KEY,
+	note text
+);
+
+CHECKPOINT;
+
+INSERT INTO fb_summary_prefilter_target VALUES
+	(1, 'baseline'),
+	(2, 'baseline'),
+	(3, 'baseline');
+
+CREATE TABLE fb_summary_prefilter_mark (
+	target_ts timestamptz NOT NULL
+);
+
+INSERT INTO fb_summary_prefilter_mark VALUES (clock_timestamp());
+
+UPDATE fb_summary_prefilter_target
+SET note = 'after-target'
+WHERE id = 2;
+
+SELECT fb_summary_build_available_debug() > 0 AS built_summary;
+SELECT substring(fb_summary_meta_stats_debug() FROM 'summary_files=([0-9]+)')::int > 0
+	   AS summary_files_present,
+	   substring(fb_summary_meta_stats_debug() FROM 'prefilter_files=([0-9]+)')::int = 0
+	   AS prefilter_files_absent;
+
+SET pg_flashback.show_progress = off;
+
+SELECT *
+FROM pg_flashback(
+	NULL::public.fb_summary_prefilter_target,
+	(SELECT target_ts::text FROM fb_summary_prefilter_mark)
+)
+ORDER BY id;
+
+SELECT substring(fb_summary_meta_stats_debug() FROM 'summary_files=([0-9]+)')::int > 0
+	   AS summary_files_present,
+	   substring(fb_summary_meta_stats_debug() FROM 'prefilter_files=([0-9]+)')::int = 0
+	   AS prefilter_files_absent;

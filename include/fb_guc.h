@@ -48,6 +48,8 @@ char *fb_get_effective_archive_dir(void);
 
 char *fb_resolve_archive_dir(FbArchiveDirSource *source_out,
 							 const char **setting_name_out);
+char *fb_try_resolve_archive_dir(FbArchiveDirSource *source_out,
+								  const char **setting_name_out);
 /*
  * fb_get_archive_dir_source
  *    GUC API.
@@ -97,9 +99,6 @@ uint64 fb_get_memory_limit_bytes(void);
 
 FbSpillMode fb_get_spill_mode(void);
 const char *fb_spill_mode_name(FbSpillMode mode);
-int fb_runtime_retention_seconds(void);
-int fb_recovered_wal_retention_seconds(void);
-int fb_meta_retention_seconds(void);
 /*
  * fb_parallel_workers
  *    GUC API.
@@ -107,6 +106,12 @@ int fb_meta_retention_seconds(void);
 
 int fb_parallel_workers(void);
 int fb_export_parallel_workers(void);
+bool fb_summary_service_enabled(void);
+int fb_summary_service_workers(void);
+int fb_summary_service_scan_interval_ms(void);
+int fb_summary_service_queue_size(void);
+uint64 fb_summary_service_meta_limit_bytes(void);
+int fb_summary_service_meta_low_watermark_percent(void);
 /*
  * fb_show_progress_enabled
  *    GUC API.

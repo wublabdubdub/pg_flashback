@@ -21,6 +21,7 @@
 #include "fb_guc.h"
 #include "fb_custom_scan.h"
 #include "fb_runtime.h"
+#include "fb_summary_service.h"
 
 static char *fb_archive_dir = NULL;
 static char *fb_archive_dest = NULL;
@@ -29,12 +30,15 @@ static char *fb_memory_limit_setting = NULL;
 static char *fb_spill_mode_setting = NULL;
 static uint64 fb_memory_limit_kb = UINT64CONST(1048576);
 static FbSpillMode fb_spill_mode = FB_SPILL_MODE_AUTO;
-static int	fb_parallel_workers_setting = 0;
+static int	fb_parallel_workers_setting = 8;
 static int	fb_export_parallel_workers_setting = 0;
-static int	fb_runtime_retention_setting = 24 * 60 * 60;
-static int	fb_recovered_wal_retention_setting = 7 * 24 * 60 * 60;
-static int	fb_meta_retention_setting = 7 * 24 * 60 * 60;
 static bool fb_show_progress = true;
+static bool fb_summary_service_setting = true;
+static int fb_summary_service_workers_setting = 2;
+static int fb_summary_service_scan_interval_ms_setting = 1000;
+static int fb_summary_service_queue_size_setting = 512;
+static int fb_summary_service_meta_limit_mb_setting = 256;
+static int fb_summary_service_meta_low_watermark_percent_setting = 80;
 
 #define FB_MEMORY_LIMIT_GUC_NAME "pg_flashback.memory_limit"
 #define FB_SPILL_MODE_GUC_NAME "pg_flashback.spill_mode"
@@ -152,50 +156,11 @@ _PG_init(void)
 							   fb_spill_mode_assign_hook,
 							   NULL);
 
-	DefineCustomIntVariable("pg_flashback.runtime_retention",
-							"Retention window for stale pg_flashback runtime spill directories.",
-							"Applies to DataDir/pg_flashback/runtime. Dead backend fbspill directories are cleaned automatically; this setting also removes old leftover entries after the configured age. Set to 0 to disable age-based runtime cleanup.",
-							&fb_runtime_retention_setting,
-							24 * 60 * 60,
-							0,
-							30 * 24 * 60 * 60,
-							PGC_USERSET,
-							GUC_UNIT_S,
-							NULL,
-							NULL,
-							NULL);
-
-	DefineCustomIntVariable("pg_flashback.recovered_wal_retention",
-							"Retention window for recovered WAL copies in DataDir/pg_flashback/recovered_wal.",
-							"Recovered WAL segments older than this age are deleted during pg_flashback runtime initialization. Set to 0 to disable recovered_wal age cleanup.",
-							&fb_recovered_wal_retention_setting,
-							7 * 24 * 60 * 60,
-							0,
-							30 * 24 * 60 * 60,
-							PGC_USERSET,
-							GUC_UNIT_S,
-							NULL,
-							NULL,
-							NULL);
-
-	DefineCustomIntVariable("pg_flashback.meta_retention",
-							"Retention window for cached metadata sidecars in DataDir/pg_flashback/meta.",
-							"Prefilter and checkpoint sidecars older than this age are deleted during pg_flashback runtime initialization. Set to 0 to disable meta age cleanup.",
-							&fb_meta_retention_setting,
-							7 * 24 * 60 * 60,
-							0,
-							30 * 24 * 60 * 60,
-							PGC_USERSET,
-							GUC_UNIT_S,
-							NULL,
-							NULL,
-							NULL);
-
 	DefineCustomIntVariable("pg_flashback.parallel_workers",
 							"Control flashback-stage parallel worker count where the implementation supports parallel execution.",
 							"When 0, the flashback pipeline stays serial. When greater than 0, pg_flashback may run safe flashback stages in parallel up to the configured worker count.",
 							&fb_parallel_workers_setting,
-							0,
+							8,
 							0,
 							16,
 							PGC_USERSET,
@@ -228,6 +193,82 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	DefineCustomBoolVariable("pg_flashback.summary_service",
+							 "Enable pg_flashback background summary prebuild service.",
+							 "When on and pg_flashback is loaded via shared_preload_libraries, launcher/workers prebuild WAL segment summaries in the background.",
+							 &fb_summary_service_setting,
+							 true,
+							 PGC_SIGHUP,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomIntVariable("pg_flashback.summary_workers",
+							"Background worker count for summary prebuild.",
+							"Controls how many background summary builder workers run when pg_flashback.summary_service is enabled.",
+							&fb_summary_service_workers_setting,
+							2,
+							1,
+							8,
+							PGC_SIGHUP,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_flashback.summary_scan_interval_ms",
+							"Directory rescan interval for background summary prebuild.",
+							"Controls how often the summary launcher rescans archive and pg_wal directories for missing summaries.",
+							&fb_summary_service_scan_interval_ms_setting,
+							1000,
+							100,
+							60000,
+							PGC_SIGHUP,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_flashback.summary_queue_size",
+							"Queue slot count for background summary prebuild tasks.",
+							"Fixed shared-memory queue capacity for launcher-to-worker summary build tasks.",
+							&fb_summary_service_queue_size_setting,
+							512,
+							64,
+							4096,
+							PGC_SIGHUP,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_flashback.summary_meta_limit_mb",
+							"Soft size limit for meta/summary cleanup.",
+							"When meta/summary grows beyond this many megabytes, the launcher deletes older regenerable summary files down to the low watermark.",
+							&fb_summary_service_meta_limit_mb_setting,
+							256,
+							1,
+							4096,
+							PGC_SIGHUP,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_flashback.summary_meta_low_watermark_percent",
+							"Cleanup stop point after summary meta exceeds the limit.",
+							"Summary cleanup runs until meta/summary shrinks to this percentage of pg_flashback.summary_meta_limit_mb.",
+							&fb_summary_service_meta_low_watermark_percent_setting,
+							80,
+							25,
+							95,
+							PGC_SIGHUP,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
 	/*
 	 * Once known pg_flashback GUCs are defined, reject any future unknown
 	 * pg_flashback.* placeholders instead of silently accepting typos.
@@ -238,6 +279,8 @@ _PG_init(void)
 
 	fb_runtime_ensure_initialized();
 	fb_custom_scan_init();
+	if (process_shared_preload_libraries_in_progress)
+		fb_summary_service_shmem_init();
 }
 
 /*
@@ -283,6 +326,13 @@ fb_resolve_archive_dir(FbArchiveDirSource *source_out,
 						 const char **setting_name_out)
 {
 	return fb_resolve_archive_dir_internal(source_out, setting_name_out, true);
+}
+
+char *
+fb_try_resolve_archive_dir(FbArchiveDirSource *source_out,
+							  const char **setting_name_out)
+{
+	return fb_resolve_archive_dir_internal(source_out, setting_name_out, false);
 }
 
 /*
@@ -444,29 +494,6 @@ fb_spill_mode_name(FbSpillMode mode)
 }
 
 int
-fb_runtime_retention_seconds(void)
-{
-	return fb_runtime_retention_setting;
-}
-
-int
-fb_recovered_wal_retention_seconds(void)
-{
-	return fb_recovered_wal_retention_setting;
-}
-
-int
-fb_meta_retention_seconds(void)
-{
-	return fb_meta_retention_setting;
-}
-
-/*
- * fb_parallel_workers
- *    GUC entry point.
- */
-
-int
 fb_parallel_workers(void)
 {
 	return fb_parallel_workers_setting;
@@ -476,6 +503,42 @@ int
 fb_export_parallel_workers(void)
 {
 	return fb_export_parallel_workers_setting;
+}
+
+bool
+fb_summary_service_enabled(void)
+{
+	return fb_summary_service_setting;
+}
+
+int
+fb_summary_service_workers(void)
+{
+	return fb_summary_service_workers_setting;
+}
+
+int
+fb_summary_service_scan_interval_ms(void)
+{
+	return fb_summary_service_scan_interval_ms_setting;
+}
+
+int
+fb_summary_service_queue_size(void)
+{
+	return fb_summary_service_queue_size_setting;
+}
+
+uint64
+fb_summary_service_meta_limit_bytes(void)
+{
+	return (uint64) fb_summary_service_meta_limit_mb_setting * UINT64CONST(1024) * UINT64CONST(1024);
+}
+
+int
+fb_summary_service_meta_low_watermark_percent(void)
+{
+	return fb_summary_service_meta_low_watermark_percent_setting;
 }
 
 /*

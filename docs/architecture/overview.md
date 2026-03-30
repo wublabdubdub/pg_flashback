@@ -124,13 +124,16 @@ Custom Scan (FbApplyScan)
 - `pg_flashback.archive_dir`
 - `pg_flashback.debug_pg_wal_dir`
 - `pg_flashback.memory_limit`
-- `pg_flashback.runtime_retention`
-- `pg_flashback.recovered_wal_retention`
-- `pg_flashback.meta_retention`
 - `pg_flashback.spill_mode`
 - `pg_flashback.parallel_workers`
 - `pg_flashback.export_parallel_workers`
 - `pg_flashback.show_progress`
+
+当前默认值补充：
+
+- `pg_flashback.memory_limit = 1GB`
+- `pg_flashback.parallel_workers = 8`
+- `pg_flashback.show_progress = on`
 
 ### `fb_runtime`
 
@@ -142,14 +145,44 @@ Custom Scan (FbApplyScan)
 职责：
 
 - 初始化和校验扩展私有目录
-- 对 `runtime/recovered_wal/meta` 执行轻量目录保洁
-- 为不同目录应用不同的保留/删除策略
+- 提供 `runtime/recovered_wal/meta` 路径给各模块落盘使用
+- 不再对已生成产物执行自动删除或保留期淘汰
 
 当前固定目录：
 
 - `DataDir/pg_flashback/runtime`
 - `DataDir/pg_flashback/recovered_wal`
 - `DataDir/pg_flashback/meta`
+- `DataDir/pg_flashback/meta/summary`
+
+### `fb_summary`
+
+文件：
+
+- `src/fb_summary.c`
+- `include/fb_summary.h`
+
+职责：
+
+- 定义 segment 通用 summary 文件格式
+- 在 `meta/summary` 中读写 summary
+- 提供 locator / relid bloom probe
+- 供 query prefilter 和后台预建服务共用
+
+### `fb_summary_service`
+
+文件：
+
+- `src/fb_summary_service.c`
+- `include/fb_summary_service.h`
+
+职责：
+
+- 在 `shared_preload_libraries` 模式下注册 launcher 与 worker
+- 维护扩展私有 shared queue
+- 周期扫描 archive / `pg_wal` / `recovered_wal`
+- 让 worker 读取 WAL segment 并预建 summary
+- 对 `meta/summary` 执行 summary 专属自动清理
 
 ### `fb_progress`
 
@@ -238,6 +271,11 @@ Custom Scan (FbApplyScan)
 - 将恢复结果统一落到 `recovered_wal`
 - 支持并发 worker 共享 `recovered_wal` 缓存，不因同一 segment 的同时恢复而互相撞文件
 - 让 resolver 在同一轮中继续消费恢复后的段
+
+当前补充约束：
+
+- 若 archive 已经有 mismatch `pg_wal` 文件头所对应的真实 segment，则 resolver 不应提前把该 mismatch 文件 materialize 到 `recovered_wal`
+- 这类“错名但已被 archive 覆盖”的 `pg_wal` candidate 会被直接忽略，不再制造额外 `recovered_wal` 垃圾
 
 ### `fb_replay`
 

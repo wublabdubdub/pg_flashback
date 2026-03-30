@@ -27,6 +27,7 @@ typedef enum FbFastPathMode
 	FB_FAST_PATH_NONE = 0,
 	FB_FAST_PATH_KEY_EQ,
 	FB_FAST_PATH_KEY_IN,
+	FB_FAST_PATH_KEY_RANGE,
 	FB_FAST_PATH_KEY_TOPN
 } FbFastPathMode;
 
@@ -39,6 +40,14 @@ typedef struct FbFastPathSpec
 	bool ordered_output;
 	bool order_asc;
 	uint64 limit_count;
+	bool has_lower_bound;
+	bool lower_inclusive;
+	Datum lower_value;
+	bool lower_isnull;
+	bool has_upper_bound;
+	bool upper_inclusive;
+	Datum upper_value;
+	bool upper_isnull;
 	int key_count;
 	Datum *key_values;
 	bool *key_nulls;

@@ -131,12 +131,12 @@ fb_toast_store_create(void)
 }
 
 /*
- * fb_toast_close_spill_file
+ * fb_toast_release_spill_file
  *    TOAST helper.
  */
 
 static void
-fb_toast_close_spill_file(FbToastStore *store)
+fb_toast_release_spill_file(FbToastStore *store)
 {
 	if (store == NULL)
 		return;
@@ -149,7 +149,6 @@ fb_toast_close_spill_file(FbToastStore *store)
 
 	if (store->spill_path != NULL)
 	{
-		unlink(store->spill_path);
 		pfree(store->spill_path);
 		store->spill_path = NULL;
 	}
@@ -166,7 +165,7 @@ fb_toast_store_destroy(FbToastStore *store)
 	if (store == NULL)
 		return;
 
-	fb_toast_close_spill_file(store);
+	fb_toast_release_spill_file(store);
 }
 
 /*

@@ -21,25 +21,7 @@ SELECT current_setting('pg_flashback.spill_mode');
 SELECT current_setting('pg_flashback.parallel_workers');
  current_setting 
 -----------------
- 0
-(1 row)
-
-SELECT current_setting('pg_flashback.runtime_retention');
- current_setting 
------------------
- 1d
-(1 row)
-
-SELECT current_setting('pg_flashback.recovered_wal_retention');
- current_setting 
------------------
- 7d
-(1 row)
-
-SELECT current_setting('pg_flashback.meta_retention');
- current_setting 
------------------
- 7d
+ 8
 (1 row)
 
 SET pg_flashback.memory_limit = '2mb';
@@ -98,27 +80,6 @@ SELECT current_setting('pg_flashback.parallel_workers');
  0
 (1 row)
 
-SET pg_flashback.runtime_retention = '1h';
-SELECT current_setting('pg_flashback.runtime_retention');
- current_setting 
------------------
- 1h
-(1 row)
-
-SET pg_flashback.recovered_wal_retention = '2h';
-SELECT current_setting('pg_flashback.recovered_wal_retention');
- current_setting 
------------------
- 2h
-(1 row)
-
-SET pg_flashback.meta_retention = '3h';
-SELECT current_setting('pg_flashback.meta_retention');
- current_setting 
------------------
- 3h
-(1 row)
-
 SET pg_flashback.spill_mode = 'badmode';
 ERROR:  invalid value for parameter "pg_flashback.spill_mode": "badmode"
 DETAIL:  pg_flashback.spill_mode must be one of: auto, memory, disk.
@@ -127,6 +88,15 @@ ERROR:  invalid value for parameter "pg_flashback.memory_limit": "33gb"
 DETAIL:  pg_flashback.memory_limit must be between 1kB and 32GB.
 SET pg_flashback.parallel_workers = -1;
 ERROR:  -1 is outside the valid range for parameter "pg_flashback.parallel_workers" (0 .. 16)
+SET pg_flashback.runtime_retention = '1h';
+ERROR:  invalid configuration parameter name "pg_flashback.runtime_retention"
+DETAIL:  "pg_flashback" is a reserved prefix.
+SET pg_flashback.recovered_wal_retention = '2h';
+ERROR:  invalid configuration parameter name "pg_flashback.recovered_wal_retention"
+DETAIL:  "pg_flashback" is a reserved prefix.
+SET pg_flashback.meta_retention = '3h';
+ERROR:  invalid configuration parameter name "pg_flashback.meta_retention"
+DETAIL:  "pg_flashback" is a reserved prefix.
 SET pg_flashback.enable_parallel_workers = on;
 ERROR:  invalid configuration parameter name "pg_flashback.enable_parallel_workers"
 DETAIL:  "pg_flashback" is a reserved prefix.

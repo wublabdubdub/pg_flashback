@@ -160,6 +160,13 @@ resolver 会检查：
 - 恢复出来的可信 WAL 段
 - sidecar / metadata
 
+当前新增补充：
+
+- `meta/summary`
+  - 承载 segment 通用 summary
+  - 由后台预建服务与查询侧共同消费
+  - 当前与 archive / `pg_wal` / `recovered_wal` 解析结果保持同一份 segment 身份口径
+
 所以来源解析并不是“只在用户配置目录里找”，而是自带扩展私有工作区。
 
 ## 九、当前 resolver 与 scan 的配合关系

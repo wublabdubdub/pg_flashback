@@ -5,12 +5,6 @@
 
 #include "postgres.h"
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <time.h>
-#include <unistd.h>
-#include <utime.h>
-
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "catalog/pg_type_d.h"
@@ -22,7 +16,6 @@
 #include "nodes/execnodes.h"
 #include "nodes/supportnodes.h"
 #include "parser/parse_type.h"
-#include "port.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -41,7 +34,6 @@
 #include "fb_progress.h"
 #include "fb_replay.h"
 #include "fb_reverse_ops.h"
-#include "fb_runtime.h"
 #include "fb_wal.h"
 
 /*
@@ -78,10 +70,8 @@ PG_FUNCTION_INFO_V1(fb_check_relation);
 PG_FUNCTION_INFO_V1(fb_archive_resolve_debug);
 PG_FUNCTION_INFO_V1(fb_apply_debug);
 PG_FUNCTION_INFO_V1(fb_keyed_key_debug);
+PG_FUNCTION_INFO_V1(fb_prepare_wal_scan_debug);
 PG_FUNCTION_INFO_V1(fb_recordref_debug);
-PG_FUNCTION_INFO_V1(fb_runtime_cleanup_debug);
-PG_FUNCTION_INFO_V1(fb_runtime_retention_debug);
-PG_FUNCTION_INFO_V1(fb_runtime_touch_debug);
 PG_FUNCTION_INFO_V1(fb_progress_debug_set_clock);
 PG_FUNCTION_INFO_V1(fb_progress_debug_reset_clock);
 PG_FUNCTION_INFO_V1(fb_srf_mode_debug);
@@ -147,54 +137,6 @@ fb_parse_target_ts_text(text *target_ts_text)
 												   CStringGetDatum(target_ts_cstr),
 												   ObjectIdGetDatum(InvalidOid),
 												   Int32GetDatum(-1)));
-}
-
-static void
-fb_runtime_debug_set_mtime(const char *path, int age_seconds)
-{
-	struct utimbuf times;
-	time_t now = time(NULL);
-
-	if (path == NULL || path[0] == '\0')
-		return;
-
-	times.actime = now - age_seconds;
-	times.modtime = now - age_seconds;
-	if (utime(path, &times) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not adjust pg_flashback debug path mtime"),
-				 errdetail("path=%s: %m", path)));
-}
-
-static void
-fb_runtime_debug_write_file(const char *path)
-{
-	static const char payload[] = "pg_flashback-debug";
-	int fd;
-
-	fd = open(path,
-			  O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
-			  S_IRUSR | S_IWUSR);
-	if (fd < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not create pg_flashback debug file"),
-				 errdetail("path=%s: %m", path)));
-
-	PG_TRY();
-	{
-		if (write(fd, payload, sizeof(payload) - 1) != sizeof(payload) - 1)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not write pg_flashback debug file"),
-					 errdetail("path=%s: %m", path)));
-	}
-	PG_FINALLY();
-	{
-		close(fd);
-	}
-	PG_END_TRY();
 }
 
 static const char *
@@ -323,10 +265,15 @@ fb_copy_fast_path_spec(FbFastPathSpec *dst, const FbFastPathSpec *src)
 		return;
 
 	*dst = *src;
+	get_typlenbyval(src->key_type_oid, &typlen, &typbyval);
+
+	if (src->has_lower_bound && !src->lower_isnull)
+		dst->lower_value = datumCopy(src->lower_value, typbyval, typlen);
+	if (src->has_upper_bound && !src->upper_isnull)
+		dst->upper_value = datumCopy(src->upper_value, typbyval, typlen);
+
 	if (src->key_count <= 0 || src->key_values == NULL)
 		return;
-
-	get_typlenbyval(src->key_type_oid, &typlen, &typbyval);
 	dst->key_values = palloc0(sizeof(Datum) * src->key_count);
 	dst->key_nulls = palloc0(sizeof(bool) * src->key_count);
 
@@ -799,118 +746,6 @@ fb_check_relation(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }
 
-Datum
-fb_runtime_retention_debug(PG_FUNCTION_ARGS)
-{
-	StringInfoData buf;
-
-	initStringInfo(&buf);
-	appendStringInfo(&buf,
-					 "runtime=%d recovered_wal=%d meta=%d",
-					 fb_runtime_retention_seconds(),
-					 fb_recovered_wal_retention_seconds(),
-					 fb_meta_retention_seconds());
-
-	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
-}
-
-Datum
-fb_runtime_cleanup_debug(PG_FUNCTION_ARGS)
-{
-	FbRuntimeCleanupStats stats;
-	StringInfoData buf;
-
-	fb_runtime_ensure_initialized();
-	fb_runtime_cleanup(true, &stats);
-
-	initStringInfo(&buf);
-	appendStringInfo(&buf,
-					 "runtime_removed=%u recovered_wal_removed=%u meta_removed=%u",
-					 stats.runtime_removed,
-					 stats.recovered_wal_removed,
-					 stats.meta_removed);
-
-	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
-}
-
-Datum
-fb_runtime_touch_debug(PG_FUNCTION_ARGS)
-{
-	text *kind_text = PG_GETARG_TEXT_PP(0);
-	text *name_text = PG_GETARG_TEXT_PP(1);
-	int age_seconds = PG_GETARG_INT32(2);
-	bool live_owner = PG_GETARG_BOOL(3);
-	char *kind = text_to_cstring(kind_text);
-	char *name = text_to_cstring(name_text);
-	char *dir = NULL;
-	char path[MAXPGPATH];
-	char child[MAXPGPATH];
-	char basename[MAXPGPATH];
-
-	if (age_seconds < 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("age_seconds must be non-negative")));
-
-	fb_runtime_ensure_initialized();
-
-	if (strcmp(kind, "runtime") == 0)
-	{
-		long owner_pid = live_owner ? (long) MyProcPid : 2147483000L;
-		struct stat st;
-
-		dir = fb_runtime_runtime_dir();
-		snprintf(basename, sizeof(basename), "fbspill-%ld-%s", owner_pid, name);
-		snprintf(path, sizeof(path), "%s/%s", dir, basename);
-		if (lstat(path, &st) == 0)
-		{
-			if (S_ISDIR(st.st_mode))
-				(void) rmtree(path, true);
-			else
-				(void) unlink(path);
-		}
-		if (mkdir(path, S_IRWXU) != 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not create pg_flashback debug runtime directory"),
-					 errdetail("path=%s: %m", path)));
-
-		snprintf(child, sizeof(child), "%s/marker.bin", path);
-		fb_runtime_debug_write_file(child);
-		fb_runtime_debug_set_mtime(child, age_seconds);
-		fb_runtime_debug_set_mtime(path, age_seconds);
-	}
-	else if (strcmp(kind, "recovered_wal") == 0)
-	{
-		dir = fb_runtime_recovered_wal_dir();
-		snprintf(basename, sizeof(basename), "%s", name);
-		snprintf(path, sizeof(path), "%s/%s", dir, basename);
-		(void) unlink(path);
-		fb_runtime_debug_write_file(path);
-		fb_runtime_debug_set_mtime(path, age_seconds);
-	}
-	else if (strcmp(kind, "meta") == 0)
-	{
-		dir = fb_runtime_meta_dir();
-		snprintf(basename, sizeof(basename), "%s", name);
-		snprintf(path, sizeof(path), "%s/%s", dir, basename);
-		(void) unlink(path);
-		fb_runtime_debug_write_file(path);
-		fb_runtime_debug_set_mtime(path, age_seconds);
-	}
-	else
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("unsupported pg_flashback debug touch kind: %s", kind)));
-	}
-
-	if (dir != NULL)
-		pfree(dir);
-
-	PG_RETURN_TEXT_P(cstring_to_text(basename));
-}
-
 /*
  * fb_archive_resolve_debug
  *    SQL entry point for regression-only archive source diagnostics.
@@ -934,6 +769,31 @@ fb_archive_resolve_debug(PG_FUNCTION_ARGS)
 					 archive_dir);
 
 	pfree(archive_dir);
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+Datum
+fb_prepare_wal_scan_debug(PG_FUNCTION_ARGS)
+{
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(0);
+	FbWalScanContext scan_ctx;
+	StringInfoData buf;
+
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+	fb_wal_prepare_scan_context(target_ts, NULL, &scan_ctx);
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "timeline=%u first=%s last=%s total=%u archive=%u pg_wal=%u ckwal=%u",
+					 scan_ctx.timeline_id,
+					 scan_ctx.first_segment,
+					 scan_ctx.last_segment,
+					 scan_ctx.total_segments,
+					 scan_ctx.archive_segment_count,
+					 scan_ctx.pg_wal_segment_count,
+					 scan_ctx.ckwal_segment_count);
+
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }
 

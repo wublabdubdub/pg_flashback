@@ -32,6 +32,7 @@ typedef struct FbApplyEmit
 	FbApplyEmitKind kind;
 	TupleTableSlot *slot;
 	HeapTuple tuple;
+	bool owned_tuple;
 } FbApplyEmit;
 
 /*

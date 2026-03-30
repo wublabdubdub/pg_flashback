@@ -156,10 +156,7 @@ FROM pg_flashback(NULL::schema.table, target_ts_text);
 - `pg_wal` 只补 archive 尚未覆盖的 recent tail
 - 发生 `pg_wal` 错配时，转入扩展内部 `recovered_wal/`
 - 扩展自动维护 `DataDir/pg_flashback/{runtime,recovered_wal,meta}`
-- 扩展会按目录类型执行保洁：
-  - `runtime/` 清理死 backend 遗留 `fbspill-*` 目录，并对超保留期残留做兜底淘汰
-  - `recovered_wal/` 按 `recovered_wal_retention` 淘汰旧恢复段
-  - `meta/` 按 `meta_retention` 淘汰旧 sidecar
+- 当前不再对这些目录做自动删除；已生成产物默认保留，供后续复用与排查
 
 ## 不支持场景
 

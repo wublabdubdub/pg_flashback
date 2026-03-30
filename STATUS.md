@@ -49,18 +49,13 @@
   - `archive_dir` 兼容回退
   - `debug_pg_wal_dir`
   - `memory_limit`
-  - `runtime_retention`
-  - `recovered_wal_retention`
-  - `meta_retention`
   - `spill_mode`
   - `parallel_workers`
   - `show_progress`
   - 未显式设置 `archive_dest` 时，可按 PostgreSQL 内核 `archive_command` 自动推断本地归档目录
   - 自动初始化 `DataDir/pg_flashback/{runtime,recovered_wal,meta}`
-  - 会在运行时按目录类型做保洁：
-    - `runtime/`：清理死 backend 遗留的 `fbspill-*` 目录，并对超保留期遗留目录做兜底淘汰
-    - `recovered_wal/`：按保留期淘汰旧恢复段
-    - `meta/`：按保留期淘汰旧 prefilter / checkpoint sidecar
+  - 不再对 `runtime/recovered_wal/meta` 做自动删除或保留期淘汰
+  - `pg_flashback.parallel_workers` 默认值当前已调整为 `8`
 - 当前 `pg_flashback()` 进度显示固定为 9 段：
   - stage `9` 已改为 residual 历史行发射
 - 开发期调试约定补充：
@@ -140,6 +135,20 @@
     - replay / reverse-source 的主路径并行
     - apply 的主路径并行
 
+- 已确认当前缓存对重复 flashback 查询有实际加速作用：
+  - 当前缓存层包含：
+    - backend 内 `prefilter cache`
+    - `DataDir/pg_flashback/meta` 下的 `prefilter/checkpoint` sidecar
+    - `DataDir/pg_flashback/recovered_wal` 下的恢复段复用缓存
+  - live 诊断中，对 `scenario_oa_12t_50000r.documents @ 2026-03-29 19:30:50+08` 连续执行 `fb_recordref_debug(...)`：
+    - 同一 backend 约 `58.5s -> 28.7s`
+    - 随后新 backend 再跑一轮约 `33.1s`
+  - 同次诊断后，`/isoTest/18pgdata/pg_flashback/meta` 中出现了 `1624` 个 `prefilter-*.meta`
+  - 当前判断：
+    - 缓存对重复查询的加速已成立
+    - 收益主要集中在 WAL prefilter / sidecar / index 构建前置阶段
+    - replay / apply 阶段仍会继续受 CPU、内存访问、worker 调度和 PostgreSQL buffer 命中率影响而波动
+
 - 已完成主链并行 Phase 1：
   - `parallel_workers=0` 不再关闭 prefilter，而是保留串行 prefilter 基线
   - 当前 `parallel_workers` 只决定 worker fanout 数，不再决定 prefilter 是否启用
@@ -149,32 +158,62 @@
     - `visited_segments=x/y`
   - 活跃回归 `fb_recordref` / `fb_wal_sidecar` 已覆盖默认 `parallel=off + prefilter=on`
 
-- 已完成 `DataDir/pg_flashback/*` 目录删除机制首版：
-  - 新增 GUC：
-    - `pg_flashback.runtime_retention`
-    - `pg_flashback.recovered_wal_retention`
-    - `pg_flashback.meta_retention`
-  - 默认策略固定为：
-    - `runtime_retention = 1d`
-    - `recovered_wal_retention = 7d`
-    - `meta_retention = 7d`
-  - 当前删除口径：
-    - `runtime/`：
-      - 死 backend 遗留的 `fbspill-*` 目录会被自动清理
-      - 其余遗留目录/文件在超过 `runtime_retention` 后做兜底清理
-      - 活跃 backend 对应的 `fbspill-*` 目录不按 age 误删
-    - `recovered_wal/`：
-      - 超过 `recovered_wal_retention` 的旧恢复段自动删除
-    - `meta/`：
-      - 超过 `meta_retention` 的旧 sidecar 自动删除
-  - 当前 cleanup 节流口径：
-    - 同一 backend 至多每 `60s` 扫一次目录
-    - 回归专用 debug 入口可强制触发 cleanup
-  - 当前已补验证：
-    - `fb_guc_defaults`
-    - `fb_runtime_cleanup`（手工逐条执行确认旧文件删除、新文件保留）
+- 已拍板取消 `DataDir/pg_flashback/*` 的自动删除逻辑：
+  - 删除 `pg_flashback.runtime_retention`
+  - 删除 `pg_flashback.recovered_wal_retention`
+  - 删除 `pg_flashback.meta_retention`
+  - 删除 runtime 初始化时的 cleanup
+  - 删除查询结束时的 cleanup
+  - `runtime/`、`recovered_wal/`、`meta/` 只保留目录创建与产物承载职责
+  - 当前不再对 `fbspill-*`、`toast-retired-*`、恢复段或 sidecar 做自动删除
+
+- 已修复 `recovered_wal` 的一处不必要 materialize 问题：
+  - 真实用户 case：
+    - `SELECT * FROM pg_flashback(NULL::scenario_oa_12t_50000r.documents, '2026-03-29 19:30:50') WHERE id BETWEEN 1000 AND 2000`
+    - `parallel_workers=8`
+  - root cause：
+    - resolver 会先验证 `pg_wal` 里的 recycled / mismatched segment
+    - 旧实现会在“按 segno 做 archive 优先选择”之前，提前把所有 mismatch `pg_wal` 一律 convert 到 `recovered_wal`
+    - 即使 archive 已经有对应真实 segment，也会白白把旧段 materialize 一遍
+  - 当前修复口径：
+    - 若 mismatch `pg_wal` 文件头指向的真实 segno 已有 archive / 可用候选覆盖，则不再 convert
+    - 同时把该错名 `pg_wal` candidate 标记为 ignored，避免后续按错误 segno 再触发缺段报错
+  - 当前已补自动化回归：
+    - `fb_recovered_wal_policy`
+  - 当前 live 验证结果：
+    - 清空 `/isoTest/18pgdata/pg_flashback/recovered_wal` 后复跑上述用户 case
+    - 查询完成返回 `1001`
+    - `recovered_wal` 保持为空，没有再生成 `7C/45..89`
 
 ## 当前进行中
+
+- summary 预建服务第一版已落地：
+  - 查询侧已切到 summary-first prefilter：
+    - 优先读取 `meta/summary`
+    - 缺失时回退旧 `mmap + memmem`
+    - 不再持续写入 relation-pattern 级 `prefilter-*.meta`
+  - 已新增 segment 通用 summary：
+    - `locator_bloom + reltag_bloom`
+    - 文件落在 `DataDir/pg_flashback/meta/summary`
+    - 文件 identity 已升级到纳秒级 `mtime/ctime`，避免 `pg_wal` 活动段内容变化时误复用旧 summary
+  - 已新增 `shared_preload_libraries` 下的 summary 服务：
+    - 1 个 launcher
+    - shared queue
+    - 多 worker pool
+    - worker 只读 WAL 文件并写扩展私有 `meta/summary`
+  - 已实现自动清理：
+    - 只清理 `meta/summary`
+    - 使用容量上限 + low watermark
+    - 保护近期文件与队列中的活跃任务
+  - 已完成本机 PG18 preload 手工验证：
+    - `shared_preload_libraries = 'pg_flashback'` 后 launcher/worker 可见
+    - 清空 `meta/summary` 后，无查询介入即可自动重新生成 summary
+    - 人工制造超限 summary 文件后，launcher 会自动清理回阈值以下
+  - 当前并发预算已收口：
+    - summary worker 默认值改为 `2`
+    - 注册时会按 `max_worker_processes` 自动预留查询 worker 槽位，避免挤占 WAL payload 动态 bgworker
+  - 决策记录：
+    - `docs/decisions/ADR-0019-summary-prebuild-service.md`
 
 - 目标回归当前状态：
   - `fb_keyed_fast_path`
@@ -186,12 +225,54 @@
   - Phase 3 prototype 已回收，等待更低开销实现
   - Phase 5 prototype 继续关闭
   - apply 串行热路径继续收敛中，下一步是在无干扰环境下补稳态复测，并继续压 residual / stage 9 尾段
-- Phase 2 当前正式主路径：
-  - WAL payload / materialize 并行已经进入稳定主路径
-  - 当前实现固定为：
+  - Phase 2 当前正式主路径：
+    - WAL payload / materialize 并行已经进入稳定主路径
+    - 当前实现固定为：
+  - 本轮新增性能收敛任务已入场：
+    - keyed fast path 从 `=` / `IN` / `ORDER BY key LIMIT` 扩展到单列稳定键的 range 谓词
+    - 去掉 `FbApplyScan` 末尾 `ExecCopySlot/tts_virtual_materialize` 输出拷贝链
+    - 完成后回看 `3/9` 当前架构中仍可精简的重复性 work
     - 进程级 payload worker
+
+## 下一步
+
+- 为 summary 服务补专门的 SQL/debug 可观测面与自动化回归：
+  - queue 状态
+  - launcher 扫描结果
+  - cleanup 触发/停点
+- 继续把 summary 服务的优先级与 recent-tail 调度策略做细：
+  - 更明确区分热前沿和冷回填预算
+  - 必要时补路径级排除 / recent tail 保护
+- 回到主线性能目标：
+  - 继续压 `3/9` 后半段 payload/materialize
+  - 继续推进 metadata 并行第二版实现
     - leader 共享 resolved segment snapshot，去掉 worker 侧重复 resolver/prepare
     - worker 本地 spool，leader 按 window/LSN 顺序 merge
+
+- 本轮已完成 keyed range fast path 扩展：
+  - planner/apply 当前支持单列稳定 keyed 的：
+    - `BETWEEN`
+    - `< <= > >=`
+    - 两侧 bound 的开闭区间组合
+    - 与 `ORDER BY key` / `LIMIT` 的组合
+  - 对跨类型常量比较（例如 `bigint key` + `int4 const`）已改为按目标 btree opfamily 做 operator interpretation，不再把 `>=` / `<=` 误判为 `=`
+  - `FbApplyScan` 当前已直接绑定输出 slot，去掉末尾 `ExecCopySlot/tts_virtual_materialize` 拷贝链
+  - 为避免 range merge 时 slot 生命周期问题，ordered current candidate 当前改为 materialize 成 owned heap tuple 后再交给输出 slot
+  - 新增/更新回归：
+    - `fb_keyed_fast_path`
+    - 覆盖 `BETWEEN`、混合上下界、`ORDER BY DESC LIMIT`、带 projection 的 range fast path
+
+- 对 `3/9` 当前重复性 work 的本轮复盘：
+  - 仍值得继续压的主热点不在 prefilter 落盘，而在：
+    - `XLogDecodeNextRecord`
+    - CRC 校验
+    - touched-xid / xid-status 的重复 hash bookkeeping
+  - 当前最值得继续看的重复路径：
+    - 已进入 decode 但最后不会留下 payload / reverse-op 的 record 仍然完整走了解码与记账
+    - touched-xid 与事务状态路径上存在重复 hash lookup / insert
+    - segment / window 级筛选信息在 prefilter、visit window、materialize window 之间还有重复折返
+  - 结论：
+    - `3/9` 下一步更偏架构型收敛，应优先减少“需要进入 decode 的 record 数”和“decode 后仍重复做的 xid bookkeeping”
     - raw spool file merge + anchor rebuild，减少 leader 二次解帧开销
     - 对连续大 payload window 再按 segment 切分，提高 worker 利用率
     - 切分窗口采用“reader overlap + logical emit boundary”模型，避免跨 segment record 丢失
