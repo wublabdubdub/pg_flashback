@@ -5,6 +5,8 @@
 
 #include "postgres.h"
 
+#include <dirent.h>
+#include <errno.h>
 #include <sys/stat.h>
 
 #include "common/file_perm.h"
@@ -53,6 +55,50 @@ struct FbSpoolCursor
 };
 
 static uint64 fb_spool_session_counter = 0;
+
+static void
+fb_spool_remove_session_dir(const char *path)
+{
+	DIR *dir;
+	struct dirent *de;
+
+	if (path == NULL || path[0] == '\0')
+		return;
+
+	dir = AllocateDir(path);
+	if (dir == NULL)
+	{
+		if (errno == ENOENT)
+			return;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open fb spill directory"),
+				 errdetail("path=%s: %m", path)));
+	}
+
+	while ((de = ReadDir(dir, path)) != NULL)
+	{
+		char *child_path;
+
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+			continue;
+
+		child_path = psprintf("%s/%s", path, de->d_name);
+		if (unlink(child_path) != 0 && errno != ENOENT)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove fb spill file"),
+					 errdetail("path=%s: %m", child_path)));
+		pfree(child_path);
+	}
+
+	FreeDir(dir);
+	if (rmdir(path) != 0 && errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove fb spill directory"),
+				 errdetail("path=%s: %m", path)));
+}
 
 static void
 fb_spool_append_anchor(FbSpoolLog *log)
@@ -171,7 +217,10 @@ fb_spool_session_destroy(FbSpoolSession *session)
 	}
 
 	if (session->dir != NULL)
+	{
+		fb_spool_remove_session_dir(session->dir);
 		pfree(session->dir);
+	}
 
 	pfree(session);
 }

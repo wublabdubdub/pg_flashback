@@ -1413,7 +1413,21 @@ fb_replay_heap_delete(const FbRelationInfo *info,
 	if (htup == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("failed to locate tuple for heap delete redo")));
+				 errmsg("failed to locate tuple for heap delete redo"),
+				 errdetail("lsn=%X/%08X rel=%u/%u/%u blk=%u off=%u image=%s apply_image=%s data=%s init_page=%s maxoff=%u has_item=%s",
+						   LSN_FORMAT_ARGS(record->lsn),
+						   FB_LOCATOR_SPCOID(block_ref->locator),
+						   FB_LOCATOR_DBOID(block_ref->locator),
+						   FB_LOCATOR_RELNUMBER(block_ref->locator),
+						   block_ref->blkno,
+						   xlrec->offnum,
+						   block_ref->has_image ? "true" : "false",
+						   block_ref->apply_image ? "true" : "false",
+						   block_ref->has_data ? "true" : "false",
+						   record->init_page ? "true" : "false",
+						   (unsigned int) PageGetMaxOffsetNumber(page),
+						   (PageGetMaxOffsetNumber(page) >= xlrec->offnum &&
+							ItemIdIsUsed(PageGetItemId(page, xlrec->offnum))) ? "true" : "false")));
 
 	ItemPointerSetBlockNumber(&target_tid, block_ref->blkno);
 	ItemPointerSetOffsetNumber(&target_tid, xlrec->offnum);

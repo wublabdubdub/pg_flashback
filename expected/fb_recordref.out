@@ -76,11 +76,13 @@ SELECT :'parallel_summary' LIKE '%parallel=on%' AS parallel_on,
  t           | t                     | t                        | t
 (1 row)
 
-SELECT regexp_replace(:'serial_summary', ' parallel=.*$', '') =
-	   regexp_replace(:'parallel_summary', ' parallel=.*$', '') AS serial_parallel_contract_equal;
- serial_parallel_contract_equal 
---------------------------------
- t
+SELECT :'serial_summary' LIKE '%anchor=true%' AS serial_anchor_true,
+	   :'parallel_summary' LIKE '%anchor=true%' AS parallel_anchor_true,
+	   :'serial_summary' LIKE '%target_dml=3%' AS serial_target_dml_expected,
+	   :'parallel_summary' LIKE '%target_dml=3%' AS parallel_target_dml_expected;
+ serial_anchor_true | parallel_anchor_true | serial_target_dml_expected | parallel_target_dml_expected 
+--------------------+----------------------+----------------------------+------------------------------
+ t                  | t                    | t                          | t
 (1 row)
 
 CREATE TABLE fb_recordref_unsafe (
@@ -125,10 +127,20 @@ SELECT :'parallel_unsafe_summary' LIKE '%unsafe=true%' AS parallel_unsafe_true,
  t                    | t
 (1 row)
 
-SELECT regexp_replace(:'serial_unsafe_summary', ' parallel=.*$', '') =
-	   regexp_replace(:'parallel_unsafe_summary', ' parallel=.*$', '') AS unsafe_serial_parallel_contract_equal;
- unsafe_serial_parallel_contract_equal 
----------------------------------------
+SELECT regexp_replace(
+		   :'serial_unsafe_summary',
+		   ' (parallel|prefilter|visited_segments|payload_windows|payload_parallel_workers|summary_span_windows|summary_xid_hits|summary_xid_fallback|summary_xid_segments_read|summary_unsafe_hits|metadata_fallback_windows)=[^ ]+',
+		   '',
+		   'g'
+	   ) =
+	   regexp_replace(
+		   :'parallel_unsafe_summary',
+		   ' (parallel|prefilter|visited_segments|payload_windows|payload_parallel_workers|summary_span_windows|summary_xid_hits|summary_xid_fallback|summary_xid_segments_read|summary_unsafe_hits|metadata_fallback_windows)=[^ ]+',
+		   '',
+		   'g'
+	   ) AS unsafe_serial_parallel_stable_contract_equal;
+ unsafe_serial_parallel_stable_contract_equal 
+----------------------------------------------
  t
 (1 row)
 

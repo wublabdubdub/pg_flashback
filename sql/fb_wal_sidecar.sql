@@ -35,6 +35,7 @@ BEGIN
 	EXECUTE format('SET pg_flashback.archive_dir = %L', current_setting('data_directory') || '/pg_wal');
 END;
 $$;
+SET pg_flashback.parallel_workers = 0;
 
 CREATE TABLE fb_wal_sidecar_target (
 	id integer PRIMARY KEY,

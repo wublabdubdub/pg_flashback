@@ -10,6 +10,32 @@
 
 ## 本轮已完成
 
+- [x] 修复“较早 prefix gap 误杀较新连续 suffix”的 WAL resolver 问题
+  - resolver 不再因旧 prefix 上的不可恢复 gap 在 `2/9` 直接报 `missing segment`
+  - 当前改为保留最新端连续 suffix；只有 suffix 自身不连续时才继续报 WAL 不完整
+  - 新增回归 `fb_wal_prefix_suffix`
+- [x] 修复串行 payload path 在 split materialize windows 下漏掉跨 segment 记录头的问题
+  - `fb_flashback_toast_storage_boundary` 的跨 `80/5C -> 80/5D` heap insert 已恢复通过
+  - 当前在 payload bgworker 重新启用前，串行 payload 路径不再使用 split windows
+  - live case `documents @ 2026-03-29 14:10:13` 在 `memory_limit='8GB'` 下仍返回 `count = 4356409`
+- [x] 止血 `documents @ 2026-03-29 14:10:13` 的 postmaster 级 crash：
+  - 现场 `PANIC: stuck spinlock detected at get_hash_entry`
+  - 当前先硬关闭 dynamic payload bgworker/DSM 路径，强制回落串行 payload materialize
+  - 增加 full-range anchor fallback，避免 `fb_wal_sidecar` 因预过滤窗口裁掉 checkpoint 而误报缺锚点
+  - live 复核：
+    - `memory_limit='6GB'` 返回真实 preflight 内存报错，不再 crash
+    - `memory_limit='8GB'` 返回 `count = 4356409`
+- [x] 修复 summary-first payload 窗口残留重叠导致的重复 replay：
+  - 新增全局 visit-window merge
+  - 串行 payload materialize 增加 emit-floor，避免重叠窗口重复 append 同一条 WAL record
+  - 新增回归 `fb_summary_overlap_toast`
+  - 清空 `meta/summary` 后复跑 `fb_recordref` / `fb_flashback_toast_storage_boundary`，确认旧 fallback 路径仍可正确工作
+  - live case `documents @ 2026-03-29 14:10:13` 已不再报 replay 内核错误，`8GB` 下返回 `count = 4356409`
+- [x] 修复 summary-first prefilter 的 pthread worker 误用 `palloc/psprintf`，恢复 `3/9 build record index` 不再 backend `SIGSEGV`
+- [x] 修复 WAL payload 并行失败后的回退路径，避免主动终止 worker 后又被正常 wait 校验重新抬成 `ERROR`
+- [x] 复核用户 case `scenario_oa_12t_50000r.documents @ '2026-03-29 14:10:13'`：
+  - 默认 `memory_limit=1GB` 当前返回真实 preflight 内存报错，不再 crash
+  - `pg_flashback.memory_limit='8GB'` 已返回 `count = 4356409`
 - [x] 记录开发期 core / gdb 临时文件统一落盘到 `/isoTest/tmp`，不再使用 `/tmp`
 - [x] 修复 `FbApplyScan` 直接返回 apply 内部 slot，导致 residual 历史行参与上层表达式投影/排序时崩溃的问题
 - [x] 修复 keyed 单列 typed-key fast path 的单 key hash 不一致，恢复 `WHERE 主键 = const` / `IN (...)` 对更新行与已删除历史行的正确命中
@@ -30,8 +56,24 @@
 - [x] 迁移回归到新接口
 - [x] 迁移 deep SQL 主线到新接口
 - [x] 重写核心维护文档到当前实现口径
+- [x] 登记 `pg_flashback_summary_progress` 的 WAL 连续性观测缺口：
+  - 清理部分较老归档后，query-side 已会因中间 segment 缺口报 `WAL not complete`
+  - 当前 progress 视图仍只统计 summary 文件缺口，未把真实 WAL 缺口折算进 `missing_segments` / `first_gap_*`
 
 ## 当前待办
+
+### Runtime 安全清理
+
+- [x] 恢复“查询结束触发的 `runtime/` 安全 sweep”
+- [x] 扫描整个 `DataDir/pg_flashback/runtime`
+- [x] 仅删除 owner backend 已失活的 `fbspill-*` / `toast-retired-*`
+- [x] 活跃 owner / 命名不匹配 / 状态不确定时直接跳过
+- [x] 不恢复 `runtime_retention` 等 retention GUC
+- [x] 不触碰 `recovered_wal` / `meta`
+- [x] 补回归覆盖：
+  - 自动清理本次查询残留
+  - 自动清理历史 stale runtime 残留
+  - 不误删当前活跃 backend 的 runtime 产物
 
 ### Summary 预建服务
 
@@ -43,7 +85,29 @@
 - [x] 查询 prefilter 改为 summary-first，缺失时回退旧 `mmap + memmem`
 - [x] 新增 `meta/summary` 容量上限与 summary 专属自动清理
 - [x] 完成 PG18 preload 手工验证
-- [ ] 补齐 summary/service 专项回归与可观测 debug 接口
+- [x] 将 launcher 调度改成显式“冷热双队列 + recent-first”
+- [x] 新增 summary 进度视图，展示 stable candidate 完成度与队列状态
+- [x] 补齐 summary/service 专项回归与可观测 debug 接口
+- [x] 将 `fb_summary_progress` 收口为 snapshot + hot/cold frontier 口径，避免新段持续产生时进度语义漂移
+- [x] 将用户向 summary 进度视图重做为 `pg_flashback_summary_progress`
+- [x] 将 queue / worker / cleanup 计数拆到 `pg_flashback_summary_service_debug`
+- [x] 将 stable 时间窗 / 近端前沿 / 远端前沿 / 两端首个 gap 作为新的用户主口径
+- [x] 新增并固定“用户可见 summary 观测面统一使用 `pg_flashback_` 前缀”的命名规则
+- [x] 将 `pg_flashback_summary_progress` 收紧为“当前可见 WAL 连续性 + summary 覆盖”联合口径
+  - [x] 将中间 WAL 缺口折算进 `missing_segments`
+  - [x] 让 `first_gap_from_newest_*` / `first_gap_from_oldest_*` 能指向真实 WAL 缺口
+  - [x] 让 `progress_pct` 对归档删洞后的场景不再虚高
+  - [x] 补回归覆盖“删掉 archive 中间段后 progress 先缩 frontiers”的场景
+
+### Summary v3 紧凑 segment 索引
+
+- [x] 将 `summary-*.meta` 从 bloom-only 摘要升级为 versioned 多 section 格式
+- [x] 保留 `locator_bloom/reltag_bloom` 作为 segment 级第一层 gate
+- [x] 新增 relation dictionary + relation spans section
+- [x] 新增 xid outcome section，优先服务 touched xid 状态补齐
+- [x] 查询侧命中 segment 后改为 span-driven WAL decode，不再默认整段顺序遍历
+- [x] xid status 回填改为“summary outcome 优先，WAL 回扫兜底”
+- [x] 补齐 sidecar 缺失 / 损坏 / 覆盖不足时的安全回退回归
 
 ### P3 / P4 补齐
 
@@ -118,9 +182,16 @@
   - 与 `ORDER BY key` / `LIMIT` 的可安全组合
 - [x] 去掉 `FbApplyScan` 末尾 `ExecCopySlot/tts_virtual_materialize` 输出拷贝链
 - [ ] `3/9` 架构收敛 follow-up：
-  - 减少进入 `XLogDecodeNextRecord` 但最终无 payload 的 record work
-  - 合并 touched-xid / xid-status 的重复 hash bookkeeping
-  - 复用 prefilter / visit-window / materialize-window 的重复 segment-window 计算
+  - [ ] 将 `xid fill` 改成只读取命中 query window 的 summary segment，不再按 `resolved_segment_count` 全量扫 `summary-*.meta`
+  - [ ] 为查询期 summary section 增加 backend-local cache，去掉同一查询内的重复 `open/read/close`
+  - [ ] 增加 relation-scoped `touched xids` section，让 metadata 主链不再为 xid 收集回扫整段 WAL
+  - [ ] 在保持 `meta/summary` 低存储原则下新增紧凑 `unsafe facts` section
+  - [ ] 将 metadata 主链改成 summary-first，仅对 uncovered window 回退 WAL 扫描
+  - [ ] 保留原有 metadata/xact WAL 路径，确保 meta 未及时生成时仍可正确回退
+  - [ ] 删除现有 `meta/summary` 并重建后，复跑回归与 live case 验证真实收益
+  - [ ] 继续减少进入 `XLogDecodeNextRecord` 但最终无 payload 的 record work
+  - [ ] 继续合并 touched-xid / xid-status 的重复 hash bookkeeping
+  - [ ] 继续复用 prefilter / visit-window / materialize-window 的重复 segment-window 计算
 - [x] 从本机会话日志恢复 bounded spill Stage A 代码基线（`fb_spool` / `fb_spill` / `FbReverseOpSource`）
 - [x] 继续从本机会话日志恢复 `2026-03-26 21:10` 后半段到 `2026-03-27` 的 spill follow-up / `fb_wal` sidecar / SRF 主链
 - [x] 统一内存超限报错增加 `pg_flashback.memory_limit` 调参提示与可读单位
@@ -143,6 +214,13 @@
     - overlap read + logical emit boundary 的 correctness 修复
   - 已补自动化回归 `fb_wal_parallel_payload`
   - live case 已确认 `FbWalIndexScan` 与总时长均有明显收益
+- [ ] root-cause 并重新启用 WAL payload dynamic bgworker/DSM 路径
+  - 当前 live case 曾触发 postmaster 级 `stuck spinlock` / shared-memory instability
+  - 现阶段已硬关闭 `fb_wal_materialize_payload_parallel()`，仅保留串行 payload materialize
+  - 重新启用前至少需要：
+    - 复现并定位具体 shared-memory / bgworker 生命周期问题
+    - 保证 `fb_wal_parallel_payload` 回到真实并行 worker 口径
+    - 复跑 `documents @ 2026-03-29 14:10:13`，确认日志无 `PANIC` / recovery
 - [ ] 将 WAL metadata scan 改造成不改变语义且稳定优于串行基线的并行阶段
   - 当前 metadata 两段式并行 prototype 已做过，并补过 `fb_recordref` safe/unsafe 合同回归
   - 但 live case 上未打赢串行 metadata 基线，当前保持关闭

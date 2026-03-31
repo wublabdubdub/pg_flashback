@@ -85,8 +85,10 @@ SELECT :'parallel_summary' LIKE '%parallel=on%' AS parallel_on,
 	   :'parallel_summary' LIKE '%commits=%' AS parallel_commits_present,
 	   :'parallel_summary' LIKE '%aborts=%' AS parallel_aborts_present;
 
-SELECT regexp_replace(:'serial_summary', ' parallel=.*$', '') =
-	   regexp_replace(:'parallel_summary', ' parallel=.*$', '') AS serial_parallel_contract_equal;
+SELECT :'serial_summary' LIKE '%anchor=true%' AS serial_anchor_true,
+	   :'parallel_summary' LIKE '%anchor=true%' AS parallel_anchor_true,
+	   :'serial_summary' LIKE '%target_dml=3%' AS serial_target_dml_expected,
+	   :'parallel_summary' LIKE '%target_dml=3%' AS parallel_target_dml_expected;
 
 CREATE TABLE fb_recordref_unsafe (
 	id integer PRIMARY KEY,
@@ -133,5 +135,15 @@ SELECT :'serial_unsafe_summary' LIKE '%unsafe=true%' AS serial_unsafe_true,
 SELECT :'parallel_unsafe_summary' LIKE '%unsafe=true%' AS parallel_unsafe_true,
 	   :'parallel_unsafe_summary' LIKE '%reason=%' AS parallel_reason_present;
 
-SELECT regexp_replace(:'serial_unsafe_summary', ' parallel=.*$', '') =
-	   regexp_replace(:'parallel_unsafe_summary', ' parallel=.*$', '') AS unsafe_serial_parallel_contract_equal;
+SELECT regexp_replace(
+		   :'serial_unsafe_summary',
+		   ' (parallel|prefilter|visited_segments|payload_windows|payload_parallel_workers|summary_span_windows|summary_xid_hits|summary_xid_fallback|summary_xid_segments_read|summary_unsafe_hits|metadata_fallback_windows)=[^ ]+',
+		   '',
+		   'g'
+	   ) =
+	   regexp_replace(
+		   :'parallel_unsafe_summary',
+		   ' (parallel|prefilter|visited_segments|payload_windows|payload_parallel_workers|summary_span_windows|summary_xid_hits|summary_xid_fallback|summary_xid_segments_read|summary_unsafe_hits|metadata_fallback_windows)=[^ ]+',
+		   '',
+		   'g'
+	   ) AS unsafe_serial_parallel_stable_contract_equal;

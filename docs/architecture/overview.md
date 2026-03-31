@@ -146,7 +146,10 @@ Custom Scan (FbApplyScan)
 
 - 初始化和校验扩展私有目录
 - 提供 `runtime/recovered_wal/meta` 路径给各模块落盘使用
-- 不再对已生成产物执行自动删除或保留期淘汰
+- `recovered_wal/meta` 不再做通用自动删除或保留期淘汰
+- 查询结束时对 `runtime/` 触发一次安全 sweep：
+  - 仅清理 owner backend 已失活的 `fbspill-*` / `toast-retired-*`
+  - 对活跃 owner 或状态不确定的产物保持保留
 
 当前固定目录：
 
@@ -164,9 +167,11 @@ Custom Scan (FbApplyScan)
 
 职责：
 
-- 定义 segment 通用 summary 文件格式
+- 定义 segment 通用 summary / segment index 文件格式
 - 在 `meta/summary` 中读写 summary
 - 提供 locator / relid bloom probe
+- 提供 relation spans / xid outcomes / relation-scoped touched xids / 紧凑 unsafe facts 的读取接口
+- 提供查询期 backend-local summary section cache，避免同一查询重复读取相同 summary 文件
 - 供 query prefilter 和后台预建服务共用
 
 ### `fb_summary_service`
@@ -180,9 +185,13 @@ Custom Scan (FbApplyScan)
 
 - 在 `shared_preload_libraries` 模式下注册 launcher 与 worker
 - 维护扩展私有 shared queue
+- 显式区分热前沿与冷回填两类任务
 - 周期扫描 archive / `pg_wal` / `recovered_wal`
 - 让 worker 读取 WAL segment 并预建 summary
 - 对 `meta/summary` 执行 summary 专属自动清理
+- 提供 summary 预建进度的 SQL 可观测面：
+  - 用户主视图为 `pg_flashback_summary_progress`
+  - 服务内部调试视图为 `pg_flashback_summary_service_debug`
 
 ### `fb_progress`
 

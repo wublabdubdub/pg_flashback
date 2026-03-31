@@ -19,11 +19,14 @@
 - 预建服务要求 `shared_preload_libraries` 支持
 - 注册常驻 launcher 与多 worker pool
 - launcher 周期扫描 `archive_dest`、`pg_wal`、`recovered_wal`
+- launcher 默认按“最近时间 -> 更早时间”推进预建
+- shared queue 显式区分热前沿与冷回填两类任务
 - worker 在进程私有内存中读取 WAL segment，构建极小通用 summary
 - summary 直接落盘到 `DataDir/pg_flashback/meta/summary`
 - 查询 prefilter 优先使用 summary；缺失时继续回退旧查询路径
 - relation-pattern 级 `prefilter-*.meta` sidecar 停用，不再继续扩张
 - 自动清理只针对 `meta/summary`，不影响 `runtime`、`recovered_wal`、checkpoint sidecar 或其它 query-owned 产物
+- 额外提供一个 SQL 视图，让用户查看 summary 预建进度与队列状态
 
 ## 后果
 

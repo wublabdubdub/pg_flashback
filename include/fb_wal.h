@@ -13,6 +13,8 @@
 #include "fb_common.h"
 #include "fb_spool.h"
 
+typedef struct FbSummaryQueryCache FbSummaryQueryCache;
+
 typedef enum FbWalUnsafeReason
 {
 	FB_WAL_UNSAFE_NONE = 0,
@@ -49,8 +51,11 @@ typedef struct FbWalScanContext
 	int wal_seg_size;
 	char first_segment[25];
 	char last_segment[25];
+	char retained_gap_left_segment[25];
+	char retained_gap_right_segment[25];
 	uint32 total_segments;
 	bool segments_complete;
+	bool retained_suffix_only;
 	bool end_is_partial;
 	XLogRecPtr start_lsn;
 	XLogRecPtr original_start_lsn;
@@ -90,10 +95,17 @@ typedef struct FbWalScanContext
 	uint32 prefilter_hit_segments;
 	uint32 prefilter_total_segments;
 	bool *segment_hit_map;
+	uint32 summary_span_windows;
+	uint32 summary_xid_hits;
+	uint32 summary_xid_fallback;
+	uint32 summary_xid_segments_read;
+	uint32 summary_unsafe_hits;
+	uint32 metadata_fallback_windows;
 	bool current_segment_may_hit;
 	uint32 progress_segment_total;
 	uint32 visited_segment_count;
 	FbSpoolSession *spool_session;
+	FbSummaryQueryCache *summary_cache;
 } FbWalScanContext;
 
 typedef enum FbWalRecordKind

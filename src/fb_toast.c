@@ -5,6 +5,8 @@
 
 #include "postgres.h"
 
+#include <errno.h>
+
 #include <unistd.h>
 
 #include "access/genam.h"
@@ -149,6 +151,11 @@ fb_toast_release_spill_file(FbToastStore *store)
 
 	if (store->spill_path != NULL)
 	{
+		if (unlink(store->spill_path) != 0 && errno != ENOENT)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove fb toast spill file"),
+					 errdetail("path=%s: %m", store->spill_path)));
 		pfree(store->spill_path);
 		store->spill_path = NULL;
 	}

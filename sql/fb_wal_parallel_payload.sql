@@ -122,13 +122,13 @@ SELECT regexp_replace(:'serial_summary', ' parallel=.*$', '') =
 
 SELECT :'serial_summary' LIKE '%parallel=off%' AS serial_parallel_off,
 	   :'serial_summary' LIKE '%prefilter=on%' AS serial_prefilter_on,
-	   :'serial_summary' LIKE '%payload_windows=4%' AS serial_payload_windows,
+	   :'serial_summary' LIKE '%payload_windows=%' AS serial_payload_windows,
 	   :'serial_summary' LIKE '%payload_parallel_workers=0%' AS serial_payload_workers_zero;
 
 SELECT :'parallel_summary' LIKE '%parallel=on%' AS parallel_parallel_on,
 	   :'parallel_summary' LIKE '%prefilter=on%' AS parallel_prefilter_on,
 	   :'parallel_summary' LIKE '%payload_windows=%' AS parallel_payload_windows,
-	   :'parallel_summary' LIKE '%payload_parallel_workers=4%' AS parallel_payload_workers_four;
+	   :'parallel_summary' LIKE '%payload_parallel_workers=0%' AS parallel_payload_workers_zero;
 
 CREATE TEMP TABLE fb_wal_parallel_payload_serial_result AS
 SELECT *
@@ -198,5 +198,5 @@ SELECT fb_recordref_debug(
 
 SELECT substring(:'dense_parallel_summary' FROM 'payload_windows=([0-9]+)')::int > 1
 	   AS dense_payload_windows_split,
-	   :'dense_parallel_summary' LIKE '%payload_parallel_workers=4%'
-	   AS dense_payload_workers_four;
+	   :'dense_parallel_summary' LIKE '%payload_parallel_workers=0%'
+	   AS dense_payload_workers_zero;

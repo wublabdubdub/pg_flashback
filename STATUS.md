@@ -11,6 +11,8 @@
   - `fb_check_relation(regclass)`
   - `pg_flashback_to(regclass, text)`
   - `pg_flashback(anyelement, text)`
+  - `pg_flashback_summary_progress` 视图
+  - `pg_flashback_summary_service_debug` 视图
 - 当前用户调用形态固定为：
   - `SELECT pg_flashback_to('schema.table'::regclass, target_ts_text);`
   - `SELECT * FROM pg_flashback(NULL::schema.table, target_ts_text);`
@@ -54,7 +56,11 @@
   - `show_progress`
   - 未显式设置 `archive_dest` 时，可按 PostgreSQL 内核 `archive_command` 自动推断本地归档目录
   - 自动初始化 `DataDir/pg_flashback/{runtime,recovered_wal,meta}`
-  - 不再对 `runtime/recovered_wal/meta` 做自动删除或保留期淘汰
+  - `recovered_wal/meta` 仍不做通用自动删除或保留期淘汰
+  - `runtime/` 当前将恢复“查询结束触发的安全 sweep”：
+    - 扫描整个 `runtime/`
+    - 仅删除 owner backend 已失活的 `fbspill-*` / `toast-retired-*`
+    - 活跃 owner、命名不匹配、状态不确定时一律跳过
   - `pg_flashback.parallel_workers` 默认值当前已调整为 `8`
 - 当前 `pg_flashback()` 进度显示固定为 9 段：
   - stage `9` 已改为 residual 历史行发射
@@ -63,6 +69,118 @@
   - 不再使用 `/tmp` 作为本项目的临时 core 落盘路径
 
 ## 本轮完成
+
+- 已修复“连续删掉较早一段 WAL 后，prepare 阶段仍因更早 prefix gap 直接报 `missing segment`”的问题：
+  - root cause：
+    - resolver 在 [fb_wal.c](/root/pg_flashback/src/fb_wal.c) 原先对整条候选 segment 集做全局连续性校验
+    - 只要较早位置存在一个不可恢复 gap，就会在 `2/9 preparing wal scan context` 直接报
+      `WAL not complete: missing segment between ...`
+    - 即使较新的连续 suffix 仍然完整，且 target 实际只需要这段 suffix，也会被前缀缺口误杀
+  - 当前修复口径：
+    - 选择逻辑改成“保留最新端连续 suffix”
+    - 遇到不可恢复 gap 时，不再整条失败，而是丢弃 gap 之前的旧 prefix
+    - 只有最新 suffix 自身仍不连续时，才继续视为真正的 WAL 不完整
+  - 新增回归：
+    - `fb_wal_prefix_suffix`
+    - 该回归构造 `A,C,D` 三段 archive fixture，验证 prepare 会丢弃旧 `A`，保留最新连续 `C,D`
+  - 当前验证：
+    - `fb_wal_prefix_suffix fb_wal_sidecar` 已全部通过
+    - 现场 `alldb` 上，原先在 `2/9` 报 `missing segment between 000000010000007F000000FF and 00000001000000800000009F`
+      的查询，现在已能进入 `3/9`
+    - 同一条 query 当前改为报 `WAL not complete: no checkpoint before target timestamp`，说明“前缀 gap 误杀”已消失，剩余失败原因已切到真实 anchor 覆盖不足
+
+- 已修复 `pg_flashback_summary_progress` 对 archive 删洞场景的误报：
+  - root cause：
+    - progress 统计原先只看“当前 candidate 是否已有 summary 文件”，没有把当前 WAL 连续性缺口折算进 `missing_segments` / `first_gap_*`
+    - 同时 progress 复用了 `skip_unstable_tail=true` 的 candidate 口径，连续 run 的尾段会被天然裁掉，进一步掩盖真实 gap
+    - 当用户清理一部分较老归档 WAL 后，查询路径会先因 `WAL not complete` 失败，但 progress 仍可能给出一段看似正常的 stable 时间窗
+  - 当前修复口径：
+    - `fb_summary_service_collect_progress()` 改为基于完整 candidate 集统计，不再沿用 `skip_unstable_tail=true`
+    - 将相邻 segno 间的 WAL 洞折算进 `missing_segments`
+    - `first_gap_from_newest_*` / `first_gap_from_oldest_*` 现可直接指向真实 WAL 缺口，而不只指向“缺 summary 的现存 segment”
+    - 当 shared snapshot 与当前会话可见 candidate 完全错位时，progress 会自动回退到“直接按当前 candidate 统计”，避免 session 级 `archive_dest/debug_pg_wal_dir` 下整张视图失明
+  - 当前验证：
+    - `fb_summary_service` 单测已通过
+    - `fb_summary_service fb_summary_v3 fb_wal_sidecar` bundle 已通过
+    - `alldb` 现场当前显示：
+      - `missing_segments = 793`
+      - `first_gap_from_newest_segno = 32926`
+      - `first_gap_from_oldest_segno = 31488`
+      - `progress_pct = 46.20081411126187`
+    - 同时原用户 SQL 仍会快速报 `WAL not complete: missing segment ...`，说明观测面已与 query-side 事实对齐
+
+- 已修复 serial payload path 在 split materialize windows 下漏掉跨 segment 记录头的问题：
+  - root cause：
+    - `fb_split_parallel_materialize_windows()` 只借 trailing decode-tail，不借 leading decode-head
+    - 在 payload bgworker 已硬关闭后，串行 fallback 仍沿用这套 split windows
+    - 当目标 heap record 从前一段起始、在当前段结束时，后一个 split chunk 会从段边界起扫并直接跳过该 record
+    - 现场最小复现为 `fb_flashback_toast_storage_boundary`，失败点为跨 `80/5C` -> `80/5D` 的 heap insert，后续 replay 在同页 `off=5` 时报 `failed to replay heap insert`
+  - 当前修复口径：
+    - 在 payload bgworker 重新启用前，串行 payload 路径不再调用 `fb_split_parallel_materialize_windows()`
+    - 保持 merged payload windows 原样读取，避免 split chunk 裁掉跨段记录头
+  - 当前验证：
+    - `fb_flashback_toast_storage_boundary` 已恢复通过
+    - `fb_wal_parallel_payload fb_wal_sidecar fb_summary_overlap_toast fb_summary_v3 fb_flashback_toast_storage_boundary fb_toast_flashback fb_recordref` 已全部通过
+    - live case `scenario_oa_12t_50000r.documents @ '2026-03-29 14:10:13'` 在 `memory_limit='8GB'` 下仍可完整返回 `count = 4356409`
+
+- 已止血 `scenario_oa_12t_50000r.documents @ '2026-03-29 14:10:13'` 的 postmaster 级 crash：
+  - 现场证据：
+    - 崩溃时 PostgreSQL 日志报 `PANIC: stuck spinlock detected at get_hash_entry, dynahash.c:1268`
+    - core 落在 autovacuum `LockAcquire -> SetupLockInTable -> get_hash_entry`
+    - 崩溃窗口内用户查询正在走 dynamic payload bgworker/DSM 路径
+  - 当前处置：
+    - 先硬关闭 `fb_wal_materialize_payload_parallel()`，强制回落串行 payload materialize
+    - 保留原有 WAL payload 串行路径，避免 meta 未及时生成或并行路径不稳时影响 correctness
+    - 追加 full-range anchor fallback，避免关闭 bgworker 后 `fb_wal_sidecar` 因预过滤窗口裁掉 checkpoint 而误报 `no checkpoint before target timestamp`
+  - 当前验证：
+    - `fb_wal_parallel_payload` 已同步为“并行请求下仍走串行 payload worker=0”口径
+    - `scenario_oa_12t_50000r.documents @ '2026-03-29 14:10:13'`：
+      - `memory_limit='6GB'` 现返回真实 preflight 内存报错，不再 crash
+      - `memory_limit='8GB'` 已完整跑通并返回 `count = 4356409`
+    - 最新 `postgresql-2026-03-31_214335.log` 已无新的 `PANIC` / `stuck spinlock` / postmaster recovery 记录
+
+- 已修复 summary-first payload 窗口残留重叠导致的 replay 重放错误：
+  - root cause：
+    - `fb_summary_segment_lookup_spans_cached()` 会把 main/toast/reltag 命中的多套 relation spans 直接拼接返回
+    - 查询侧旧实现只做 append/clip，不对 summary span windows / payload windows 做全局 merge
+    - live case 与最小 toast-heavy case 都会把同一段 WAL 重复 materialize，先后触发：
+      - `failed to replay heap insert`
+      - 消掉重复 insert 后继续暴露的 `failed to locate tuple for heap delete redo`
+  - 当前修复口径：
+    - 新增 summary/payload visit window 的全局排序 + merge
+    - 串行 payload materialize 增加 `payload_emit_start_lsn` 单调推进，物理读范围保留，逻辑发射不再重复 append 同一条 record
+    - 原有 summary 缺失时的 WAL fallback 路径保持不变
+  - 新增回归：
+    - `fb_summary_overlap_toast`
+  - 当前验证：
+    - `fb_summary_overlap_toast fb_summary_v3 fb_flashback_toast_storage_boundary fb_toast_flashback fb_recordref fb_wal_sidecar` 已全部通过
+    - 清空 `/isoTest/18pgdata/pg_flashback/meta/summary` 后复跑 `fb_recordref fb_flashback_toast_storage_boundary` 通过，确认 meta 未及时生成时旧路径仍可正确回退
+    - 用户 live case `scenario_oa_12t_50000r.documents @ '2026-03-29 14:10:13'`：
+      - `memory_limit='6GB'` 当前不再报 replay 错误，改为真实 preflight 内存报错
+      - `memory_limit='8GB'` 已完整跑通并返回 `count = 4356409`
+
+- 已修复 `3/9 build record index` 阶段的一处 summary-prefilter pthread 崩溃：
+  - root cause：
+    - segment prefilter 的 pthread worker 在 `fb_summary_load_file()` 路径内调用了 `fb_runtime_meta_summary_dir() / psprintf() / palloc()`
+    - PostgreSQL backend 内存上下文分配器不支持该 pthread 用法，导致 backend `SIGSEGV`
+  - 当前修复口径：
+    - `fb_summary_load_file()` 改为走线程安全的栈上 `snprintf()` summary path 拼接
+    - prefilter worker 不再在 pthread 内触碰 PostgreSQL `palloc/psprintf`
+  - 用户 case `scenario_oa_12t_50000r.documents @ '2026-03-29 14:10:13'`：
+    - 原先在 `NOTICE [3/9 0%]` 后直接把 backend 打挂
+    - 当前已可稳定走完整条 flashback 主链，不再触发 server crash
+
+- 已修复 WAL payload 并行阶段的一处失败退化问题：
+  - root cause：
+    - live case 上 payload bgworker 不能稳定保留时，leader 会主动 `TerminateBackgroundWorker()`
+    - 旧实现随后仍走“worker 必须 `DONE`”的正常 wait 校验，把回退路径再次抬成 `ERROR`
+  - 当前修复口径：
+    - payload worker 注册/启动失败时回退串行 payload 基线
+    - 主动终止已启动 worker 后，只等待关停，不再要求这些 worker 回报 `DONE`
+  - 当前 live 验证：
+    - `fb_wal_parallel_payload` 回归已通过
+    - `scenario_oa_12t_50000r.documents @ '2026-03-29 14:10:13'` 默认 `memory_limit=1GB` 下当前返回真实 preflight 报错，不再 crash
+    - 将 `pg_flashback.memory_limit='8GB'` 后，同一条查询已返回 `count = 4356409`
 
 - 已修复两处 `pg_flashback()` 查询面 correctness / stability 问题：
   - `FbApplyScan` 已改为把 apply 内部结果 copy 到 `ss_ScanTupleSlot` 后再返回
@@ -163,9 +281,8 @@
   - 删除 `pg_flashback.recovered_wal_retention`
   - 删除 `pg_flashback.meta_retention`
   - 删除 runtime 初始化时的 cleanup
-  - 删除查询结束时的 cleanup
-  - `runtime/`、`recovered_wal/`、`meta/` 只保留目录创建与产物承载职责
-  - 当前不再对 `fbspill-*`、`toast-retired-*`、恢复段或 sidecar 做自动删除
+  - `recovered_wal/`、`meta/` 继续不做查询结束 cleanup
+  - `runtime/` 后续单独恢复为“查询结束安全 sweep”，不回摆 retention GUC
 
 - 已修复 `recovered_wal` 的一处不必要 materialize 问题：
   - 真实用户 case：
@@ -185,6 +302,93 @@
     - 查询完成返回 `1001`
     - `recovered_wal` 保持为空，没有再生成 `7C/45..89`
 
+- 已完成 summary 服务 recent-first 调度与进度可观测面：
+  - launcher / worker 调度已从“隐含倒序入队”收口为显式冷热双队列
+  - worker 当前固定为：
+    - 先领取 hot 任务
+    - 同类任务内按更近的 segno 优先
+  - 新增旧版 `fb_summary_progress` 视图：
+    - 展示 stable candidate 总数
+    - 已完成 / 未完成 summary 数
+    - hot/cold missing 数
+    - `covered_through_ts`，表示从最新稳定 segment 往回连续已完成 summary 的最老事务时间点
+    - `snapshot_timeline_id/snapshot_oldest_segno/snapshot_newest_segno`
+    - `snapshot_hot_candidates/snapshot_cold_candidates`
+    - `cold_covered_until_ts`，表示从最老稳定 segment 往新方向连续已完成 summary 的最晚事务时间点
+    - queue 的 `pending/running` hot/cold 状态
+    - launcher/worker/counters 与 summary 文件大小
+  - 视图口径已收口为：
+    - 以 `last_scan_at` 对应的 stable segment snapshot 为准
+    - 不直接拿“当前文件系统最新 tail”做分母
+    - recent tail 持续增长时，进度仍按上一轮 snapshot 稳定展示
+  - 已补自动化回归：
+    - `fb_summary_service`
+  - 已补服务级恢复：
+    - worker 重启后遗留的 stale `RUNNING` task 会回收为 `PENDING`
+    - 进度视图不再把 stale task 误算成活跃运行中
+
+- 已拍板重做 summary 进度用户视图：
+  - 旧 `fb_summary_progress` 语义对用户不直观
+  - 当前已改为：
+    - 用户主视图 `pg_flashback_summary_progress`
+    - 调试视图 `pg_flashback_summary_service_debug`
+  - 用户主口径当前直接表达：
+    - stable 时间窗
+    - 近端连续覆盖前沿
+    - 远端连续覆盖前沿
+    - 从新端/旧端观察到的第一个 gap
+  - launcher / worker / queue / cleanup 等内部字段已迁到 `pg_flashback_summary_service_debug`
+  - 新的用户可见 summary 观测面当前统一使用 `pg_flashback_` 前缀，不再新增 `fb_*` 用户对象
+  - 当前专项验证结果：
+    - `PGPORT=5832 PGUSER=18pg make ... installcheck REGRESS='fb_summary_service fb_summary_v3 fb_wal_sidecar'`
+    - `All 3 tests passed.`
+  - 决策记录：
+    - `docs/decisions/ADR-0022-summary-progress-surface-redesign.md`
+
+- 已完成 summary v3 紧凑 segment 索引第一版落地：
+  - `summary-*.meta` 已升级为 versioned 多 section 格式
+  - 在原有 bloom gate 之上新增：
+    - relation dictionary
+    - relation spans
+    - xid outcomes
+  - 查询侧当前口径：
+    - metadata / anchor 仍走 prefilter window，保持 checkpoint / unsafe 语义不丢
+    - payload materialize 已改为“summary spans 优先，缺失 segment 回退 coarse window”
+    - xid status 补齐已改为“summary outcome 优先，WAL 回扫兜底”
+    - unsafe-only xid（如 truncate / rewrite / storage change）已纳入 summary outcome / fallback 统一补齐
+  - 当前已补自动化回归：
+    - `fb_summary_v3`
+    - `fb_recordref`
+    - `fb_wal_sidecar`
+    - `fb_wal_parallel_payload`
+    - 联合 `fb_runtime_cleanup` / `fb_runtime_gate` / `fb_spill`
+  - 当前专项验证结果：
+    - `PGPORT=5832 PGUSER=18pg make ... installcheck REGRESS='fb_summary_v3 fb_recordref fb_wal_sidecar fb_wal_parallel_payload fb_runtime_cleanup fb_runtime_gate fb_spill'`
+    - `All 7 tests passed.`
+
+- 已拍板启动 `3/9 build record index` 的 summary-first 第二阶段收敛：
+  - 当前 live case 复盘已确认：
+    - summary 预建覆盖本身已完整，不是“没建 summary”
+    - 当前 `3/9` 的主要剩余热点之一是 `summary xid outcome` 回填仍按 `resolved_segment_count` 全段顺序打开并读取 `summary-*.meta`
+    - metadata 主循环当前仍以 WAL 顺序扫描为主，summary 只承担 prefilter/span 缩窗，不足以把 `3/9` 真正打下来
+  - 本轮已拍板的新口径：
+    - 查询侧把 summary 从“辅助过滤”升级为 `3/9` 的主索引
+    - `xid fill` 只允许读取命中 window 覆盖到的 summary segment，不再按全量 resolved segment 扫描
+    - 查询期新增 backend-local summary section cache，避免同一查询内反复 `open/read/close` 相同 summary 文件
+    - 在保持 `meta/summary` 低存储原则下，新增 relation-scoped `touched xids` 与紧凑 `unsafe facts` section
+    - metadata 主路径改为：
+      - summary-first 先收敛 `touched xids` / `unsafe facts`
+      - xid status 继续优先吃 summary outcomes
+      - 仅在 summary 缺失、损坏或覆盖不足的 window 上回退 WAL 扫描
+      - 原有 metadata/xact WAL 路径继续保留，承接 meta 未及时生成场景
+    - checkpoint / anchor 继续复用现有 checkpoint sidecar，不并入 summary
+  - 本轮验证要求固定为：
+    - 修改后必须手动删除现有 `DataDir/pg_flashback/meta/summary`
+    - 重新预建 summary
+    - 再复跑回归与 live 调试 case，确认不是吃旧 meta 假收益
+  - 决策记录：
+    - `docs/decisions/ADR-0023-summary-first-record-index.md`
+
 ## 当前进行中
 
 - summary 预建服务第一版已落地：
@@ -192,6 +396,27 @@
     - 优先读取 `meta/summary`
     - 缺失时回退旧 `mmap + memmem`
     - 不再持续写入 relation-pattern 级 `prefilter-*.meta`
+
+- `3/9 build record index` 当前主线收敛中：
+  - 第一优先级不再是 metadata 并行 fanout
+  - 当前改为先把 summary-first 主索引打完整：
+    - 压掉全量 summary xid scan
+    - 压掉 metadata 串行 WAL 主循环中的可由 summary 直接回答的工作
+    - 同时保持 `meta/summary` 继续走紧凑低存储口径，并保留原有 WAL fallback
+
+- runtime 自动清理口径已重新拍板：
+  - 恢复“查询结束触发的 runtime 安全 sweep”
+  - 只清理 `DataDir/pg_flashback/runtime`
+  - 不恢复 `runtime_retention` 一类保留期 GUC
+  - 不恢复 `recovered_wal/meta` 的通用 cleanup
+  - 目录扫描时仅删除 owner backend 已失活的：
+    - `fbspill-<pid>-<serial>/`
+    - `toast-retired-<pid>-<serial>.bin`
+  - 当前实现已完成：
+    - 本查询自己的 `fbspill-*` 会在 `FbSpoolSession` destroy 时直接删目录
+    - 本查询自己的 `toast-retired-*` 会在 toast spill release 时直接删文件
+    - 查询结束时会再扫一轮整个 `runtime/`，清理 dead owner 残留
+  - `fb_runtime_cleanup` / `fb_spill` / `fb_runtime_gate` 回归已通过
   - 已新增 segment 通用 summary：
     - `locator_bloom + reltag_bloom`
     - 文件落在 `DataDir/pg_flashback/meta/summary`
@@ -212,6 +437,11 @@
   - 当前并发预算已收口：
     - summary worker 默认值改为 `2`
     - 注册时会按 `max_worker_processes` 自动预留查询 worker 槽位，避免挤占 WAL payload 动态 bgworker
+  - 当前服务调度与可观测面：
+    - launcher 默认按“最近时间 -> 更早时间”推进 summary 预建
+    - shared queue 已显式区分 hot / cold 两类任务
+    - 用户主视图已重做为 `pg_flashback_summary_progress`
+    - 服务调试视图已拆分为 `pg_flashback_summary_service_debug`
   - 决策记录：
     - `docs/decisions/ADR-0019-summary-prebuild-service.md`
 
@@ -236,15 +466,16 @@
 
 ## 下一步
 
-- 为 summary 服务补专门的 SQL/debug 可观测面与自动化回归：
-  - queue 状态
-  - launcher 扫描结果
-  - cleanup 触发/停点
-- 继续把 summary 服务的优先级与 recent-tail 调度策略做细：
-  - 更明确区分热前沿和冷回填预算
-  - 必要时补路径级排除 / recent tail 保护
+- 继续补 summary 服务的细节验证与策略收敛：
+  - cleanup 与 queue/progress 的专项回归是否再细分
 - 回到主线性能目标：
-  - 继续压 `3/9` 后半段 payload/materialize
+  - 优先完成 `3/9` summary-first 第二阶段：
+    - window-scoped xid outcome reduce
+    - query-local summary section cache
+    - 紧凑 unsafe facts section
+    - metadata summary-first + uncovered-window WAL fallback
+  - 完成后清空并重建 `meta/summary`，复跑 live case 与回归
+  - 再继续压 `3/9` 后半段 payload/materialize
   - 继续推进 metadata 并行第二版实现
     - leader 共享 resolved segment snapshot，去掉 worker 侧重复 resolver/prepare
     - worker 本地 spool，leader 按 window/LSN 顺序 merge

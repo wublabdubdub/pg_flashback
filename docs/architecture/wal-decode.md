@@ -176,8 +176,11 @@ WAL 层当前只做三件大事：
 当前正式主路径已拆成两段：
 
 - metadata phase
-  - Phase A 可以按 window 并行，只收集 checkpoint / touched_xids / unsafe
-  - Phase B 固定由 leader 串行只扫 `RM_XACT_ID`，回填 `xid_statuses`
+  - 当前方向已改为 summary-first：
+    - 优先从 summary relation spans / touched xids / xid outcomes / unsafe facts 收敛 touched / xid / unsafe
+    - 仅对 summary 缺失、损坏或覆盖不足的 uncovered window 回退 WAL 扫描
+    - 原有 metadata/xact WAL 路径继续保留，承接 meta 未及时生成场景
+  - checkpoint / anchor 继续复用独立 checkpoint sidecar
 - payload phase
   - 在 anchor 已确定后，再按 payload window 物化 `RecordRef`
 

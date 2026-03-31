@@ -34,6 +34,7 @@
 #include "fb_progress.h"
 #include "fb_replay.h"
 #include "fb_reverse_ops.h"
+#include "fb_runtime.h"
 #include "fb_wal.h"
 
 /*
@@ -554,6 +555,8 @@ fb_flashback_release_reverse_state(FbFlashbackReverseBuildState *state)
 		fb_spool_session_destroy(state->spool);
 		state->spool = NULL;
 	}
+
+	fb_runtime_cleanup_stale();
 }
 
 static void
@@ -602,6 +605,8 @@ fb_flashback_query_release(FbFlashbackQueryState *state)
 		fb_spool_session_destroy(state->spool);
 		state->spool = NULL;
 	}
+
+	fb_runtime_cleanup_stale();
 }
 
 /*
@@ -825,7 +830,7 @@ fb_recordref_debug(PG_FUNCTION_ARGS)
 
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
-						 "anchor=%s unsafe=%s reason=%s meta_refs=%llu payload_refs=%u kept=%llu target_dml=%llu commits=%llu aborts=%llu tail_inline=%s head_gap_refs=%u tail_refs=%u parallel=%s prefilter=%s visited_segments=%u/%u payload_windows=%u payload_parallel_workers=%u",
+						 "anchor=%s unsafe=%s reason=%s meta_refs=%llu payload_refs=%u kept=%llu target_dml=%llu commits=%llu aborts=%llu tail_inline=%s head_gap_refs=%u tail_refs=%u parallel=%s prefilter=%s visited_segments=%u/%u payload_windows=%u payload_parallel_workers=%u summary_span_windows=%u summary_xid_hits=%u summary_xid_fallback=%u summary_xid_segments_read=%u summary_unsafe_hits=%u metadata_fallback_windows=%u",
 						 index.anchor_found ? "true" : "false",
 						 index.unsafe ? "true" : "false",
 						 fb_wal_unsafe_reason_name(index.unsafe_reason),
@@ -843,16 +848,24 @@ fb_recordref_debug(PG_FUNCTION_ARGS)
 						 scan_ctx.visited_segment_count,
 						 scan_ctx.progress_segment_total,
 						 index.payload_window_count,
-						 index.payload_parallel_workers);
+						 index.payload_parallel_workers,
+						 scan_ctx.summary_span_windows,
+						 scan_ctx.summary_xid_hits,
+						 scan_ctx.summary_xid_fallback,
+						 scan_ctx.summary_xid_segments_read,
+						 scan_ctx.summary_unsafe_hits,
+						 scan_ctx.metadata_fallback_windows);
 
 		fb_spool_session_destroy(spool);
 		spool = NULL;
+		fb_runtime_cleanup_stale();
 		PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 	}
 	PG_CATCH();
 	{
 		if (spool != NULL)
 			fb_spool_session_destroy(spool);
+		fb_runtime_cleanup_stale();
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -1293,6 +1306,7 @@ fb_export_undo(PG_FUNCTION_ARGS)
 				 errmsg("fb does not support WAL windows containing %s operations",
 						fb_wal_unsafe_reason_name(index.unsafe_reason))));
 	fb_spool_session_destroy(spool);
+	fb_runtime_cleanup_stale();
 	fb_raise_not_implemented("fb_export_undo page replay + reverse op stream");
 	PG_RETURN_NULL();
 }

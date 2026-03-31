@@ -1,0 +1,119 @@
+DO $$
+BEGIN
+	IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_flashback') THEN
+		EXECUTE 'DROP EXTENSION pg_flashback CASCADE';
+	END IF;
+END;
+$$;
+CREATE EXTENSION pg_flashback;
+SET pg_flashback.show_progress = off;
+
+DO $$
+BEGIN
+	IF to_regprocedure('fb_prepare_wal_scan_debug(timestamptz)') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_prepare_wal_scan_debug(timestamptz)';
+	END IF;
+END;
+$$;
+
+CREATE FUNCTION fb_prepare_wal_scan_debug(timestamptz)
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_prepare_wal_scan_debug'
+LANGUAGE C
+STRICT;
+
+CREATE TEMP TABLE fb_wal_prefix_suffix_fixture (
+	seg_name text NOT NULL,
+	segno bigint NOT NULL
+);
+
+DO $$
+DECLARE
+	data_dir text := current_setting('data_directory');
+	archive_dir text := '/tmp/fb_wal_prefix_suffix_archive';
+	pgwal_dir text := '/tmp/fb_wal_prefix_suffix_pgwal';
+	rec record;
+BEGIN
+	PERFORM pg_switch_wal();
+	PERFORM pg_switch_wal();
+	PERFORM pg_switch_wal();
+	PERFORM pg_switch_wal();
+
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'rm -rf ' || archive_dir || ' ' || pgwal_dir ||
+		' && mkdir -p ' || archive_dir || ' ' || pgwal_dir ||
+		' && rm -f ' || data_dir || '/pg_flashback/recovered_wal/*');
+
+	INSERT INTO fb_wal_prefix_suffix_fixture(seg_name, segno)
+	WITH wal AS (
+		SELECT name,
+			   (('x' || substr(name, 9, 8))::bit(32)::bigint *
+				(4294967296::bigint / pg_size_bytes(current_setting('wal_segment_size'))) +
+				('x' || substr(name, 17, 8))::bit(32)::bigint) AS segno,
+			   lead(
+				   (('x' || substr(name, 9, 8))::bit(32)::bigint *
+					(4294967296::bigint / pg_size_bytes(current_setting('wal_segment_size'))) +
+					('x' || substr(name, 17, 8))::bit(32)::bigint),
+				   1
+			   ) OVER (ORDER BY name) AS next_segno_1,
+			   lead(
+				   (('x' || substr(name, 9, 8))::bit(32)::bigint *
+					(4294967296::bigint / pg_size_bytes(current_setting('wal_segment_size'))) +
+					('x' || substr(name, 17, 8))::bit(32)::bigint),
+				   2
+			   ) OVER (ORDER BY name) AS next_segno_2,
+			   lead(
+				   (('x' || substr(name, 9, 8))::bit(32)::bigint *
+					(4294967296::bigint / pg_size_bytes(current_setting('wal_segment_size'))) +
+					('x' || substr(name, 17, 8))::bit(32)::bigint),
+				   3
+			   ) OVER (ORDER BY name) AS next_segno_3
+		FROM pg_ls_dir(data_dir || '/pg_wal') AS d(name)
+		WHERE d.name ~ '^[0-9A-F]{24}$'
+	),
+	pick AS (
+		SELECT segno AS start_segno
+		FROM wal
+		WHERE next_segno_1 = segno + 1
+		  AND next_segno_2 = segno + 2
+		  AND next_segno_3 = segno + 3
+		ORDER BY segno DESC
+		LIMIT 1
+	)
+	SELECT wal.name, wal.segno
+	FROM wal, pick
+	WHERE wal.segno IN (pick.start_segno, pick.start_segno + 2, pick.start_segno + 3)
+	ORDER BY wal.segno;
+
+	IF (SELECT count(*) FROM fb_wal_prefix_suffix_fixture) <> 3 THEN
+		RAISE EXCEPTION 'failed to prepare prefix/suffix WAL fixture';
+	END IF;
+
+	FOR rec IN
+		SELECT seg_name
+		FROM fb_wal_prefix_suffix_fixture
+		ORDER BY segno
+	LOOP
+		EXECUTE format(
+			'COPY (SELECT '''') TO PROGRAM %L',
+			'cp ' || quote_literal(data_dir || '/pg_wal/' || rec.seg_name) || ' ' ||
+			quote_literal(archive_dir || '/' || rec.seg_name));
+	END LOOP;
+END;
+$$;
+
+SET pg_flashback.archive_dest = '/tmp/fb_wal_prefix_suffix_archive';
+SET pg_flashback.debug_pg_wal_dir = '/tmp/fb_wal_prefix_suffix_pgwal';
+
+SELECT count(*) = 3 AS prepared_fixture
+FROM fb_wal_prefix_suffix_fixture;
+
+SELECT fb_prepare_wal_scan_debug(clock_timestamp()) =
+	   format(
+		   'timeline=1 first=%s last=%s total=2 archive=3 pg_wal=0 ckwal=0',
+		   (SELECT seg_name FROM fb_wal_prefix_suffix_fixture ORDER BY segno OFFSET 1 LIMIT 1),
+		   (SELECT seg_name FROM fb_wal_prefix_suffix_fixture ORDER BY segno OFFSET 2 LIMIT 1)
+	   ) AS drops_prefix_gap_and_keeps_newest_suffix;
+
+DROP FUNCTION fb_prepare_wal_scan_debug(timestamptz);

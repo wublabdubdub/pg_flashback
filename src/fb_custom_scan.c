@@ -45,6 +45,7 @@
 #include "fb_progress.h"
 #include "fb_replay.h"
 #include "fb_reverse_ops.h"
+#include "fb_runtime.h"
 #include "fb_spool.h"
 
 typedef enum FbCustomNodeKind
@@ -2083,6 +2084,8 @@ fb_flashback_end_custom_scan(CustomScanState *node)
 	}
 
 	fb_flashback_cleanup_state(state);
+	if (state->kind == FB_CUSTOM_NODE_APPLY)
+		fb_runtime_cleanup_stale();
 
 	while (node->custom_ps != NIL)
 	{
