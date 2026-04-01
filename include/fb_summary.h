@@ -57,6 +57,15 @@ typedef struct FbSummaryUnsafeFact
 	Oid rel_oid;
 } FbSummaryUnsafeFact;
 
+typedef struct FbSummaryBlockAnchor
+{
+	RelFileLocator locator;
+	ForkNumber forknum;
+	BlockNumber blkno;
+	XLogRecPtr anchor_lsn;
+	uint16 flags;
+} FbSummaryBlockAnchor;
+
 FbSummaryQueryCache *fb_summary_query_cache_create(MemoryContext mcxt);
 bool fb_summary_segment_lookup_spans_cached(const char *path,
 											off_t bytes,
@@ -97,6 +106,16 @@ bool fb_summary_segment_lookup_unsafe_facts_cached(const char *path,
 												   FbSummaryQueryCache *cache,
 												   FbSummaryUnsafeFact **facts_out,
 												   uint32 *fact_count_out);
+bool fb_summary_segment_lookup_block_anchors_cached(const char *path,
+													off_t bytes,
+													TimeLineID timeline_id,
+													XLogSegNo segno,
+													int wal_seg_size,
+													int source_kind,
+													const FbRelationInfo *info,
+													FbSummaryQueryCache *cache,
+													FbSummaryBlockAnchor **anchors_out,
+													uint32 *anchor_count_out);
 
 bool fb_summary_segment_matches(const char *path,
 								off_t bytes,

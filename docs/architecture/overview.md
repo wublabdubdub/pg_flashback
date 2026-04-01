@@ -171,6 +171,9 @@ Custom Scan (FbApplyScan)
 - 在 `meta/summary` 中读写 summary
 - 提供 locator / relid bloom probe
 - 提供 relation spans / xid outcomes / relation-scoped touched xids / 紧凑 unsafe facts 的读取接口
+- 正在扩展为提供 relation-scoped block anchor facts：
+  - 每段内按 relation / block 记录可用 `FPI/INIT_PAGE` 锚点
+  - 先服务 `replay discover/warm` 的 missing-block anchor 解析
 - 提供查询期 backend-local summary section cache，避免同一查询重复读取相同 summary 文件
 - 供 query prefilter 和后台预建服务共用
 
@@ -192,6 +195,7 @@ Custom Scan (FbApplyScan)
 - 提供 summary 预建进度的 SQL 可观测面：
   - 用户主视图为 `pg_flashback_summary_progress`
   - 服务内部调试视图为 `pg_flashback_summary_service_debug`
+  - 并维护最近一次 flashback 查询的 summary 降级观测，区分“summary 文件都在”和“最近查询没有回退到原始 WAL 扫描”
 
 ### `fb_progress`
 
@@ -276,7 +280,7 @@ Custom Scan (FbApplyScan)
 
 职责：
 
-- 当 archive 与 `pg_wal` 都无法直接提供可信 segment 时，尝试从可见目录中复制/纠正 WAL 段
+- 当 archive 无法直接提供可信 segment 时，尝试从 `pg_wal` 错配段恢复 WAL
 - 将恢复结果统一落到 `recovered_wal`
 - 支持并发 worker 共享 `recovered_wal` 缓存，不因同一 segment 的同时恢复而互相撞文件
 - 让 resolver 在同一轮中继续消费恢复后的段
@@ -285,6 +289,8 @@ Custom Scan (FbApplyScan)
 
 - 若 archive 已经有 mismatch `pg_wal` 文件头所对应的真实 segment，则 resolver 不应提前把该 mismatch 文件 materialize 到 `recovered_wal`
 - 这类“错名但已被 archive 覆盖”的 `pg_wal` candidate 会被直接忽略，不再制造额外 `recovered_wal` 垃圾
+- archive exact-hit 不再通过 `fb_ckwal` 复制到 `recovered_wal`
+- `recovered_wal` 仅承载已恢复缓存与“archive 缺失/未开时，由错配 `pg_wal` 修复出的真实 segment”
 
 ### `fb_replay`
 

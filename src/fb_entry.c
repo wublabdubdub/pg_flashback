@@ -72,7 +72,9 @@ PG_FUNCTION_INFO_V1(fb_archive_resolve_debug);
 PG_FUNCTION_INFO_V1(fb_apply_debug);
 PG_FUNCTION_INFO_V1(fb_keyed_key_debug);
 PG_FUNCTION_INFO_V1(fb_prepare_wal_scan_debug);
+PG_FUNCTION_INFO_V1(fb_replay_debug);
 PG_FUNCTION_INFO_V1(fb_recordref_debug);
+PG_FUNCTION_INFO_V1(fb_recordref_missing_spool_debug);
 PG_FUNCTION_INFO_V1(fb_progress_debug_set_clock);
 PG_FUNCTION_INFO_V1(fb_progress_debug_reset_clock);
 PG_FUNCTION_INFO_V1(fb_srf_mode_debug);
@@ -830,7 +832,7 @@ fb_recordref_debug(PG_FUNCTION_ARGS)
 
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
-						 "anchor=%s unsafe=%s reason=%s meta_refs=%llu payload_refs=%u kept=%llu target_dml=%llu commits=%llu aborts=%llu tail_inline=%s head_gap_refs=%u tail_refs=%u parallel=%s prefilter=%s visited_segments=%u/%u payload_windows=%u payload_parallel_workers=%u summary_span_windows=%u summary_xid_hits=%u summary_xid_fallback=%u summary_xid_segments_read=%u summary_unsafe_hits=%u metadata_fallback_windows=%u",
+						 "anchor=%s unsafe=%s reason=%s meta_refs=%llu payload_refs=%u kept=%llu target_dml=%llu commits=%llu aborts=%llu tail_inline=%s head_gap_refs=%u tail_refs=%u parallel=%s prefilter=%s visited_segments=%u/%u payload_windows=%u payload_scan_mode=%s payload_parallel_workers=%u payload_covered_segments=%u payload_scanned_records=%llu payload_kept_records=%llu payload_sparse_reader_resets=%llu payload_sparse_reader_reuses=%llu summary_span_windows=%u summary_xid_hits=%u summary_xid_fallback=%u summary_xid_segments_read=%u summary_unsafe_hits=%u metadata_fallback_windows=%u",
 						 index.anchor_found ? "true" : "false",
 						 index.unsafe ? "true" : "false",
 						 fb_wal_unsafe_reason_name(index.unsafe_reason),
@@ -848,13 +850,91 @@ fb_recordref_debug(PG_FUNCTION_ARGS)
 						 scan_ctx.visited_segment_count,
 						 scan_ctx.progress_segment_total,
 						 index.payload_window_count,
+						 fb_wal_payload_scan_mode_name(index.payload_scan_mode),
 						 index.payload_parallel_workers,
+						 index.payload_covered_segment_count,
+						 (unsigned long long) index.payload_scanned_record_count,
+						 (unsigned long long) index.payload_kept_record_count,
+						 (unsigned long long) index.payload_sparse_reader_resets,
+						 (unsigned long long) index.payload_sparse_reader_reuses,
 						 scan_ctx.summary_span_windows,
 						 scan_ctx.summary_xid_hits,
 						 scan_ctx.summary_xid_fallback,
 						 scan_ctx.summary_xid_segments_read,
 						 scan_ctx.summary_unsafe_hits,
 						 scan_ctx.metadata_fallback_windows);
+
+		fb_spool_session_destroy(spool);
+		spool = NULL;
+		fb_runtime_cleanup_stale();
+		PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+	}
+	PG_CATCH();
+	{
+		if (spool != NULL)
+			fb_spool_session_destroy(spool);
+		fb_runtime_cleanup_stale();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+Datum
+fb_recordref_missing_spool_debug(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	FbRelationInfo info;
+	FbWalScanContext scan_ctx;
+	FbWalRecordIndex index;
+
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+	fb_catalog_load_relation_info(relid, &info);
+	fb_wal_prepare_scan_context(target_ts, NULL, &scan_ctx);
+	fb_wal_build_record_index(&info, &scan_ctx, &index);
+
+	PG_RETURN_TEXT_P(cstring_to_text("unexpected success"));
+}
+
+Datum
+fb_replay_debug(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	FbRelationInfo info;
+	FbWalScanContext scan_ctx;
+	FbWalRecordIndex index;
+	FbReplayResult replay_result;
+	FbSpoolSession *spool = NULL;
+	StringInfoData buf;
+
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+	fb_catalog_load_relation_info(relid, &info);
+
+	PG_TRY();
+	{
+		spool = fb_spool_session_create();
+		fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
+		fb_wal_build_record_index(&info, &scan_ctx, &index);
+		fb_replay_execute(&info, &index, &replay_result);
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "records=%llu blocks=%llu errors=%llu precomputed_missing_blocks=%u discover_rounds=%u discover_skipped=%u summary_anchor_hits=%u summary_anchor_fallback=%u summary_anchor_segments_read=%u target_insert=%llu target_delete=%llu target_update=%llu",
+						 (unsigned long long) replay_result.records_replayed,
+						 (unsigned long long) replay_result.blocks_materialized,
+						 (unsigned long long) replay_result.replay_errors,
+						 replay_result.precomputed_missing_blocks,
+						 replay_result.discover_rounds,
+						 replay_result.discover_skipped,
+						 replay_result.summary_anchor_hits,
+						 replay_result.summary_anchor_fallback,
+						 replay_result.summary_anchor_segments_read,
+						 (unsigned long long) replay_result.target_insert_count,
+						 (unsigned long long) replay_result.target_delete_count,
+						 (unsigned long long) replay_result.target_update_count);
 
 		fb_spool_session_destroy(spool);
 		spool = NULL;

@@ -41,6 +41,18 @@ static bool fb_ckwal_find_segment_in_directory(const char *directory,
 											   char *candidate_path,
 											   Size candidate_path_len);
 /*
+ * fb_ckwal_find_mismatched_segment_in_directory
+ *    ckwal helper.
+ */
+
+static bool fb_ckwal_find_mismatched_segment_in_directory(const char *directory,
+														  const char *expected_fname,
+														  TimeLineID timeline_id,
+														  XLogSegNo segno,
+														  int wal_seg_size,
+														  char *candidate_path,
+														  Size candidate_path_len);
+/*
  * fb_ckwal_copy_file
  *    ckwal helper.
  */
@@ -126,6 +138,59 @@ fb_ckwal_find_segment_in_directory(const char *directory,
 		XLogSegNo file_segno;
 
 		if (!IsXLogFileName(de->d_name))
+			continue;
+
+		snprintf(path, sizeof(path), "%s/%s", directory, de->d_name);
+		if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+			continue;
+
+		if (!fb_ckwal_read_segment_header(path, &file_tli, &file_segno,
+										  wal_seg_size))
+			continue;
+
+		if (file_tli != timeline_id || file_segno != segno)
+			continue;
+
+		strlcpy(candidate_path, path, candidate_path_len);
+		FreeDir(dir);
+		return true;
+	}
+
+	FreeDir(dir);
+	return false;
+}
+
+/*
+ * fb_ckwal_find_mismatched_segment_in_directory
+ *    ckwal helper.
+ */
+
+static bool
+fb_ckwal_find_mismatched_segment_in_directory(const char *directory,
+											  const char *expected_fname,
+											  TimeLineID timeline_id,
+											  XLogSegNo segno,
+											  int wal_seg_size,
+											  char *candidate_path,
+											  Size candidate_path_len)
+{
+	DIR *dir;
+	struct dirent *de;
+
+	dir = AllocateDir(directory);
+	if (dir == NULL)
+		return false;
+
+	while ((de = ReadDir(dir, directory)) != NULL)
+	{
+		char path[MAXPGPATH];
+		struct stat st;
+		TimeLineID file_tli;
+		XLogSegNo file_segno;
+
+		if (!IsXLogFileName(de->d_name))
+			continue;
+		if (expected_fname != NULL && strcmp(de->d_name, expected_fname) == 0)
 			continue;
 
 		snprintf(path, sizeof(path), "%s/%s", directory, de->d_name);
@@ -250,11 +315,8 @@ fb_ckwal_restore_segment(TimeLineID timeline_id,
 	char *restore_dir;
 	char *archive_dir = NULL;
 	char *pg_wal_dir = NULL;
-	char *recovered_search_dir = NULL;
 	char fname[MAXPGPATH];
 	char candidate[MAXPGPATH];
-	const char *search_dirs[3];
-	int i;
 	struct stat st;
 
 	fb_runtime_ensure_initialized();
@@ -268,52 +330,38 @@ fb_ckwal_restore_segment(TimeLineID timeline_id,
 
 	archive_dir = fb_get_effective_archive_dir();
 	pg_wal_dir = fb_get_pg_wal_dir();
-	recovered_search_dir = fb_runtime_recovered_wal_dir();
 
-	search_dirs[0] = archive_dir;
-	search_dirs[1] = pg_wal_dir;
-	search_dirs[2] = recovered_search_dir;
+	/*
+	 * recovered_wal is no longer an archive copy/cache sink. Only use it for
+	 * already materialized real-name files, and only recover from mismatched
+	 * pg_wal when archive cannot satisfy the requested segment.
+	 */
+	if (archive_dir != NULL && archive_dir[0] != '\0' &&
+		fb_ckwal_find_segment_in_directory(archive_dir, timeline_id, segno,
+										   wal_seg_size, candidate,
+										   sizeof(candidate)))
+		goto fail;
 
-	for (i = 0; i < lengthof(search_dirs); i++)
-	{
-		const char *dirpath = search_dirs[i];
-		char exact_path[MAXPGPATH];
-		TimeLineID file_tli;
-		XLogSegNo file_segno;
+	if (pg_wal_dir != NULL && pg_wal_dir[0] != '\0' &&
+		fb_ckwal_find_mismatched_segment_in_directory(pg_wal_dir, fname,
+													  timeline_id, segno,
+													  wal_seg_size, candidate,
+													  sizeof(candidate)) &&
+		fb_ckwal_copy_file(candidate, out_path))
+		goto success;
 
-		if (dirpath == NULL || dirpath[0] == '\0')
-			continue;
-
-		snprintf(exact_path, sizeof(exact_path), "%s/%s", dirpath, fname);
-		if (fb_ckwal_read_segment_header(exact_path, &file_tli, &file_segno,
-										 wal_seg_size) &&
-			file_tli == timeline_id &&
-			file_segno == segno &&
-			fb_ckwal_copy_file(exact_path, out_path))
-			goto success;
-
-		if (fb_ckwal_find_segment_in_directory(dirpath, timeline_id, segno,
-											   wal_seg_size, candidate,
-											   sizeof(candidate)) &&
-			fb_ckwal_copy_file(candidate, out_path))
-			goto success;
-	}
-
+fail:
 	if (archive_dir != NULL)
 		pfree(archive_dir);
 	if (pg_wal_dir != NULL)
 		pfree(pg_wal_dir);
-	if (recovered_search_dir != NULL)
-		pfree(recovered_search_dir);
 	return false;
 
-	success:
+success:
 	if (archive_dir != NULL)
 		pfree(archive_dir);
 	if (pg_wal_dir != NULL)
 		pfree(pg_wal_dir);
-	if (recovered_search_dir != NULL)
-		pfree(recovered_search_dir);
 	return true;
 }
 

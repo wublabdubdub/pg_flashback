@@ -98,6 +98,9 @@
   - [x] 让 `first_gap_from_newest_*` / `first_gap_from_oldest_*` 能指向真实 WAL 缺口
   - [x] 让 `progress_pct` 对归档删洞后的场景不再虚高
   - [x] 补回归覆盖“删掉 archive 中间段后 progress 先缩 frontiers”的场景
+  - [x] 增加“最近一次查询是否发生 summary 降级”口径
+  - [x] 在用户视图暴露最近查询的 ready/fallback 状态与时间戳
+  - [x] 补回归覆盖“删空 `meta/summary` 后查询回退、重建后恢复 ready”的场景
 
 ### Summary v3 紧凑 segment 索引
 
@@ -108,6 +111,17 @@
 - [x] 查询侧命中 segment 后改为 span-driven WAL decode，不再默认整段顺序遍历
 - [x] xid status 回填改为“summary outcome 优先，WAL 回扫兜底”
 - [x] 补齐 sidecar 缺失 / 损坏 / 覆盖不足时的安全回退回归
+- [x] `block-anchor summary v1`
+  - [x] 在 `summary-*.meta` 中新增 relation-scoped block anchor section
+  - [x] 查询侧优先使用 block anchor summary 解析 missing-block 的最近可用锚点
+  - [x] replay backtrack gate 从 `record_index` 收敛到 `anchor_lsn`
+  - [x] 保持现有 relation/xid summary 与 WAL fallback 语义
+  - [x] 补专项回归与 debug 口径
+- [x] `replay discover` 静态 missing-block 预计算
+  - [x] 利用 `RecordRef` 顺序静态模拟 block initialized/no-op/missing 状态
+  - [x] `missing-block=0` 时跳过整轮 discover/warm
+  - [x] 仅对真正缺页基线的 block 再走 anchor resolve + warm
+  - [x] 补 debug/回归，并用 live case 复核 `4/9` / `5/9` 阶段收益
 
 ### P3 / P4 补齐
 
@@ -157,6 +171,11 @@
   - 保留目录创建与产物写入，不再对现有文件做保洁
 - [x] 修复“archive 已有真实 segment 时，recycled / mismatched pg_wal 仍被提前 convert 并白白写入 recovered_wal”的 resolver 问题
   - 新增回归 `fb_recovered_wal_policy`
+- [x] 继续收紧 `recovered_wal` 语义：
+  - 删除 “archive exact-hit 复制到 recovered_wal” 路径
+  - 只允许 `pg_wal` 被覆盖/错配且 archive 不可用时 materialize 到 `recovered_wal`
+  - 回归覆盖 archive-hit 不落盘、archive-missing mismatch 才落盘
+  - 已验证 `fb_recovered_wal_policy`、`fb_wal_source_policy`、`fb_wal_prefix_suffix`、`fb_wal_error_surface`
 
 ### P5.6 内存与效率
 
@@ -181,7 +200,41 @@
   - 两侧 bound 的开闭区间组合
   - 与 `ORDER BY key` / `LIMIT` 的可安全组合
 - [x] 去掉 `FbApplyScan` 末尾 `ExecCopySlot/tts_virtual_materialize` 输出拷贝链
-- [ ] `3/9` 架构收敛 follow-up：
+  - [ ] `3/9` 架构收敛 follow-up：
+  - [x] 将 `3/9 build record index` 的 `NOTICE` 细分为固定子相位：
+    - `prefilter`
+    - `summary-span`
+    - `metadata`
+    - `xact-status`
+    - `payload`
+  - [x] 为 `fb_recordref_debug()` 补 payload work counter：
+    - payload windows
+    - payload covered segments
+    - payload scanned/decoded records
+    - payload kept/materialized records
+  - [x] 在保持 `9` 段进度不变的前提下，消除“`3/9 100%` 后仍长时间空白”的误导性观测
+  - [x] 先做一轮保守版 payload window narrowing：
+    - 仅合并同一 covered segment slice 内的碎片窗口
+    - 不跨 segment 扩窗
+    - live case 已验证 `3/9 payload` 从约 `97s` 降到约 `16s`
+  - [ ] 继续收窄 build-index 尾段 payload work，减少对 replay/final 无贡献的 decode/materialize
+    - [x] 将 payload 改成 `summary-span` 驱动的 sparse candidate-stream 读路径
+      - 当前稳定口径是“merge-normalized sparse spans”，不是直接吃 raw spans
+      - 已补 `payload_scan_mode` debug 观测
+      - live case 已验证 `payload_scanned_records` 从约 `1960万` 降到约 `180万`
+    - [ ] 缺 summary 的 segment 保持现有 fallback 全扫
+    - [x] 为新 payload 读路径补 debug 可观测，避免后续回退到粗窗口顺扫时无从察觉
+    - [ ] 继续压 sparse payload 的 seek 开销：
+      - 当前 live 仍有 `payload_windows=259685`
+      - 下一个收益点不再是 decode 量，而是 candidate window 数与跳读成本
+      - [ ] 先做一轮不改 payload 语义的 reader-reuse 收口：
+        - 同一 sparse segment slice 内避免逐 window 重置 reader
+        - 尽量复用 open file / reader 状态
+        - 补可观测 debug，确认优化后不是黑盒
+    - [ ] 用 `scenario_oa_12t_50000r.documents @ '2026-04-01 01:40:13'` 持续复测，直到 `3/9` 不再是主要慢点
+    - [ ] 在 sparse payload 冷态优化完成后，复现并修复：
+      - `scenario_oa_12t_50000r.documents @ '2026-04-01 23:15:13'`
+      - `ERROR: missing FPI for block 216136`
   - [ ] 将 `xid fill` 改成只读取命中 query window 的 summary segment，不再按 `resolved_segment_count` 全量扫 `summary-*.meta`
   - [ ] 为查询期 summary section 增加 backend-local cache，去掉同一查询内的重复 `open/read/close`
   - [ ] 增加 relation-scoped `touched xids` section，让 metadata 主链不再为 xid 收集回扫整段 WAL
@@ -189,6 +242,7 @@
   - [ ] 将 metadata 主链改成 summary-first，仅对 uncovered window 回退 WAL 扫描
   - [ ] 保留原有 metadata/xact WAL 路径，确保 meta 未及时生成时仍可正确回退
   - [ ] 删除现有 `meta/summary` 并重建后，复跑回归与 live case 验证真实收益
+  - [ ] 在 block-anchor summary v1 稳定后，再评估是否继续扩展到 block span-driven replay 窄化
   - [ ] 继续减少进入 `XLogDecodeNextRecord` 但最终无 payload 的 record work
   - [ ] 继续合并 touched-xid / xid-status 的重复 hash bookkeeping
   - [ ] 继续复用 prefilter / visit-window / materialize-window 的重复 segment-window 计算
@@ -214,6 +268,22 @@
     - overlap read + logical emit boundary 的 correctness 修复
   - 已补自动化回归 `fb_wal_parallel_payload`
   - live case 已确认 `FbWalIndexScan` 与总时长均有明显收益
+- [x] 将“缺 checkpoint anchor”判定前移
+  - 缺 `target_ts` 前 checkpoint 时，不再扫完整个 `3/9 build record index` 后才报错
+  - 在 metadata / payload 主扫描前先完成 anchor 可达性判定
+  - 补回归覆盖“仅保留近端连续 WAL，但 target 早于最早 checkpoint”的场景
+- [x] 收敛 WAL spool 初始化报错
+  - 不再向用户直接暴露 `fb WAL record spool session is not initialized`
+  - 改成可读的用户错误文案，并补回归覆盖
+- [x] 完成 `failed to replay heap insert` 现场复核与止血
+  - `documents @ '2026-04-01 08:10:13'` 在最新 build + restart 后已不再复现该错误
+  - record spool 已确认包含 `off21..28` 相关完整 WAL，说明不是该段记录漏收
+  - 同一条 SQL 在 `memory_limit='8GB'` 下当前返回 `count = 4356191`
+  - `memory_limit='1GB'` 下当前返回真实 preflight 内存报错，而不是 replay 错误
+  - 内核调试补充确认：
+    - raw summary spans 对该 live case 确实乱序，当前 correctness 依赖后续全局 merge
+    - 去掉 summary/payload merge + `emit_floor` 后，live case 会重新退化为 replay correctness 错误
+    - 因此原 `failed to replay heap insert` 的本质根因已收敛为“payload window 非单调/重叠导致页状态落后”，不是 heap insert redo 原语本身
 - [ ] root-cause 并重新启用 WAL payload dynamic bgworker/DSM 路径
   - 当前 live case 曾触发 postmaster 级 `stuck spinlock` / shared-memory instability
   - 现阶段已硬关闭 `fb_wal_materialize_payload_parallel()`，仅保留串行 payload materialize
@@ -221,6 +291,10 @@
     - 复现并定位具体 shared-memory / bgworker 生命周期问题
     - 保证 `fb_wal_parallel_payload` 回到真实并行 worker 口径
     - 复跑 `documents @ 2026-03-29 14:10:13`，确认日志无 `PANIC` / recovery
+  - 本轮补充：
+    - [ ] 取消 `fb_wal_materialize_payload_parallel()` 顶部硬返回
+    - [ ] `fb_wal_parallel_payload` 改回断言 `payload_parallel_workers > 0`
+    - [ ] 用用户提供的 `documents @ '2026-03-31 22:40:13'` SQL 连跑三次
 - [ ] 将 WAL metadata scan 改造成不改变语义且稳定优于串行基线的并行阶段
   - 当前 metadata 两段式并行 prototype 已做过，并补过 `fb_recordref` safe/unsafe 合同回归
   - 但 live case 上未打赢串行 metadata 基线，当前保持关闭

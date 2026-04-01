@@ -6,6 +6,8 @@
 #ifndef FB_WAL_H
 #define FB_WAL_H
 
+#include "postgres.h"
+
 #include "access/xlogdefs.h"
 #include "access/xlogreader.h"
 #include "utils/hsearch.h"
@@ -14,6 +16,34 @@
 #include "fb_spool.h"
 
 typedef struct FbSummaryQueryCache FbSummaryQueryCache;
+
+typedef struct FbWalBlockKey
+{
+	RelFileLocator locator;
+	ForkNumber forknum;
+	BlockNumber blkno;
+} FbWalBlockKey;
+
+typedef struct FbWalPrecomputedMissingBlock
+{
+	FbWalBlockKey key;
+	uint32 first_record_index;
+	XLogRecPtr first_record_lsn;
+} FbWalPrecomputedMissingBlock;
+
+typedef struct FbWalResolvedSegment
+{
+	char name[25];
+	TimeLineID timeline_id;
+	XLogSegNo segno;
+	char path[MAXPGPATH];
+	off_t bytes;
+	bool partial;
+	bool valid;
+	bool mismatch;
+	bool ignored;
+	int source_kind;
+} FbWalResolvedSegment;
 
 typedef enum FbWalUnsafeReason
 {
@@ -96,11 +126,15 @@ typedef struct FbWalScanContext
 	uint32 prefilter_total_segments;
 	bool *segment_hit_map;
 	uint32 summary_span_windows;
+	uint32 summary_span_covered_segments;
+	uint32 summary_span_fallback_segments;
 	uint32 summary_xid_hits;
 	uint32 summary_xid_fallback;
 	uint32 summary_xid_segments_read;
 	uint32 summary_unsafe_hits;
 	uint32 metadata_fallback_windows;
+	uint64 payload_sparse_reader_resets;
+	uint64 payload_sparse_reader_reuses;
 	bool current_segment_may_hit;
 	uint32 progress_segment_total;
 	uint32 visited_segment_count;
@@ -131,6 +165,12 @@ typedef enum FbWalXidStatus
 	FB_WAL_XID_COMMITTED,
 	FB_WAL_XID_ABORTED
 } FbWalXidStatus;
+
+typedef enum FbWalPayloadScanMode
+{
+	FB_WAL_PAYLOAD_SCAN_WINDOWED = 0,
+	FB_WAL_PAYLOAD_SCAN_SPARSE
+} FbWalPayloadScanMode;
 
 /*
  * FbRecordBlockRef
@@ -213,12 +253,24 @@ typedef struct FbWalRecordIndex
 	uint32 record_count;
 	uint32 payload_window_count;
 	uint32 payload_parallel_workers;
+	uint32 payload_covered_segment_count;
+	FbWalPayloadScanMode payload_scan_mode;
+	uint64 payload_scanned_record_count;
+	uint64 payload_kept_record_count;
+	uint64 payload_sparse_reader_resets;
+	uint64 payload_sparse_reader_reuses;
 	bool tail_inline_payload;
 	XLogRecPtr tail_cutover_lsn;
 	HTAB *xid_statuses;
 	FbSpoolSession *spool_session;
 	FbSpoolLog *record_log;
 	FbSpoolLog *record_tail_log;
+	HTAB *precomputed_missing_blocks;
+	uint32 precomputed_missing_block_count;
+	const FbWalResolvedSegment *resolved_segments;
+	uint32 resolved_segment_count;
+	int wal_seg_size;
+	FbSummaryQueryCache *summary_cache;
 } FbWalRecordIndex;
 
 typedef struct FbWalRecordCursor FbWalRecordCursor;
@@ -279,6 +331,10 @@ bool fb_wal_record_load(const FbWalRecordIndex *index,
 
 void fb_wal_visit_records(FbWalScanContext *ctx, FbWalRecordVisitor visitor,
 						  void *arg);
+void fb_wal_visit_resolved_records(const FbWalRecordIndex *index,
+								   XLogRecPtr end_lsn,
+								   FbWalRecordVisitor visitor,
+								   void *arg);
 /*
  * fb_wal_unsafe_reason_name
  *    WAL API.
@@ -287,5 +343,6 @@ void fb_wal_visit_records(FbWalScanContext *ctx, FbWalRecordVisitor visitor,
 const char *fb_wal_unsafe_reason_name(FbWalUnsafeReason reason);
 const char *fb_wal_unsafe_scope_name(FbWalUnsafeScope scope);
 const char *fb_wal_storage_change_op_name(FbWalStorageChangeOp op);
+const char *fb_wal_payload_scan_mode_name(FbWalPayloadScanMode mode);
 
 #endif

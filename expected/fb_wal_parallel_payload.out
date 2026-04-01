@@ -177,9 +177,10 @@ SELECT :'serial_summary' LIKE '%parallel=off%' AS serial_parallel_off,
 SELECT :'parallel_summary' LIKE '%parallel=on%' AS parallel_parallel_on,
 	   :'parallel_summary' LIKE '%prefilter=on%' AS parallel_prefilter_on,
 	   :'parallel_summary' LIKE '%payload_windows=%' AS parallel_payload_windows,
-	   :'parallel_summary' LIKE '%payload_parallel_workers=0%' AS parallel_payload_workers_zero;
- parallel_parallel_on | parallel_prefilter_on | parallel_payload_windows | parallel_payload_workers_zero 
-----------------------+-----------------------+--------------------------+-------------------------------
+	   substring(:'parallel_summary' FROM 'payload_parallel_workers=([0-9]+)')::int > 0
+	   AS parallel_payload_workers_enabled;
+ parallel_parallel_on | parallel_prefilter_on | parallel_payload_windows | parallel_payload_workers_enabled 
+----------------------+-----------------------+--------------------------+----------------------------------
  t                    | t                     | t                        | t
 (1 row)
 
@@ -248,10 +249,10 @@ SELECT fb_recordref_debug(
 \gset
 SELECT substring(:'dense_parallel_summary' FROM 'payload_windows=([0-9]+)')::int > 1
 	   AS dense_payload_windows_split,
-	   :'dense_parallel_summary' LIKE '%payload_parallel_workers=0%'
-	   AS dense_payload_workers_zero;
- dense_payload_windows_split | dense_payload_workers_zero 
------------------------------+----------------------------
+	   substring(:'dense_parallel_summary' FROM 'payload_parallel_workers=([0-9]+)')::int > 0
+	   AS dense_payload_workers_enabled;
+ dense_payload_windows_split | dense_payload_workers_enabled 
+-----------------------------+-------------------------------
  t                           | t
 (1 row)
 

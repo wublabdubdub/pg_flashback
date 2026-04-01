@@ -13,9 +13,11 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
+#include "fb_compat.h"
 #include "fb_memory.h"
 #include "fb_progress.h"
 #include "fb_replay.h"
+#include "fb_summary.h"
 #include "fb_toast.h"
 
 /*
@@ -53,10 +55,22 @@ typedef struct FbReplayStore
 	HTAB *blocks;
 } FbReplayStore;
 
+typedef struct FbReplayWalAnchorVisitorState
+{
+	const FbRelationInfo *info;
+	HTAB *missing_blocks;
+} FbReplayWalAnchorVisitorState;
+
 struct FbReplayDiscoverState
 {
 	HTAB *backtrack_blocks;
 	TupleDesc toast_tupdesc;
+	uint32 precomputed_missing_blocks;
+	uint32 discover_rounds;
+	bool discover_skipped;
+	uint32 summary_anchor_hits;
+	uint32 summary_anchor_fallback;
+	uint32 summary_anchor_segments_read;
 };
 
 struct FbReplayWarmState
@@ -83,7 +97,8 @@ typedef struct FbReplayMissingBlock
 {
 	FbReplayBlockKey key;
 	uint32 first_record_index;
-	uint32 anchor_record_index;
+	XLogRecPtr first_record_lsn;
+	XLogRecPtr anchor_lsn;
 	bool anchor_found;
 } FbReplayMissingBlock;
 
@@ -111,6 +126,15 @@ typedef struct FbPendingReverseOpQueue
 	FbPendingReverseOpEntry *head;
 	FbPendingReverseOpEntry *tail;
 } FbPendingReverseOpQueue;
+
+static FbReplayMissingBlock *fb_replay_find_missing_block(HTAB *missing_blocks,
+														  const FbRecordBlockRef *block_ref);
+static void fb_replay_seed_missing_blocks_from_index(HTAB *missing_blocks,
+													  const FbWalRecordIndex *index);
+static XLogRecPtr fb_replay_missing_blocks_end_lsn(HTAB *missing_blocks);
+static bool fb_replay_raw_record_materializes_page(XLogReaderState *reader,
+												   int block_id);
+static bool fb_replay_raw_anchor_visitor(XLogReaderState *reader, void *arg);
 
 /*
  * fb_replay_progress_stage
@@ -266,6 +290,41 @@ fb_replay_create_missing_block_hash(void)
 
 	return hash_create("fb replay missing blocks", 64, &ctl,
 					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+static void
+fb_replay_seed_missing_blocks_from_index(HTAB *missing_blocks,
+										 const FbWalRecordIndex *index)
+{
+	HASH_SEQ_STATUS seq;
+	FbWalPrecomputedMissingBlock *entry;
+
+	if (missing_blocks == NULL || index == NULL ||
+		index->precomputed_missing_blocks == NULL)
+		return;
+
+	hash_seq_init(&seq, index->precomputed_missing_blocks);
+	while ((entry = (FbWalPrecomputedMissingBlock *) hash_seq_search(&seq)) != NULL)
+	{
+		FbReplayMissingBlock *dest;
+		bool found = false;
+
+		dest = (FbReplayMissingBlock *) hash_search(missing_blocks,
+													 &entry->key,
+													 HASH_ENTER,
+													 &found);
+		if (!found)
+		{
+			MemSet(dest, 0, sizeof(*dest));
+			dest->key.locator = entry->key.locator;
+			dest->key.forknum = entry->key.forknum;
+			dest->key.blkno = entry->key.blkno;
+		}
+		dest->first_record_index = entry->first_record_index;
+		dest->first_record_lsn = entry->first_record_lsn;
+		dest->anchor_lsn = InvalidXLogRecPtr;
+		dest->anchor_found = false;
+	}
 }
 
 /*
@@ -652,6 +711,7 @@ fb_replay_note_missing_block(FbReplayControl *control,
 		MemSet(entry, 0, sizeof(*entry));
 		entry->key = key;
 		entry->first_record_index = control->record_index;
+		entry->first_record_lsn = InvalidXLogRecPtr;
 	}
 	else if (control->record_index < entry->first_record_index)
 		entry->first_record_index = control->record_index;
@@ -667,7 +727,20 @@ fb_replay_note_record_missing_blocks(FbReplayControl *control,
 		return;
 
 	for (block_index = 0; block_index < record->block_count; block_index++)
+	{
 		fb_replay_note_missing_block(control, &record->blocks[block_index]);
+		if (control->missing_blocks != NULL)
+		{
+			FbReplayMissingBlock *entry;
+
+			entry = fb_replay_find_missing_block(control->missing_blocks,
+												 &record->blocks[block_index]);
+			if (entry != NULL &&
+				(XLogRecPtrIsInvalid(entry->first_record_lsn) ||
+				 record->lsn < entry->first_record_lsn))
+				entry->first_record_lsn = record->lsn;
+		}
+	}
 }
 
 /*
@@ -753,6 +826,28 @@ fb_replay_missing_block_count(HTAB *missing_blocks)
 	return count;
 }
 
+static XLogRecPtr
+fb_replay_missing_blocks_end_lsn(HTAB *missing_blocks)
+{
+	HASH_SEQ_STATUS seq;
+	FbReplayMissingBlock *entry;
+	XLogRecPtr end_lsn = InvalidXLogRecPtr;
+
+	if (missing_blocks == NULL)
+		return end_lsn;
+
+	hash_seq_init(&seq, missing_blocks);
+	while ((entry = (FbReplayMissingBlock *) hash_seq_search(&seq)) != NULL)
+	{
+		if (entry->anchor_found || XLogRecPtrIsInvalid(entry->first_record_lsn))
+			continue;
+		if (XLogRecPtrIsInvalid(end_lsn) || entry->first_record_lsn > end_lsn)
+			end_lsn = entry->first_record_lsn;
+	}
+
+	return end_lsn;
+}
+
 /*
  * fb_replay_merge_missing_blocks
  *    Replay helper.
@@ -776,16 +871,108 @@ fb_replay_merge_missing_blocks(HTAB *dest, HTAB *src)
 			*dest_entry = *entry;
 		else
 		{
-			if (!dest_entry->anchor_found ||
-				entry->anchor_record_index < dest_entry->anchor_record_index)
+			if (entry->anchor_found &&
+				(!dest_entry->anchor_found ||
+				 entry->anchor_lsn < dest_entry->anchor_lsn))
 			{
-				dest_entry->anchor_record_index = entry->anchor_record_index;
+				dest_entry->anchor_lsn = entry->anchor_lsn;
 				dest_entry->anchor_found = entry->anchor_found;
 			}
 			if (entry->first_record_index < dest_entry->first_record_index)
 				dest_entry->first_record_index = entry->first_record_index;
+			if (XLogRecPtrIsInvalid(dest_entry->first_record_lsn) ||
+				(!XLogRecPtrIsInvalid(entry->first_record_lsn) &&
+				 entry->first_record_lsn < dest_entry->first_record_lsn))
+				dest_entry->first_record_lsn = entry->first_record_lsn;
 		}
 	}
+}
+
+static bool
+fb_replay_raw_record_materializes_page(XLogReaderState *reader, int block_id)
+{
+	uint8 rmid;
+	uint8 info_code;
+
+	if (reader == NULL || block_id < 0)
+		return false;
+	if (XLogRecHasBlockImage(reader, block_id))
+		return true;
+
+	rmid = XLogRecGetRmid(reader);
+	if (rmid == RM_HEAP_ID)
+	{
+		info_code = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+
+		switch (info_code)
+		{
+			case XLOG_HEAP_INSERT:
+				return block_id == 0 &&
+					(XLogRecGetInfo(reader) & XLOG_HEAP_INIT_PAGE) != 0;
+			case XLOG_HEAP_UPDATE:
+			case XLOG_HEAP_HOT_UPDATE:
+				return block_id == 0 &&
+					(XLogRecGetInfo(reader) & XLOG_HEAP_INIT_PAGE) != 0;
+			default:
+				break;
+		}
+	}
+	else if (rmid == RM_HEAP2_ID)
+	{
+		info_code = XLogRecGetInfo(reader) & XLOG_HEAP_OPMASK;
+
+		if (info_code == XLOG_HEAP2_MULTI_INSERT)
+			return block_id == 0 &&
+				(XLogRecGetInfo(reader) & XLOG_HEAP_INIT_PAGE) != 0;
+	}
+
+	return false;
+}
+
+static bool
+fb_replay_raw_anchor_visitor(XLogReaderState *reader, void *arg)
+{
+	FbReplayWalAnchorVisitorState *state = (FbReplayWalAnchorVisitorState *) arg;
+	int block_id;
+
+	if (reader == NULL || state == NULL || state->info == NULL ||
+		state->missing_blocks == NULL)
+		return true;
+
+	for (block_id = 0; block_id <= FB_XLOGREC_MAX_BLOCK_ID(reader); block_id++)
+	{
+		RelFileLocator locator;
+		ForkNumber forknum;
+		BlockNumber blkno;
+		FbReplayMissingBlock *entry;
+		FbRecordBlockRef block_ref;
+
+		if (!XLogRecGetBlockTag(reader, block_id, &locator, &forknum, &blkno))
+			continue;
+		if (forknum != MAIN_FORKNUM)
+			continue;
+		if (!RelFileLocatorEquals(locator, state->info->locator) &&
+			(!state->info->has_toast_locator ||
+			 !RelFileLocatorEquals(locator, state->info->toast_locator)))
+			continue;
+
+		MemSet(&block_ref, 0, sizeof(block_ref));
+		block_ref.in_use = true;
+		block_ref.locator = locator;
+		block_ref.forknum = forknum;
+		block_ref.blkno = blkno;
+		entry = fb_replay_find_missing_block(state->missing_blocks, &block_ref);
+		if (entry == NULL ||
+			XLogRecPtrIsInvalid(entry->first_record_lsn) ||
+			reader->ReadRecPtr >= entry->first_record_lsn ||
+			!fb_replay_raw_record_materializes_page(reader, block_id))
+			continue;
+
+		entry->anchor_found = true;
+		entry->anchor_lsn = reader->ReadRecPtr;
+	}
+
+	return true;
 }
 
 /*
@@ -794,17 +981,81 @@ fb_replay_merge_missing_blocks(HTAB *dest, HTAB *src)
  */
 
 static void
-fb_replay_resolve_missing_anchors(const FbWalRecordIndex *index,
-								  HTAB *missing_blocks)
+fb_replay_resolve_missing_anchors(const FbRelationInfo *info,
+								  const FbWalRecordIndex *index,
+								  HTAB *missing_blocks,
+								  FbReplayResult *result)
 {
 	uint32 unresolved;
+	uint32 segment_index;
 	FbWalRecordCursor *cursor;
 	FbRecordRef record;
-	uint32 record_index;
+	uint32 record_index = 0;
 
 	unresolved = fb_replay_missing_block_count(missing_blocks);
 	if (unresolved == 0)
 		return;
+
+	if (index != NULL &&
+		index->resolved_segments != NULL &&
+		index->resolved_segment_count > 0 &&
+		index->summary_cache != NULL)
+	{
+		for (segment_index = index->resolved_segment_count; segment_index > 0 && unresolved > 0; segment_index--)
+		{
+			const FbWalResolvedSegment *segment = &index->resolved_segments[segment_index - 1];
+			FbSummaryBlockAnchor *anchors = NULL;
+			uint32 anchor_count = 0;
+			uint32 anchor_index;
+
+			if (!fb_summary_segment_lookup_block_anchors_cached(segment->path,
+																segment->bytes,
+																segment->timeline_id,
+																segment->segno,
+																index->wal_seg_size,
+																segment->source_kind,
+																info,
+																index->summary_cache,
+																&anchors,
+																&anchor_count))
+				continue;
+			if (result != NULL)
+				result->summary_anchor_segments_read++;
+
+			for (anchor_index = anchor_count; anchor_index > 0 && unresolved > 0; anchor_index--)
+			{
+				const FbSummaryBlockAnchor *anchor = &anchors[anchor_index - 1];
+				FbRecordBlockRef block_ref;
+				FbReplayMissingBlock *entry;
+
+				MemSet(&block_ref, 0, sizeof(block_ref));
+				block_ref.in_use = true;
+				block_ref.locator = anchor->locator;
+				block_ref.forknum = anchor->forknum;
+				block_ref.blkno = anchor->blkno;
+
+				entry = fb_replay_find_missing_block(missing_blocks, &block_ref);
+				if (entry == NULL || entry->anchor_found ||
+					XLogRecPtrIsInvalid(entry->first_record_lsn) ||
+					anchor->anchor_lsn >= entry->first_record_lsn)
+					continue;
+
+				entry->anchor_found = true;
+				entry->anchor_lsn = anchor->anchor_lsn;
+				if (result != NULL)
+					result->summary_anchor_hits++;
+				unresolved--;
+			}
+
+			if (anchors != NULL)
+				pfree(anchors);
+		}
+	}
+
+	if (unresolved == 0)
+		return;
+	if (result != NULL)
+		result->summary_anchor_fallback += unresolved;
 
 	cursor = fb_wal_record_cursor_open(index, FB_SPOOL_BACKWARD);
 	while (unresolved > 0 &&
@@ -827,35 +1078,54 @@ fb_replay_resolve_missing_anchors(const FbWalRecordIndex *index,
 				continue;
 
 			entry->anchor_found = true;
-			entry->anchor_record_index = record_index;
+			entry->anchor_lsn = record.lsn;
 			unresolved--;
 		}
 	}
 	fb_wal_record_cursor_close(cursor);
+
+	if (unresolved > 0 && index != NULL &&
+		index->resolved_segments != NULL &&
+		index->resolved_segment_count > 0)
+	{
+		FbReplayWalAnchorVisitorState raw_state;
+		XLogRecPtr end_lsn;
+
+		end_lsn = fb_replay_missing_blocks_end_lsn(missing_blocks);
+		if (!XLogRecPtrIsInvalid(end_lsn))
+		{
+			MemSet(&raw_state, 0, sizeof(raw_state));
+			raw_state.info = info;
+			raw_state.missing_blocks = missing_blocks;
+			fb_wal_visit_resolved_records(index, end_lsn,
+										  fb_replay_raw_anchor_visitor,
+										  &raw_state);
+		}
+	}
 }
 
 /*
- * fb_replay_min_anchor_index
+ * fb_replay_min_anchor_lsn
  *    Replay helper.
  */
 
-static uint32
-fb_replay_min_anchor_index(HTAB *missing_blocks)
+static XLogRecPtr
+fb_replay_min_anchor_lsn(HTAB *missing_blocks)
 {
 	HASH_SEQ_STATUS seq;
 	FbReplayMissingBlock *entry;
-	uint32 min_index = UINT32_MAX;
+	XLogRecPtr min_lsn = InvalidXLogRecPtr;
 
 	hash_seq_init(&seq, missing_blocks);
 	while ((entry = (FbReplayMissingBlock *) hash_seq_search(&seq)) != NULL)
 	{
 		if (!entry->anchor_found)
 			continue;
-		if (entry->anchor_record_index < min_index)
-			min_index = entry->anchor_record_index;
+		if (XLogRecPtrIsInvalid(min_lsn) || entry->anchor_lsn < min_lsn)
+			min_lsn = entry->anchor_lsn;
 	}
 
-	return min_index;
+	return min_lsn;
 }
 
 /*
@@ -898,8 +1168,7 @@ fb_replay_raise_unresolved_missing_fpi(const FbWalRecordIndex *index,
 
 static bool
 fb_record_should_apply_for_backtrack(const FbRecordRef *record,
-									 HTAB *missing_blocks,
-									 uint32 record_index)
+									 HTAB *missing_blocks)
 {
 	bool touches_backtracked = false;
 	int block_index;
@@ -914,7 +1183,9 @@ fb_record_should_apply_for_backtrack(const FbRecordRef *record,
 			continue;
 
 		touches_backtracked = true;
-		if (!entry->anchor_found || record_index < entry->anchor_record_index)
+		if (!entry->anchor_found ||
+			XLogRecPtrIsInvalid(entry->anchor_lsn) ||
+			record->lsn < entry->anchor_lsn)
 			return false;
 	}
 
@@ -2292,8 +2563,7 @@ fb_replay_run_pass(const FbRelationInfo *info,
 		if (control != NULL &&
 			control->phase == FB_REPLAY_PHASE_WARM &&
 			!fb_record_should_apply_for_backtrack(&record,
-												 control->missing_blocks,
-												 record_index))
+												 control->missing_blocks))
 			continue;
 
 		switch (record.kind)
@@ -2350,6 +2620,31 @@ fb_replay_run_pass(const FbRelationInfo *info,
 	fb_wal_record_cursor_close(cursor);
 }
 
+static uint32
+fb_replay_find_record_index_at_or_after_lsn(const FbWalRecordIndex *index,
+											XLogRecPtr lsn)
+{
+	FbWalRecordCursor *cursor;
+	FbRecordRef record;
+	uint32 record_index = 0;
+	uint32 found_index = UINT32_MAX;
+
+	if (index == NULL || XLogRecPtrIsInvalid(lsn))
+		return UINT32_MAX;
+
+	cursor = fb_wal_record_cursor_open(index, FB_SPOOL_FORWARD);
+	while (fb_wal_record_cursor_read(cursor, &record, &record_index))
+	{
+		if (record.lsn >= lsn)
+		{
+			found_index = record_index;
+			break;
+		}
+	}
+	fb_wal_record_cursor_close(cursor);
+	return found_index;
+}
+
 /*
  * fb_replay_warm_store
  *    Replay helper.
@@ -2365,7 +2660,8 @@ fb_replay_warm_store(const FbRelationInfo *info,
 					 FbReplayResult *result)
 {
 	FbReplayControl warm_control;
-	uint32 min_anchor_index;
+	uint32 warm_start_index;
+	XLogRecPtr min_anchor_lsn;
 	XLogRecPtr warm_start;
 
 	if (fb_replay_missing_block_count(backtrack_blocks) == 0)
@@ -2374,26 +2670,23 @@ fb_replay_warm_store(const FbRelationInfo *info,
 		return;
 	}
 
-	min_anchor_index = fb_replay_min_anchor_index(backtrack_blocks);
-	if (min_anchor_index == UINT32_MAX)
+	min_anchor_lsn = fb_replay_min_anchor_lsn(backtrack_blocks);
+	if (XLogRecPtrIsInvalid(min_anchor_lsn))
 	{
 		fb_progress_update_percent(FB_PROGRESS_STAGE_REPLAY_WARM, 100, NULL);
 		return;
 	}
 
-	{
-		FbRecordRef anchor_record;
-
-		if (!fb_wal_record_load(index, min_anchor_index, &anchor_record))
-			elog(ERROR, "missing warm anchor record %u", min_anchor_index);
-		warm_start = anchor_record.lsn;
-	}
+	warm_start = min_anchor_lsn;
+	warm_start_index = fb_replay_find_record_index_at_or_after_lsn(index, warm_start);
+	if (warm_start_index == UINT32_MAX)
+		warm_start_index = 0;
 	MemSet(&warm_control, 0, sizeof(warm_control));
 	warm_control.phase = FB_REPLAY_PHASE_WARM;
 	warm_control.missing_blocks = backtrack_blocks;
 	fb_replay_run_pass(info, index, NULL, toast_tupdesc, toast_store,
 					   store, &warm_control, result, NULL, NULL,
-					   min_anchor_index,
+					   warm_start_index,
 					   warm_start, index->anchor_redo_lsn);
 	fb_progress_update_percent(FB_PROGRESS_STAGE_REPLAY_WARM, 100, NULL);
 }
@@ -2422,6 +2715,32 @@ fb_replay_discover(const FbRelationInfo *info,
 	state = palloc0(sizeof(*state));
 	state->toast_tupdesc = fb_replay_open_toast_tupdesc(info);
 	state->backtrack_blocks = fb_replay_create_missing_block_hash();
+
+	if (index != NULL && index->precomputed_missing_blocks != NULL)
+	{
+		state->precomputed_missing_blocks = index->precomputed_missing_block_count;
+		fb_progress_enter_stage(FB_PROGRESS_STAGE_REPLAY_DISCOVER, "precomputed");
+		if (index->precomputed_missing_block_count > 0)
+		{
+			FbReplayResult discover_result;
+
+			fb_replay_seed_missing_blocks_from_index(state->backtrack_blocks, index);
+			fb_replay_init_result(index, &discover_result);
+			fb_replay_resolve_missing_anchors(info, index, state->backtrack_blocks,
+											  &discover_result);
+			state->summary_anchor_hits = discover_result.summary_anchor_hits;
+			state->summary_anchor_fallback = discover_result.summary_anchor_fallback;
+			state->summary_anchor_segments_read =
+				discover_result.summary_anchor_segments_read;
+		}
+		else
+		{
+			state->discover_skipped = true;
+			fb_progress_update_percent(FB_PROGRESS_STAGE_REPLAY_DISCOVER, 100,
+									   "precomputed");
+			return state;
+		}
+	}
 
 	for (iteration = 0; iteration < 8; iteration++)
 	{
@@ -2452,6 +2771,7 @@ fb_replay_discover(const FbRelationInfo *info,
 		discover_control.phase = FB_REPLAY_PHASE_DISCOVER;
 		discover_control.round_no = iteration + 1;
 		discover_control.missing_blocks = iteration_missing;
+		state->discover_rounds = iteration + 1;
 		fb_replay_progress_enter(&discover_control);
 		fb_replay_run_pass(info, index, NULL, state->toast_tupdesc, discover_toast_store,
 						   &discover_store, &discover_control, &discover_result,
@@ -2472,7 +2792,11 @@ fb_replay_discover(const FbRelationInfo *info,
 			break;
 		}
 
-		fb_replay_resolve_missing_anchors(index, iteration_missing);
+		fb_replay_resolve_missing_anchors(info, index, iteration_missing, &discover_result);
+		state->summary_anchor_hits += discover_result.summary_anchor_hits;
+		state->summary_anchor_fallback += discover_result.summary_anchor_fallback;
+		state->summary_anchor_segments_read +=
+			discover_result.summary_anchor_segments_read;
 		fb_replay_raise_unresolved_missing_fpi(index, iteration_missing);
 		fb_replay_merge_missing_blocks(state->backtrack_blocks, iteration_missing);
 		hash_destroy(iteration_missing);
@@ -2587,6 +2911,16 @@ fb_replay_execute_internal(const FbRelationInfo *info,
 	discover = fb_replay_discover(info, index);
 	warm = fb_replay_warm(info, index, discover, result);
 	fb_replay_final_build_reverse_source(info, index, tupdesc, warm, result, source);
+	if (discover != NULL)
+	{
+		result->precomputed_missing_blocks = discover->precomputed_missing_blocks;
+		result->discover_rounds = discover->discover_rounds;
+		result->discover_skipped = discover->discover_skipped ? 1 : 0;
+		result->summary_anchor_hits = discover->summary_anchor_hits;
+		result->summary_anchor_fallback = discover->summary_anchor_fallback;
+		result->summary_anchor_segments_read =
+			discover->summary_anchor_segments_read;
+	}
 	fb_replay_warm_destroy(warm);
 	fb_replay_discover_destroy(discover);
 }

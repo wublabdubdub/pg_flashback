@@ -26,6 +26,7 @@
 #include "utils/timestamp.h"
 
 #include "fb_ckwal.h"
+#include "fb_catalog.h"
 #include "fb_compat.h"
 #include "fb_guc.h"
 #include "fb_runtime.h"
@@ -33,13 +34,14 @@
 #include "fb_wal.h"
 
 PG_FUNCTION_INFO_V1(fb_summary_build_available_debug);
+PG_FUNCTION_INFO_V1(fb_summary_block_anchor_debug);
 PG_FUNCTION_INFO_V1(fb_summary_meta_stats_debug);
 
 #define FB_SUMMARY_MAGIC ((uint32) 0x4642534d)
-#define FB_SUMMARY_VERSION 4
+#define FB_SUMMARY_VERSION 5
 #define FB_SUMMARY_LOCATOR_BLOOM_BYTES 64
 #define FB_SUMMARY_RELTAG_BLOOM_BYTES 64
-#define FB_SUMMARY_SECTION_COUNT 5
+#define FB_SUMMARY_SECTION_COUNT 6
 #define FB_SUMMARY_SPAN_MERGE_GAP XLOG_BLCKSZ
 
 typedef enum FbSummarySourceKind
@@ -81,6 +83,7 @@ typedef struct FbSummaryFileHeader
 	uint32 xid_outcome_count;
 	uint32 touched_xid_count;
 	uint32 unsafe_fact_count;
+	uint32 block_anchor_count;
 	uint32 section_count;
 	struct
 	{
@@ -99,7 +102,8 @@ typedef enum FbSummarySectionKind
 	FB_SUMMARY_SECTION_RELATION_SPANS,
 	FB_SUMMARY_SECTION_XID_OUTCOMES,
 	FB_SUMMARY_SECTION_TOUCHED_XIDS,
-	FB_SUMMARY_SECTION_UNSAFE_FACTS
+	FB_SUMMARY_SECTION_UNSAFE_FACTS,
+	FB_SUMMARY_SECTION_BLOCK_ANCHORS
 } FbSummarySectionKind;
 
 typedef enum FbSummaryUnsafeMatchKind
@@ -130,6 +134,8 @@ typedef struct FbSummaryDiskRelationEntry
 	uint32 touched_xid_count;
 	uint32 first_unsafe_fact;
 	uint32 unsafe_fact_count;
+	uint32 first_block_anchor;
+	uint32 block_anchor_count;
 	RelFileLocator locator;
 	Oid db_oid;
 	Oid rel_oid;
@@ -175,6 +181,14 @@ typedef struct FbSummaryDiskUnsafeFact
 	Oid rel_oid;
 } FbSummaryDiskUnsafeFact;
 
+typedef struct FbSummaryDiskBlockAnchor
+{
+	uint16 slot;
+	uint16 flags;
+	uint32 blkno;
+	XLogRecPtr anchor_lsn;
+} FbSummaryDiskBlockAnchor;
+
 typedef struct FbSummaryLocatorKey
 {
 	RelFileLocator locator;
@@ -214,6 +228,9 @@ typedef struct FbSummaryBuildRelationEntry
 	FbSummaryUnsafeFact *unsafe_facts;
 	uint32 unsafe_fact_count;
 	uint32 unsafe_fact_capacity;
+	FbSummaryBlockAnchor *block_anchors;
+	uint32 block_anchor_count;
+	uint32 block_anchor_capacity;
 } FbSummaryBuildRelationEntry;
 
 typedef struct FbSummaryBuildState
@@ -265,6 +282,7 @@ typedef struct FbSummaryQueryCacheEntry
 	FbSummaryDiskXidOutcome *xid_outcomes;
 	FbSummaryDiskTouchedXid *touched_xids;
 	FbSummaryDiskUnsafeFact *unsafe_facts;
+	FbSummaryDiskBlockAnchor *block_anchors;
 } FbSummaryQueryCacheEntry;
 
 struct FbSummaryQueryCache
@@ -315,6 +333,12 @@ static void fb_summary_relation_append_span(FbSummaryBuildRelationEntry *entry,
 											uint16 flags);
 static void fb_summary_relation_append_touched_xid(FbSummaryBuildRelationEntry *entry,
 													TransactionId xid);
+static void fb_summary_relation_append_block_anchor(FbSummaryBuildRelationEntry *entry,
+													const RelFileLocator *locator,
+													ForkNumber forknum,
+													BlockNumber blkno,
+													XLogRecPtr anchor_lsn,
+													uint16 flags);
 static void fb_summary_relation_append_unsafe_fact_locator(FbSummaryBuildRelationEntry *entry,
 														   FbWalUnsafeReason reason,
 														   FbWalUnsafeScope scope,
@@ -344,6 +368,9 @@ static void fb_summary_note_xact_timestamp(FbSummaryBuildState *state,
 										   TimestampTz ts);
 static bool fb_summary_record_locator_from_smgr(XLogReaderState *reader,
 												 RelFileLocator *locator_out);
+static bool fb_summary_record_block_is_anchor(XLogReaderState *reader,
+											  int block_id,
+											  uint16 *flags_out);
 static void fb_summary_note_record(XLogReaderState *reader,
 								   FbSummaryBuildState *state);
 static int fb_summary_open_file_at_path(const char *path);
@@ -398,6 +425,8 @@ static int fb_summary_collect_selected_segments(FbSummarySegmentEntry **selected
 												 int *wal_seg_size_out);
 static int fb_summary_disk_touched_xid_cmp(const void *lhs, const void *rhs);
 static int fb_summary_disk_unsafe_fact_cmp(const void *lhs, const void *rhs);
+static int fb_summary_block_anchor_cmp(const void *lhs, const void *rhs);
+static int fb_summary_disk_block_anchor_cmp(const void *lhs, const void *rhs);
 #if PG_VERSION_NUM >= 130000
 static void fb_summary_open_segment(XLogReaderState *state, XLogSegNo next_segno,
 									TimeLineID *timeline_id);
@@ -953,6 +982,41 @@ fb_summary_relation_append_touched_xid(FbSummaryBuildRelationEntry *entry,
 }
 
 static void
+fb_summary_relation_append_block_anchor(FbSummaryBuildRelationEntry *entry,
+										const RelFileLocator *locator,
+										ForkNumber forknum,
+										BlockNumber blkno,
+										XLogRecPtr anchor_lsn,
+										uint16 flags)
+{
+	FbSummaryBlockAnchor *anchor;
+
+	if (entry == NULL || locator == NULL || XLogRecPtrIsInvalid(anchor_lsn))
+		return;
+
+	if (entry->block_anchor_count == entry->block_anchor_capacity)
+	{
+		entry->block_anchor_capacity =
+			(entry->block_anchor_capacity == 0) ? 8 : entry->block_anchor_capacity * 2;
+		if (entry->block_anchors == NULL)
+			entry->block_anchors =
+				palloc0(sizeof(*entry->block_anchors) * entry->block_anchor_capacity);
+		else
+			entry->block_anchors =
+				repalloc(entry->block_anchors,
+						 sizeof(*entry->block_anchors) * entry->block_anchor_capacity);
+	}
+
+	anchor = &entry->block_anchors[entry->block_anchor_count++];
+	MemSet(anchor, 0, sizeof(*anchor));
+	anchor->locator = *locator;
+	anchor->forknum = forknum;
+	anchor->blkno = blkno;
+	anchor->anchor_lsn = anchor_lsn;
+	anchor->flags = flags;
+}
+
+static void
 fb_summary_relation_append_unsafe_fact_common(FbSummaryBuildRelationEntry *entry,
 											  FbWalUnsafeReason reason,
 											  FbWalUnsafeScope scope,
@@ -1203,6 +1267,90 @@ fb_summary_disk_unsafe_fact_cmp(const void *lhs, const void *rhs)
 		 (left->rel_oid > right->rel_oid) ? 1 : 0);
 }
 
+static int
+fb_summary_block_anchor_cmp(const void *lhs, const void *rhs)
+{
+	const FbSummaryBlockAnchor *left = (const FbSummaryBlockAnchor *) lhs;
+	const FbSummaryBlockAnchor *right = (const FbSummaryBlockAnchor *) rhs;
+	int locator_cmp;
+
+	locator_cmp = memcmp(&left->locator, &right->locator, sizeof(left->locator));
+	if (locator_cmp != 0)
+		return locator_cmp;
+	if (left->forknum < right->forknum)
+		return -1;
+	if (left->forknum > right->forknum)
+		return 1;
+	if (left->blkno < right->blkno)
+		return -1;
+	if (left->blkno > right->blkno)
+		return 1;
+	if (left->anchor_lsn < right->anchor_lsn)
+		return -1;
+	if (left->anchor_lsn > right->anchor_lsn)
+		return 1;
+	if (left->flags < right->flags)
+		return -1;
+	if (left->flags > right->flags)
+		return 1;
+	return 0;
+}
+
+static int
+fb_summary_disk_block_anchor_cmp(const void *lhs, const void *rhs)
+{
+	const FbSummaryDiskBlockAnchor *left = (const FbSummaryDiskBlockAnchor *) lhs;
+	const FbSummaryDiskBlockAnchor *right = (const FbSummaryDiskBlockAnchor *) rhs;
+
+	if (left->slot < right->slot)
+		return -1;
+	if (left->slot > right->slot)
+		return 1;
+	if (left->blkno < right->blkno)
+		return -1;
+	if (left->blkno > right->blkno)
+		return 1;
+	if (left->anchor_lsn < right->anchor_lsn)
+		return -1;
+	if (left->anchor_lsn > right->anchor_lsn)
+		return 1;
+	if (left->flags < right->flags)
+		return -1;
+	if (left->flags > right->flags)
+		return 1;
+	return 0;
+}
+
+static int
+fb_summary_block_anchor_public_cmp(const void *lhs, const void *rhs)
+{
+	const FbSummaryBlockAnchor *left = (const FbSummaryBlockAnchor *) lhs;
+	const FbSummaryBlockAnchor *right = (const FbSummaryBlockAnchor *) rhs;
+	int locator_cmp;
+
+	if (left->anchor_lsn < right->anchor_lsn)
+		return -1;
+	if (left->anchor_lsn > right->anchor_lsn)
+		return 1;
+
+	locator_cmp = memcmp(&left->locator, &right->locator, sizeof(left->locator));
+	if (locator_cmp != 0)
+		return locator_cmp;
+	if (left->forknum < right->forknum)
+		return -1;
+	if (left->forknum > right->forknum)
+		return 1;
+	if (left->blkno < right->blkno)
+		return -1;
+	if (left->blkno > right->blkno)
+		return 1;
+	if (left->flags < right->flags)
+		return -1;
+	if (left->flags > right->flags)
+		return 1;
+	return 0;
+}
+
 static void
 fb_summary_bloom_add(unsigned char *bits, Size bits_len, const void *data, Size len)
 {
@@ -1325,6 +1473,60 @@ fb_summary_record_locator_from_smgr(XLogReaderState *reader, RelFileLocator *loc
 	return false;
 }
 
+static bool
+fb_summary_record_block_is_anchor(XLogReaderState *reader,
+								  int block_id,
+								  uint16 *flags_out)
+{
+	uint8 rmid;
+	uint8 info_code;
+	uint16 flags = 0;
+
+	if (flags_out != NULL)
+		*flags_out = 0;
+	if (reader == NULL || block_id < 0)
+		return false;
+
+	if (XLogRecHasBlockImage(reader, block_id))
+	{
+		flags |= 0x0001;
+		if (flags_out != NULL)
+			*flags_out = flags;
+		return true;
+	}
+
+	if (block_id != 0 || (XLogRecGetInfo(reader) & XLOG_HEAP_INIT_PAGE) == 0)
+		return false;
+
+	rmid = XLogRecGetRmid(reader);
+	if (rmid == RM_HEAP_ID)
+	{
+		info_code = XLogRecGetInfo(reader) & XLOG_HEAP_OPMASK;
+		if (info_code == XLOG_HEAP_INSERT ||
+			info_code == XLOG_HEAP_UPDATE ||
+			info_code == XLOG_HEAP_HOT_UPDATE)
+		{
+			flags |= 0x0002;
+			if (flags_out != NULL)
+				*flags_out = flags;
+			return true;
+		}
+	}
+	else if (rmid == RM_HEAP2_ID)
+	{
+		info_code = XLogRecGetInfo(reader) & XLOG_HEAP_OPMASK;
+		if (info_code == XLOG_HEAP2_MULTI_INSERT)
+		{
+			flags |= 0x0002;
+			if (flags_out != NULL)
+				*flags_out = flags;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static int
 fb_summary_open_file_at_path(const char *path)
 {
@@ -1375,10 +1577,10 @@ fb_summary_note_record(XLogReaderState *reader, FbSummaryBuildState *state)
 		ForkNumber forknum;
 		BlockNumber blkno;
 		FbSummaryBuildRelationEntry *entry;
+		uint16 anchor_flags = 0;
 
 		if (!fb_xlogrec_get_block_tag(reader, block_id, &locator, &forknum, &blkno))
 			continue;
-		(void) blkno;
 		if (forknum != MAIN_FORKNUM)
 			continue;
 
@@ -1388,6 +1590,13 @@ fb_summary_note_record(XLogReaderState *reader, FbSummaryBuildState *state)
 		fb_summary_relation_append_touched_xid(entry, xid);
 		if (TransactionIdIsValid(top_xid) && top_xid != xid)
 			fb_summary_relation_append_touched_xid(entry, top_xid);
+		if (fb_summary_record_block_is_anchor(reader, block_id, &anchor_flags))
+			fb_summary_relation_append_block_anchor(entry,
+													&locator,
+													forknum,
+													blkno,
+													record_start,
+													anchor_flags);
 	}
 
 	if (rmid == RM_HEAP_ID)
@@ -1919,6 +2128,7 @@ fb_summary_build_file_for_segment(const FbSummarySegmentEntry *entry,
 	FbSummaryDiskXidOutcome *disk_outcomes = NULL;
 	FbSummaryDiskTouchedXid *disk_touched_xids = NULL;
 	FbSummaryDiskUnsafeFact *disk_unsafe_facts = NULL;
+	FbSummaryDiskBlockAnchor *disk_block_anchors = NULL;
 	FbSummaryReaderPrivate private;
 	XLogReaderState *reader;
 	XLogRecPtr start_lsn;
@@ -1935,6 +2145,8 @@ fb_summary_build_file_for_segment(const FbSummarySegmentEntry *entry,
 	uint32 touched_xid_index = 0;
 	uint32 total_unsafe_facts = 0;
 	uint32 unsafe_fact_index = 0;
+	uint32 total_block_anchors = 0;
+	uint32 block_anchor_index = 0;
 	uint32 section_index = 0;
 	uint32 i;
 	int fd;
@@ -2029,10 +2241,12 @@ fb_summary_build_file_for_segment(const FbSummarySegmentEntry *entry,
 		total_spans += state.relations[i].span_count;
 		total_touched_xids += state.relations[i].touched_xid_count;
 		total_unsafe_facts += state.relations[i].unsafe_fact_count;
+		total_block_anchors += state.relations[i].block_anchor_count;
 	}
 	state.file.relation_span_count = total_spans;
 	state.file.touched_xid_count = total_touched_xids;
 	state.file.unsafe_fact_count = total_unsafe_facts;
+	state.file.block_anchor_count = total_block_anchors;
 
 	if (state.relation_count > 0)
 		disk_relations = palloc0(sizeof(*disk_relations) * state.relation_count);
@@ -2042,6 +2256,8 @@ fb_summary_build_file_for_segment(const FbSummarySegmentEntry *entry,
 		disk_touched_xids = palloc0(sizeof(*disk_touched_xids) * total_touched_xids);
 	if (total_unsafe_facts > 0)
 		disk_unsafe_facts = palloc0(sizeof(*disk_unsafe_facts) * total_unsafe_facts);
+	if (total_block_anchors > 0)
+		disk_block_anchors = palloc0(sizeof(*disk_block_anchors) * total_block_anchors);
 
 	for (i = 0; i < state.relation_count; i++)
 	{
@@ -2057,6 +2273,7 @@ fb_summary_build_file_for_segment(const FbSummarySegmentEntry *entry,
 		dst->span_count = src->span_count;
 		dst->first_touched_xid = touched_xid_index;
 		dst->first_unsafe_fact = unsafe_fact_index;
+		dst->first_block_anchor = block_anchor_index;
 		dst->locator = src->locator;
 		dst->db_oid = src->db_oid;
 		dst->rel_oid = src->rel_oid;
@@ -2112,10 +2329,33 @@ fb_summary_build_file_for_segment(const FbSummarySegmentEntry *entry,
 			unique_unsafe++;
 		}
 		dst->unsafe_fact_count = unique_unsafe;
+
+		if (src->block_anchor_count > 1)
+			qsort(src->block_anchors,
+				  src->block_anchor_count,
+				  sizeof(*src->block_anchors),
+				  fb_summary_block_anchor_cmp);
+		for (j = 0; j < src->block_anchor_count; j++)
+		{
+			if (j > 0 &&
+				memcmp(&src->block_anchors[j - 1],
+					   &src->block_anchors[j],
+					   sizeof(*src->block_anchors)) == 0)
+				continue;
+
+			disk_block_anchors[block_anchor_index].slot = src->slot;
+			disk_block_anchors[block_anchor_index].flags = src->block_anchors[j].flags;
+			disk_block_anchors[block_anchor_index].blkno = src->block_anchors[j].blkno;
+			disk_block_anchors[block_anchor_index].anchor_lsn =
+				src->block_anchors[j].anchor_lsn;
+			block_anchor_index++;
+		}
+		dst->block_anchor_count = block_anchor_index - dst->first_block_anchor;
 	}
 
 	state.file.touched_xid_count = touched_xid_index;
 	state.file.unsafe_fact_count = unsafe_fact_index;
+	state.file.block_anchor_count = block_anchor_index;
 
 	outcome_count = (state.xid_outcomes == NULL) ? 0 : (uint32) hash_get_num_entries(state.xid_outcomes);
 	state.file.xid_outcome_count = outcome_count;
@@ -2182,6 +2422,18 @@ fb_summary_build_file_for_segment(const FbSummarySegmentEntry *entry,
 		state.file.sections[section_index].item_count = unsafe_fact_index;
 		section_index++;
 	}
+	if (block_anchor_index > 0)
+	{
+		state.file.sections[section_index].kind = FB_SUMMARY_SECTION_BLOCK_ANCHORS;
+		state.file.sections[section_index].offset =
+			(section_index == 0) ? sizeof(FbSummaryFileHeader) :
+			state.file.sections[section_index - 1].offset +
+			state.file.sections[section_index - 1].length;
+		state.file.sections[section_index].length =
+			sizeof(*disk_block_anchors) * block_anchor_index;
+		state.file.sections[section_index].item_count = block_anchor_index;
+		section_index++;
+	}
 	state.file.section_count = section_index;
 
 	initStringInfo(&buf);
@@ -2201,6 +2453,10 @@ fb_summary_build_file_for_segment(const FbSummarySegmentEntry *entry,
 		appendBinaryStringInfo(&buf,
 							   (char *) disk_unsafe_facts,
 							   sizeof(*disk_unsafe_facts) * unsafe_fact_index);
+	if (block_anchor_index > 0)
+		appendBinaryStringInfo(&buf,
+							   (char *) disk_block_anchors,
+							   sizeof(*disk_block_anchors) * block_anchor_index);
 
 	fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
 			  S_IRUSR | S_IWUSR);
@@ -2381,6 +2637,17 @@ fb_summary_cache_load_sections(FbSummaryQueryCache *cache,
 			read(fd, entry->unsafe_facts, sizeof(*entry->unsafe_facts) * count) !=
 			(ssize_t) (sizeof(*entry->unsafe_facts) * count))
 			elog(ERROR, "failed to load summary unsafe facts");
+	}
+
+	if (fb_summary_find_section(&entry->file, FB_SUMMARY_SECTION_BLOCK_ANCHORS,
+								&offset, &length, &count) &&
+		count > 0)
+	{
+		entry->block_anchors = MemoryContextAlloc(cache->mcxt, sizeof(*entry->block_anchors) * count);
+		if (lseek(fd, offset, SEEK_SET) < 0 ||
+			read(fd, entry->block_anchors, sizeof(*entry->block_anchors) * count) !=
+			(ssize_t) (sizeof(*entry->block_anchors) * count))
+			elog(ERROR, "failed to load summary block anchors");
 	}
 }
 
@@ -2872,6 +3139,100 @@ fb_summary_segment_lookup_unsafe_facts_cached(const char *path,
 	return true;
 }
 
+bool
+fb_summary_segment_lookup_block_anchors_cached(const char *path,
+												off_t bytes,
+												TimeLineID timeline_id,
+												XLogSegNo segno,
+												int wal_seg_size,
+												int source_kind,
+												const FbRelationInfo *info,
+												FbSummaryQueryCache *cache,
+												FbSummaryBlockAnchor **anchors_out,
+												uint32 *anchor_count_out)
+{
+	FbSummaryQueryCacheEntry *cache_entry = NULL;
+	FbSummaryBlockAnchor *anchors = NULL;
+	uint32 count = 0;
+	uint32 i;
+
+	if (anchors_out != NULL)
+		*anchors_out = NULL;
+	if (anchor_count_out != NULL)
+		*anchor_count_out = 0;
+	if (path == NULL || info == NULL)
+		return false;
+
+	if (cache != NULL)
+	{
+		if (!fb_summary_cache_get_or_load(path, bytes, timeline_id, segno,
+										  wal_seg_size, source_kind, cache, &cache_entry))
+			return false;
+	}
+	else
+	{
+		cache = fb_summary_query_cache_create(CurrentMemoryContext);
+		if (!fb_summary_cache_get_or_load(path, bytes, timeline_id, segno,
+										  wal_seg_size, source_kind, cache, &cache_entry))
+			return false;
+	}
+
+	if (cache_entry == NULL)
+		return false;
+	if (cache_entry->file.relation_entry_count == 0)
+		return true;
+	if (cache_entry->relations == NULL)
+		elog(ERROR, "summary relation entry section is missing");
+	if (cache_entry->block_anchors == NULL && cache_entry->file.block_anchor_count > 0)
+		elog(ERROR, "summary block anchor section is missing");
+
+	for (i = 0; i < cache_entry->file.relation_entry_count; i++)
+	{
+		FbSummaryDiskRelationEntry *entry = &cache_entry->relations[i];
+
+		if (!fb_summary_relation_entry_matches_info(entry, info))
+			continue;
+		count += entry->block_anchor_count;
+	}
+
+	if (count > 0)
+		anchors = palloc0(sizeof(*anchors) * count);
+
+	count = 0;
+	for (i = 0; i < cache_entry->file.relation_entry_count; i++)
+	{
+		FbSummaryDiskRelationEntry *entry = &cache_entry->relations[i];
+		uint32 j;
+
+		if (!fb_summary_relation_entry_matches_info(entry, info))
+			continue;
+
+		for (j = 0; j < entry->block_anchor_count; j++)
+		{
+			FbSummaryDiskBlockAnchor *src =
+				&cache_entry->block_anchors[entry->first_block_anchor + j];
+
+			anchors[count].locator = entry->locator;
+			anchors[count].forknum = MAIN_FORKNUM;
+			anchors[count].blkno = src->blkno;
+			anchors[count].anchor_lsn = src->anchor_lsn;
+			anchors[count].flags = src->flags;
+			count++;
+		}
+	}
+
+	if (count > 1)
+		qsort(anchors, count, sizeof(*anchors), fb_summary_block_anchor_public_cmp);
+
+	if (anchors_out != NULL)
+		*anchors_out = anchors;
+	else if (anchors != NULL)
+		pfree(anchors);
+	if (anchor_count_out != NULL)
+		*anchor_count_out = count;
+	return true;
+}
+
 int
 fb_summary_collect_build_candidates(FbSummaryBuildCandidate **candidates_out,
 									 bool skip_unstable_tail)
@@ -3113,6 +3474,61 @@ Datum
 fb_summary_build_available_debug(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT32(fb_summary_build_available_debug_impl());
+}
+
+Datum
+fb_summary_block_anchor_debug(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	FbRelationInfo info;
+	FbSummaryBuildCandidate *candidates = NULL;
+	FbSummaryQueryCache *cache = NULL;
+	uint32 total_anchors = 0;
+	int candidate_count;
+	int i;
+
+	fb_runtime_ensure_initialized();
+	fb_catalog_load_relation_info(relid, &info);
+
+	candidate_count = fb_summary_collect_build_candidates(&candidates, false);
+	cache = fb_summary_query_cache_create(CurrentMemoryContext);
+
+	PG_TRY();
+	{
+		for (i = 0; i < candidate_count; i++)
+		{
+			FbSummaryBlockAnchor *anchors = NULL;
+			uint32 anchor_count = 0;
+
+			if (!fb_summary_candidate_summary_exists(&candidates[i]))
+				continue;
+			if (!fb_summary_segment_lookup_block_anchors_cached(candidates[i].path,
+															   candidates[i].bytes,
+															   candidates[i].timeline_id,
+															   candidates[i].segno,
+															   candidates[i].wal_seg_size,
+															   candidates[i].source_kind,
+															   &info,
+															   cache,
+															   &anchors,
+															   &anchor_count))
+				continue;
+			total_anchors += anchor_count;
+			if (anchors != NULL)
+				pfree(anchors);
+		}
+
+		fb_summary_free_build_candidates(candidates);
+	}
+	PG_CATCH();
+	{
+		if (candidates != NULL)
+			fb_summary_free_build_candidates(candidates);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	PG_RETURN_INT32((int32) total_anchors);
 }
 
 Datum

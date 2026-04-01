@@ -40,25 +40,28 @@ WHERE id = 1;
 SELECT fb_progress_debug_set_clock(ARRAY[
 	0,
 	1000,
+	2000,
 	3000,
+	4000,
+	5000,
 	6000,
+	7000,
+	8000,
+	9000,
 	10000,
+	11000,
+	12000,
+	13000,
+	14000,
 	15000,
+	16000,
+	17000,
+	18000,
+	19000,
+	20000,
 	21000,
-	28000,
-	36000,
-	45000,
-	55000,
-	66000,
-	78000,
-	91000,
-	105000,
-	120000,
-	136000,
-	153000,
-	171000,
-	190000,
-	210000
+	22000,
+	23000
 ]::bigint[]);
  fb_progress_debug_set_clock 
 -----------------------------
@@ -72,25 +75,27 @@ FROM pg_flashback(
 )
 ORDER BY id;
 NOTICE:  [1/9] validating target relation and runtime (+1.000 ms)
-NOTICE:  [2/9] preparing wal scan context (+2.000 ms)
-NOTICE:  [3/9 0%] scanning wal and building record index (+3.000 ms)
-NOTICE:  [3/9 50%] scanning wal and building record index (+4.000 ms)
-NOTICE:  [3/9 100%] scanning wal and building record index (+5.000 ms)
-NOTICE:  [4/9 0%] replay discover round=1 (+6.000 ms)
-NOTICE:  [4/9 50%] replay discover round=1 (+7.000 ms)
-NOTICE:  [4/9 100%] replay discover round=1 (+8.000 ms)
-NOTICE:  [5/9 0%] replay warm (+9.000 ms)
-NOTICE:  [5/9 100%] replay warm (+10.000 ms)
-NOTICE:  [6/9 0%] replay final and build forward ops (+11.000 ms)
-NOTICE:  [6/9 50%] replay final and build forward ops (+12.000 ms)
-NOTICE:  [6/9 100%] replay final and build forward ops (+13.000 ms)
-NOTICE:  [7/9 0%] building reverse ops (+14.000 ms)
-NOTICE:  [7/9 100%] building reverse ops (+15.000 ms)
-NOTICE:  [8/9 0%] applying reverse ops (+16.000 ms)
-NOTICE:  [8/9 100%] applying reverse ops (+17.000 ms)
-NOTICE:  [9/9 0%] emitting residual historical rows (+18.000 ms)
-NOTICE:  [9/9 100%] emitting residual historical rows (+19.000 ms)
-NOTICE:  [done] total elapsed 210.000 ms
+NOTICE:  [2/9] preparing wal scan context (+1.000 ms)
+NOTICE:  [3/9 0%] scanning wal and building record index prefilter (+1.000 ms)
+NOTICE:  [3/9 10%] scanning wal and building record index summary-span (+1.000 ms)
+NOTICE:  [3/9 30%] scanning wal and building record index metadata (+1.000 ms)
+NOTICE:  [3/9 55%] scanning wal and building record index xact-status (+1.000 ms)
+NOTICE:  [3/9 70%] scanning wal and building record index payload (+1.000 ms)
+NOTICE:  [3/9 100%] scanning wal and building record index payload (+1.000 ms)
+NOTICE:  [4/9 0%] replay discover precomputed (+1.000 ms)
+NOTICE:  [4/9 100%] replay discover precomputed (+1.000 ms)
+NOTICE:  [5/9 0%] replay warm (+1.000 ms)
+NOTICE:  [5/9 100%] replay warm (+1.000 ms)
+NOTICE:  [6/9 0%] replay final and build forward ops (+1.000 ms)
+NOTICE:  [6/9 50%] replay final and build forward ops (+1.000 ms)
+NOTICE:  [6/9 100%] replay final and build forward ops (+1.000 ms)
+NOTICE:  [7/9 0%] building reverse ops (+1.000 ms)
+NOTICE:  [7/9 100%] building reverse ops (+1.000 ms)
+NOTICE:  [8/9 0%] applying reverse ops (+1.000 ms)
+NOTICE:  [8/9 100%] applying reverse ops (+1.000 ms)
+NOTICE:  [9/9 0%] emitting residual historical rows (+1.000 ms)
+NOTICE:  [9/9 100%] emitting residual historical rows (+1.000 ms)
+NOTICE:  [done] total elapsed 22.000 ms
  id |   note   
 ----+----------
   1 | baseline

@@ -64,11 +64,247 @@
   - `pg_flashback.parallel_workers` 默认值当前已调整为 `8`
 - 当前 `pg_flashback()` 进度显示固定为 9 段：
   - stage `9` 已改为 residual 历史行发射
+- 当前 `summary` 主线补充：
+  - 已拍板启动 `block-anchor summary v1`
+  - 首版目标不是全量 block span/row-image sidecar
+  - 首版只在 segment summary 中补充 relation-scoped block anchor facts：
+    - block 上最近可用 `FPI/INIT_PAGE` 锚点
+    - 优先服务 `4/9 replay discover` / `5/9 replay warm`
+  - 首版不承诺直接优化 `8/9 applying reverse ops`
+  - 首版保持现有 relation/xid summary section 与 WAL fallback 语义不变
+  - `pg_flashback_summary_progress` 还需补“最近一次实际查询是否发生 summary 降级”观测，避免把文件覆盖率 `100%` 误读成“最近查询必然走到 summary-first 索引”
 - 开发期调试约定补充：
   - 手工导出 / 保留 core dump、gdb 临时 core 文件时，统一使用 `/isoTest/tmp`
   - 不再使用 `/tmp` 作为本项目的临时 core 落盘路径
 
 ## 本轮完成
+
+- 已开始收敛 `sparse payload` 冷态随机读放大问题，并串行跟进新的 `missing FPI` 现场 bug：
+  - 背景：
+    - 当前 live case `scenario_oa_12t_50000r.documents @ '2026-03-31 22:40:13+08'`
+      虽已把 `payload_scanned_records` 从约 `1960万` 降到约 `180万`
+    - 但 `fb_recordref_debug()` 仍显示：
+      - `payload_windows=259687`
+      - `payload_covered_segments=718`
+      - `payload_scan_mode=sparse`
+    - 这说明当前瓶颈已从“decode 总量过大”收口为：
+      - 同一批 covered segments 被切成大量稀疏小 window
+      - `fb_wal_visit_sparse_windows()` 仍按 window 级别反复重置 reader / 关开 segment / 重新找记录起点
+      - 重启后的第一次查询因此出现明显冷态随机读放大
+    - 用户新增现场同时暴露：
+      - `documents @ '2026-04-01 23:15:13'`
+      - `4/9 replay discover precomputed`
+      - 报错 `missing FPI for block 216136`
+  - 当前拍板方向：
+    - 先做一轮不改 payload 语义的安全优化：
+      - 优先复用 sparse path 内同一 segment slice 的 reader / open file 状态
+      - 先减少 window 级重定位与随机读，不先扩大 payload decode 覆盖面
+    - 优化完成后立即复现并修正新的 `missing FPI` 现场问题
+  - 验证目标：
+    - 冷启动下 `3/9 payload` 明显下降
+    - `documents @ '2026-04-01 23:15:13'` 不再报 `missing FPI for block 216136`
+  - 当前状态：
+    - 正在执行
+
+- 已开始回收 `WAL payload dynamic bgworker/DSM` 路径：
+  - 背景：
+    - 当前代码仍在 `fb_wal_materialize_payload_parallel()` 顶部硬返回 `false`
+    - `fb_wal_parallel_payload` 现状也只断言“并行请求下仍显示 `payload_parallel_workers=0`”
+    - 用户现场已明确要求重新放开 payload 并行，不再接受长期停留在串行 fallback
+  - 本轮目标：
+    - 先把自动化回归改回“真实并行 worker 生效”口径
+    - 再重新启用 payload bgworker/DSM 主路径
+    - 最后用用户提供的 `documents @ '2026-03-31 22:40:13'` 现场 SQL 连跑复核
+  - 当前状态：
+    - 正在执行
+
+- 已拍板进入 `3/9` payload 的 `B` 档架构收敛：
+  - 背景：
+    - 当前 live case `documents @ '2026-04-01 01:40:13'` 在保守 narrowing 后，`3/9 payload` 已从约 `97s` 降到约 `16.403s`
+    - 但 `fb_recordref_debug()` 仍显示：
+      - `payload_scanned_records=19603174`
+      - `payload_kept_records=690785`
+      - 保留率仍只有约 `3.5%`
+    - 这说明剩余热点已不在 window 数量，而在 payload window 内部仍按顺序 decode 了大量无关 record
+  - 当前拍板方向：
+    - 不再继续单纯扩大/合并 payload windows
+    - 改为引入 `summary-span` 驱动的 sparse candidate-stream 读路径
+    - 对 summary 已提供的细粒度 relation spans，payload 侧尽量直接跳到 candidate span 起点，而不是把多个 span 重新并成粗窗口后顺扫整段
+    - 缺 summary 的 fallback segment 仍保留现有安全全扫语义
+  - 目标：
+    - 继续压低 `payload_scanned_records`
+    - 在不改 replay/apply 接口语义的前提下，把 `3/9` 的剩余主耗时从“粗窗口内无关 decode”转成“candidate span 命中式 decode”
+  - 当前实现结论：
+    - 直接吃 raw summary spans 的 sparse path 在 live case 上会把 replay 打坏：
+      - `payload_refs` 从安全口径 `690785` 漂到 `762265`
+      - `SELECT count(*) ...` 现场会报
+        `failed to replay heap insert`
+    - root cause 已收敛为：
+      - raw summary spans 自身仍需要先做一轮全局 overlap-normalize
+      - 不能直接把“原始 span 列表”当成最终 payload candidate stream
+    - 当前稳定版本改为：
+      - 先对 payload candidate spans 做一轮 `fb_merge_visit_windows()` 级别的 overlap merge
+      - 只消重叠/接壤，不做同 slice 激进扩窗
+      - 再把这层 merge-normalized spans 作为 sparse payload read path 的输入
+      - `fb_recordref_debug()` 额外暴露 `payload_scan_mode=sparse|windowed`
+  - 当前 live debug：
+    - `fb_recordref_debug('scenario_oa_12t_50000r.documents', '2026-04-01 01:40:13+08')`
+    - 当前返回：
+      - `payload_scan_mode=sparse`
+      - `payload_windows=259685`
+      - `payload_covered_segments=714`
+      - `payload_scanned_records=1808411`
+      - `payload_kept_records=690785`
+    - 与上一版安全 windowed 口径相比：
+      - `payload_refs` 保持回到 `690785`
+      - `payload_scanned_records` 从约 `19603174` 继续降到约 `1808411`
+  - 当前 live query：
+    - `SET pg_flashback.memory_limit='8GB'`
+    - `SELECT count(*) FROM pg_flashback(NULL::scenario_oa_12t_50000r.documents, '2026-04-01 01:40:13')`
+    - 当前返回：
+      - `count = 4356191`
+      - `3/9 metadata` 约 `1.337s`
+      - `3/9 xact-status` 约 `1.786s`
+      - `3/9 payload` 约 `17.262s`
+      - `NOTICE [done] total elapsed 48872.288 ms`
+      - shell 侧总耗时约 `49.12s`
+    - 相比用户现场最初看到的：
+      - `3/9 payload` 约 `73.198s`
+      - 当前已降到约 `17.262s`
+      - 且 replay/apply 主链保持正确返回，不再报 `failed to replay heap insert`
+
+- 已将 `3/9 build record index` 的用户观测收口到固定子相位：
+  - root cause：
+    - live case 上原先存在 `3/9 100%` 后到 `4/9 0%` 之间的长空白
+    - 结合 `fb_replay_debug()` 已确认：
+      - `4/9 replay discover` 在该类 case 上已是 precomputed/近空转
+      - 真正被隐藏的是 build-index 尾段工作，旧 `NOTICE` 会误导用户把热点看成 `4/9`
+  - 当前修复口径：
+    - 仍保持公开进度总段数固定为 `9`
+    - `3/9` 改为固定子相位发射：
+      - `prefilter`
+      - `summary-span`
+      - `metadata`
+      - `xact-status`
+      - `payload`
+    - `fb_progress` 当前会拒绝未进入该 stage 的越级 percent 更新，避免 prepare 阶段提前打出伪 `3/9 100%`
+  - 新增回归：
+    - `fb_progress` 当前会稳定断言新的 `3/9` 子相位流
+  - 当前验证：
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config PGPORT=5832 PGUSER=18pg installcheck REGRESS='fb_progress fb_recordref'`
+      当前结果：`All 2 tests passed.`
+
+- 已为 `fb_recordref_debug()` 增加 build-index payload work counters：
+  - 当前新增 debug 字段：
+    - `payload_covered_segments`
+    - `payload_scanned_records`
+    - `payload_kept_records`
+  - 当前口径：
+    - 与现有 `payload_windows` / `payload_parallel_workers` 一起输出
+    - 先服务回归与 live case 定位，不额外进入用户 SQL 视图
+  - 新增回归：
+    - `fb_recordref` 已断言 serial / parallel 调试字符串都包含上述 payload counters
+  - 当前验证：
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config PGPORT=5832 PGUSER=18pg installcheck REGRESS='fb_progress fb_recordref'`
+      当前结果：`All 2 tests passed.`
+
+- 已对 build-index payload phase 做一处最小 narrowing，并完成 live 复核：
+  - 当前测量结论：
+    - 原 live case `documents @ '2026-04-01 01:40:13'` 上，旧 build-index payload 主问题不是 payload refs 数量本身，而是 payload visit windows 过度碎片化
+    - 在新增 counters 后，旧口径现场显示：
+      - `payload_windows=259685`
+      - `payload_refs=690785`
+      - `3/9 70% -> 100% payload` 约 `97.270s`
+  - 本轮收口：
+    - 不再跨 segment 激进扩窗
+    - 仅把“已经落在同一 covered segment slice 内”的 payload windows 合并
+    - 同时修正 payload counters 生命周期，避免被 `fb_wal_finalize_record_stats()` 清零
+  - 当前 live debug：
+    - `fb_recordref_debug('scenario_oa_12t_50000r.documents', '2026-04-01 01:40:13+08')`
+    - 当前返回：
+      - `payload_windows=681`
+      - `payload_covered_segments=714`
+      - `payload_scanned_records=19603174`
+      - `payload_kept_records=690785`
+      - `elapsed=1:03.56`
+  - 当前 live query：
+    - `SET pg_flashback.memory_limit='8GB'`
+    - `SELECT count(*) FROM pg_flashback(NULL::scenario_oa_12t_50000r.documents, '2026-04-01 01:40:13')`
+    - 当前返回：
+      - `count = 4356191`
+      - `3/9 payload` 从约 `97.270s` 降到约 `16.403s`
+      - `NOTICE [done] total elapsed 130953.442 ms`
+      - shell 侧总耗时约 `2:11.24`
+  - 当前 bundle 验证：
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config PGPORT=5832 PGUSER=18pg installcheck REGRESS='fb_progress fb_recordref'`
+      结果：`All 2 tests passed.`
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config PGPORT=5832 PGUSER=18pg installcheck REGRESS='fb_summary_v3 fb_summary_overlap_toast fb_replay'`
+      结果：`All 3 tests passed.`
+
+- 已补 `pg_flashback_summary_progress` 的“最近查询 summary 降级”观测：
+  - root cause：
+    - 旧视图的 `progress_pct` 只代表 stable candidate 对应的 summary 文件是否齐全
+    - 这会把“summary 文件覆盖率 `100%`”与“最近一次 flashback 查询没有回退到原始 WAL 扫描”混为一谈
+    - live 复核也确认：即使 `progress_pct = 100`，查询侧慢点也可能来自别的阶段；因此用户需要单独看到“最近一次查询是否真的发生了 summary fallback”
+  - 当前修复口径：
+    - `fb_wal_build_record_index()` 结束时会上报最近一次查询的 summary fallback 结果到 summary service shared state
+    - `pg_flashback_summary_progress` 新增 4 列：
+      - `last_query_observed_at`
+      - `last_query_summary_ready`
+      - `last_query_summary_span_fallback_segments`
+      - `last_query_metadata_fallback_segments`
+    - 其中 `last_query_summary_ready=true` 表示最近一次 query-side build-index 没有发生 summary span / metadata fallback
+    - 因而用户现在可以区分：
+      - “summary 文件覆盖率是否完整”
+      - “最近一次实际查询有没有回退到原始 WAL 扫描”
+  - 当前验证：
+    - 回归 `fb_summary_service` 已新增：
+      - 删空 `meta/summary` 后跑一条真实 `pg_flashback(...)`
+      - 断言视图立刻显示：
+        - `last_query_summary_ready = false`
+        - `last_query_summary_span_fallback_segments > 0`
+        - `last_query_metadata_fallback_segments > 0`
+      - 重建 summary 后再次查询，断言上述字段恢复到 ready/0
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config PGPORT=5832 PGUSER=18pg installcheck REGRESS='fb_summary_service fb_replay'`
+      当前结果：`All 2 tests passed.`
+
+- 已将“缺 checkpoint anchor”失败从慢路径收口到 build-index 入口附近：
+  - root cause：
+    - 旧实现只有在 `3/9 build record index` 完成 metadata / fallback 扫描后，才统一检查 `ctx->anchor_found`
+    - 当 target 早于 retained WAL 可覆盖的最早 checkpoint 时，查询会先扫完整个大时间窗，最后才报
+      `WAL not complete: no checkpoint before target timestamp`
+  - 当前修复口径：
+    - 在 `prepare wal` 后立即做一次 lightweight anchor probe
+    - 该 probe 只为确认“retained WAL 内是否存在任何 checkpoint anchor”，不再等完整 metadata / payload 主扫描结束
+    - 最终缺锚点报错统一收口为：
+      - `WAL not complete: target timestamp predates earliest checkpoint in retained WAL`
+      - 或 `WAL not complete: retained WAL contains no checkpoint record`
+  - 当前现场复核：
+    - `scenario_oa_12t_50000r.documents @ '2026-03-31 08:10:13'`
+    - 原先需要约 `50s` 后才失败；当前表现为：
+      - `[1/9]`
+      - `[2/9]`
+      - `[3/9 100%] (+59.976 ms)`
+      - 随即报 `target timestamp predates earliest checkpoint in retained WAL`
+    - 当前错误详情同时带出：
+      - `target=2026-03-31 08:10:13+08`
+      - `earliest_checkpoint=2026-03-31 22:31:30+08`
+      - `first_retained_segment=00000001000000800000009F`
+  - 新增回归：
+    - `fb_wal_error_surface`
+    - 已通过 `make PG_CONFIG=/home/18pg/local/bin/pg_config PGPORT=5832 PGUSER=18pg REGRESS=fb_wal_error_surface installcheck`
+
+- 已收口 `fb WAL record spool session is not initialized` 的用户可读性：
+  - root cause：
+    - 旧实现直接把 `fb_index_ensure_record_log()` 内部的 spool/session 缺失文案抛给用户
+    - 该报错暴露的是扩展内部临时工作区状态，而不是 WAL 完整性或用户输入问题
+  - 当前修复口径：
+    - 用户可见报错改为：
+      - `pg_flashback internal error: temporary WAL workspace was not initialized for this query`
+    - 同时补充 detail / hint，明确这是 query 级临时工作区初始化异常，而不是用户 SQL 写法问题
+  - 新增回归：
+    - `fb_wal_error_surface` 内新增 `fb_recordref_missing_spool_debug(regclass, timestamptz)` 专项覆盖
+    - 当前已验证新文案稳定输出
 
 - 已修复“连续删掉较早一段 WAL 后，prepare 阶段仍因更早 prefix gap 直接报 `missing segment`”的问题：
   - root cause：
@@ -180,7 +416,126 @@
   - 当前 live 验证：
     - `fb_wal_parallel_payload` 回归已通过
     - `scenario_oa_12t_50000r.documents @ '2026-03-29 14:10:13'` 默认 `memory_limit=1GB` 下当前返回真实 preflight 报错，不再 crash
-    - 将 `pg_flashback.memory_limit='8GB'` 后，同一条查询已返回 `count = 4356409`
+
+## 进行中
+
+- 已完成 `block-anchor summary v1` 首版接线：
+  - root cause：
+    - 现有 `summary v3` 已能压缩 `3/9 build record index` 的 segment/range/xid 工作
+    - 但 `4/9 replay discover` 的缺页锚点解析仍主要依赖 `record_log` 反向扫
+    - summary 当前天然产出的是 `LSN` 级事实，而 replay backtrack gate 仍以 query-local `record_index` 为主
+  - 当前实现口径：
+    - `summary-*.meta` 已新增 relation-scoped block anchor section
+    - summary build 已记录主表/TOAST relation 的 `FPI/INIT_PAGE` block anchor facts
+    - 查询侧已优先用 block anchor summary 解析 missing-block 的最近可用 anchor
+    - replay backtrack gate 已从 `record_index` 收敛到 `anchor_lsn`
+    - `warm` pass 已按最早 `anchor_lsn` 定位回放起点
+    - 现有 relation/xid summary section、summary cache 与 WAL fallback 语义保持兼容
+  - 新增调试/回归口径：
+    - 回归 `fb_replay` 已改为显式构建 summary，并校验 block-anchor section 可读且 flashback 结果正确
+    - 新增 regression-only helper `fb_summary_block_anchor_debug(regclass)` 用于核对 summary 中是否存在目标 relation 的 block anchors
+  - 本轮验证：
+    - 手工 `sql/fb_replay.sql`：通过
+    - `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_replay fb_summary_v3 fb_recordref'`：`All 3 tests passed.`
+
+## 下一步
+
+- 已完成 `replay discover` 静态 missing-block 预计算：
+  - 当前实现：
+    - 在 `fb_wal_finalize_record_stats()` 里顺序扫描 `RecordRef`
+    - 按 block 做 lightweight initialized/no-op/missing 模拟
+    - 预先生成 `precomputed_missing_blocks`
+  - 当前 replay 口径：
+    - 若 `precomputed_missing_blocks = 0`，则 `4/9` 不再跑 page-level discover round
+    - `5/9 replay warm` 也随之直接快跳
+    - 只有真正缺页基线的 block 才继续走 `anchor resolve + warm`
+  - 当前回归：
+    - `fb_replay` 已新增 `fb_replay_debug()` 断言：
+      - `precomputed_missing_blocks=0`
+      - `discover_rounds=0`
+    - `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_replay fb_summary_v3 fb_recordref'`
+      当前结果：`All 3 tests passed.`
+  - 当前 live 验证：
+    - 旧用户时间点 `2026-04-01 08:10:13/09:10:13/10:10:13/11:10:13 +08` 现已超出 retained WAL，无法继续原样复跑
+    - 在同一张 `scenario_oa_12t_50000r.documents` 上复测近端有效时间窗：
+      - `fb_replay_debug(..., '2026-04-01 17:07:22+08')`
+      - `fb_replay_debug(..., '2026-04-01 17:11:14+08')`
+      - `fb_replay_debug(..., '2026-04-01 17:13:14+08')`
+      - 三次都返回：
+        - `precomputed_missing_blocks=0`
+        - `discover_rounds=0`
+        - `discover_skipped=1`
+    - 同表实际查询：
+      - `SELECT count(*) FROM pg_flashback(NULL::scenario_oa_12t_50000r.documents, '2026-04-01 17:13:14+08')`
+      - 当前阶段表现为：
+        - `[4/9 0%] replay discover precomputed`
+        - `[4/9 100%] ... (+0.073 ms)`
+        - `[5/9 0%] replay warm (+0.022 ms)`
+        - `[5/9 100%] ... (+0.022 ms)`
+      - 证明 `4/9` / `5/9` 在原表 live case 上已被压到零头
+- 在 live case 上继续验证 `block-anchor summary v1` 对 `4/9 replay discover` / `5/9 replay warm` 的真实收益
+- 评估是否继续扩展到 block span-driven replay 窄化
+- 保持 `summary` 缺失/损坏时继续安全回退到旧 WAL 路径
+
+## 进行中
+
+- 已完成 `scenario_oa_12t_50000r.documents @ '2026-04-01 08:10:13'` 现场
+  `ERROR: failed to replay heap insert` 的复核与止血
+  - 当前复核结论：
+    - 最新 build 安装并重启 PG18 后，同一条 live query 已不再复现该错误
+    - `SET pg_flashback.memory_limit='8GB'` 后：
+      - `SELECT count(*) FROM pg_flashback(NULL::scenario_oa_12t_50000r.documents, '2026-04-01 08:10:13')`
+      - 当前返回 `4356191`
+    - `SET pg_flashback.memory_limit='1GB'` 后，同一条 SQL 当前只会命中真实 preflight：
+      - `ERROR: estimated flashback working set exceeds pg_flashback.memory_limit`
+      - `estimated=5097596604 bytes`
+      - `limit=1073741824 bytes (1 GB)`
+  - 当前定位结论：
+    - 旧现场失败块为 TOAST relation `1663/33398/16395804 blk 213310`
+    - 原报错点为 `lsn=81/71035B40 off=27 maxoff=20`
+    - 但补查 record spool 后，已确认同块关键 WAL 记录均已进入索引：
+      - `INSERT off 21/22` at `81/70829D68` / `81/70829E88`
+      - `INSERT off 23/24` at `81/70905EE0` / `81/70906018`
+      - `INSERT off 25/26` at `81/70A32D68` / `81/70A32EC0`
+      - `DELETE off 21/22` at `81/70BFCAD8` / `81/70BFCB10`
+      - `INSERT off 27/28` at `81/71035B40` / `81/71035C60`
+    - 追加 replay trace 也已确认该页在最新 build 上按顺序推进到：
+      - `off 21 -> maxoff 21`
+      - `off 22 -> maxoff 22`
+      - `off 23 -> maxoff 23`
+      - `off 24 -> maxoff 24`
+      - `off 25 -> maxoff 25`
+      - `off 26 -> maxoff 26`
+      - delete `21/22` 后保持 `maxoff 26`
+      - `off 27 -> maxoff 27`
+      - `off 28 -> maxoff 28`
+    - 因此当前可以确认：
+      - 这条旧错误不是 record spool 漏收该段 WAL
+      - 在最新安装态下，该 live case 已不再卡在 heap insert replay
+  - 当前后续口径：
+    - 该用户 case 现阶段已从 replay blocker 转为正常资源约束问题
+    - 若继续追根因，应针对“旧 build / 旧 backend 安装态下为何出现一次性脏现场”单独做版本/部署侧复盘，而不是继续按当前代码逻辑缺陷处理
+  - 本轮内核调试新增结论：
+    - 已对 `summary -> payload window -> replay` 做对照实验，确认 `failed to replay heap insert` 不是 `fb_replay_heap_insert()` 原语本身的缺陷
+    - live case 的 raw summary spans 确实天然乱序；临时 trace 直接打出了同一查询中的大量逆序样本，例如：
+      - `prev=80/C7FB7FC0 curr=80/C714B588`
+      - `prev=80/C8F85B68 curr=80/C8026FA0`
+    - 在临时禁用：
+      - summary span 全局 merge
+      - payload window 全局 merge
+      - `payload_emit_floor` 单调推进
+      后，同一条 live SQL 会重新退化为 replay correctness 错误：
+      - `ERROR: failed to locate tuple for heap delete redo`
+      - `lsn=80/CC0CB580 rel=1663/33398/16395804 blk=18225 off=21`
+    - 这说明当前 correctness 真正依赖的是：
+      - summary-derived visit windows 必须先全局排序/merge
+      - payload materialize 还必须保留 `emit_floor` 去重/单调推进
+    - 因而原先 `blk 213310 @ 81/71035B40 off=27 maxoff=20` 的 `failed to replay heap insert`
+      应归因于“payload 输入序列出现非单调/重叠导致的页状态落后”，而不是 heap insert redo 自身坏掉
+    - 当前代码里这条根因已经由：
+      - summary/payload window 全局 merge
+      - `payload_emit_start_lsn` 单调推进
+      两层修复共同兜住
 
 - 已修复两处 `pg_flashback()` 查询面 correctness / stability 问题：
   - `FbApplyScan` 已改为把 apply 内部结果 copy 到 `ss_ScanTupleSlot` 后再返回
@@ -302,6 +657,31 @@
     - 查询完成返回 `1001`
     - `recovered_wal` 保持为空，没有再生成 `7C/45..89`
 
+- 已完成 `recovered_wal` 语义继续收紧：
+  - 用户要求彻底删除“archive exact-hit 也复制到 `recovered_wal`”这条路径
+  - 最终口径：
+    - archive 有目标 segment 时，resolver 直接消费 archive
+    - `recovered_wal` 只复用“已按真实 segname 物化好的恢复段”
+    - 只有 `pg_wal` 已被覆盖/错配，且 archive 中不存在对应真实 segment 或 archive 未开启时，才允许把 WAL 物化到 `recovered_wal`
+    - archive 中即使存在错名文件，也不再通过 `fb_ckwal_restore_segment()` 物化到 `recovered_wal`
+  - 代码收口：
+    - `src/fb_ckwal.c` 新增“只找错名 `pg_wal`”的 helper
+    - `fb_ckwal_restore_segment()` 不再扫描 archive 做 exact-hit copy，也不再从 archive 错名文件恢复
+    - `fb_ckwal_convert_mismatched_segment()` 保留为“resolver 已确认错配 `pg_wal`”时的显式真实名物化入口
+  - 自动化验证：
+    - `fb_recovered_wal_policy`
+      - archive exact-hit + 错名 `pg_wal` 时，`recovered_wal` 保持为空
+      - archive 错名文件时，`recovered_wal` 保持为空
+      - archive 缺失且仅有错名 `pg_wal` 时，按真实 segname 生成一份 `recovered_wal`
+    - `fb_wal_source_policy`
+    - `fb_wal_prefix_suffix`
+    - `fb_wal_error_surface`
+  - 本轮验证命令：
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config PGPORT=5832 PGUSER=18pg installcheck REGRESS=fb_recovered_wal_policy`
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config PGPORT=5832 PGUSER=18pg installcheck REGRESS="fb_wal_source_policy fb_wal_prefix_suffix fb_wal_error_surface"`
+  - 本轮验证结果：
+    - 以上 4 条回归全部通过
+
 - 已完成 summary 服务 recent-first 调度与进度可观测面：
   - launcher / worker 调度已从“隐含倒序入队”收口为显式冷热双队列
   - worker 当前固定为：
@@ -403,6 +783,15 @@
     - 压掉全量 summary xid scan
     - 压掉 metadata 串行 WAL 主循环中的可由 summary 直接回答的工作
     - 同时保持 `meta/summary` 继续走紧凑低存储口径，并保留原有 WAL fallback
+  - `2026-04-01` 当前新增收敛目标：
+    - live case 上 `3/9 100% -> 4/9 0%` 之间仍有明显空白，已确认这段时间不应再归因给 `4/9 replay discover`
+    - 当前要先把 `3/9` 拆成固定子相位：
+      - `prefilter`
+      - `summary-span`
+      - `metadata`
+      - `xact-status`
+      - `payload`
+    - 再继续收窄 build-index 尾段 payload work，避免用户被旧进度面误导
 
 - runtime 自动清理口径已重新拍板：
   - 恢复“查询结束触发的 runtime 安全 sweep”
@@ -474,11 +863,30 @@
     - query-local summary section cache
     - 紧凑 unsafe facts section
     - metadata summary-first + uncovered-window WAL fallback
+  - 并行补 `3/9` 观测面收口：
+    - `NOTICE` 直接显示 build-index 当前卡在哪个子相位
+    - 不新增第 `10` 段，也不做 `count(*)` 特化
+    - 先用回归和 debug counter 把 payload 尾段工作量直接暴露出来
+  - 基于新 payload counters 继续做真实 work narrowing：
+    - 目标是压掉对 replay/final 无贡献的 payload decode/materialize
+    - 不是只停留在 `NOTICE` 观测修正
+  - 当前 live case 上，payload 尾段已经明显收下来了；后续主热点已转向：
+    - `6/9 replay final`
+    - `8/9 applying reverse ops`
+    - 以及 `3/9 metadata/xact-status` 的剩余串行 work
   - 完成后清空并重建 `meta/summary`，复跑 live case 与回归
   - 再继续压 `3/9` 后半段 payload/materialize
   - 继续推进 metadata 并行第二版实现
     - leader 共享 resolved segment snapshot，去掉 worker 侧重复 resolver/prepare
     - worker 本地 spool，leader 按 window/LSN 顺序 merge
+  - 当前 safety bundle 复核补充：
+    - `fb_summary_overlap_toast`
+    - `fb_replay`
+    - 当前均通过
+    - `fb_summary_v3` 仍有一条既有断言漂移：
+      - `uses_summary_unsafe_facts` 当前返回 `false`
+      - 旧 expected 仍写成 `true`
+    - 该差异落在现有 summary/unsafe facts 主线，不由本轮 `3/9 NOTICE + debug counter` 改动引入
 
 - 本轮已完成 keyed range fast path 扩展：
   - planner/apply 当前支持单列稳定 keyed 的：

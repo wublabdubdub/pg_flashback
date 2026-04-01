@@ -43,7 +43,11 @@ RETURNS TABLE (
 	first_gap_from_oldest_ts timestamptz,
 	completed_segments bigint,
 	missing_segments bigint,
-	progress_pct double precision
+	progress_pct double precision,
+	last_query_observed_at timestamptz,
+	last_query_summary_ready boolean,
+	last_query_summary_span_fallback_segments bigint,
+	last_query_metadata_fallback_segments bigint
 )
 AS 'MODULE_PATHNAME', 'fb_summary_progress_internal'
 LANGUAGE C;
@@ -102,7 +106,7 @@ COMMENT ON FUNCTION pg_flashback(anyelement, text) IS
 'Return flashback rows directly for NULL::schema.table and target timestamp text, without result-table materialization or AS t(...).';
 
 COMMENT ON VIEW pg_flashback_summary_progress IS
-'Show user-facing summary coverage progress, including stable-window frontiers and first-gap coordinates.';
+'Show user-facing summary coverage progress plus the latest query-side summary fallback status.';
 
 COMMENT ON VIEW pg_flashback_summary_service_debug IS
 'Show internal summary service state such as launcher, workers, queue counters, and summary storage stats.';

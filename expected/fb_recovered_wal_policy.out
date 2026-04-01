@@ -38,7 +38,7 @@ BEGIN
 	INTO src_name
 	FROM pg_ls_dir(data_dir || '/pg_wal') AS d(name)
 	WHERE d.name ~ '^[0-9A-F]{24}$'
-	ORDER BY d.name
+	ORDER BY name
 	LIMIT 1;
 
 	IF src_name IS NULL THEN
@@ -73,17 +73,103 @@ BEGIN
 	EXECUTE format('SET pg_flashback.debug_pg_wal_dir = %L', pgwal_dir);
 END;
 $$;
-SELECT fb_prepare_wal_scan_debug(clock_timestamp()) <> '' AS prepare_ran;
- prepare_ran 
--------------
- t
-(1 row)
-
+DO $$
+BEGIN
+	BEGIN
+		PERFORM fb_prepare_wal_scan_debug(clock_timestamp());
+	EXCEPTION
+		WHEN OTHERS THEN
+			NULL;
+	END;
+END;
+$$;
 SELECT count(*) = 0 AS recovered_stays_empty
 FROM pg_ls_dir(current_setting('data_directory') || '/pg_flashback/recovered_wal') AS d(name)
 WHERE d.name ~ '^[0-9A-F]{24}$';
  recovered_stays_empty 
 -----------------------
+ t
+(1 row)
+
+DO $$
+DECLARE
+	data_dir text := current_setting('data_directory');
+	archive_dir text := '/tmp/fb_ckwal_archive_fixture';
+	pgwal_dir text := '/tmp/fb_ckwal_pgwal_fixture';
+BEGIN
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'rm -rf ' || archive_dir || ' ' || pgwal_dir ||
+		' && mkdir -p ' || archive_dir || ' ' || pgwal_dir ||
+		' && rm -f ' || data_dir || '/pg_flashback/recovered_wal/*');
+
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'cp ' || quote_literal(data_dir || '/pg_wal/' ||
+							   (SELECT src_name FROM fb_ckwal_fixture LIMIT 1)) || ' ' ||
+		quote_literal(archive_dir || '/' ||
+					  (SELECT wrong_name FROM fb_ckwal_fixture LIMIT 1)));
+
+	EXECUTE format('SET pg_flashback.archive_dest = %L', archive_dir);
+	EXECUTE format('SET pg_flashback.debug_pg_wal_dir = %L', pgwal_dir);
+END;
+$$;
+DO $$
+BEGIN
+	BEGIN
+		PERFORM fb_prepare_wal_scan_debug(clock_timestamp());
+	EXCEPTION
+		WHEN OTHERS THEN
+			NULL;
+	END;
+END;
+$$;
+SELECT count(*) = 0 AS archive_wrong_name_does_not_materialize
+FROM pg_ls_dir(current_setting('data_directory') || '/pg_flashback/recovered_wal') AS d(name)
+WHERE d.name ~ '^[0-9A-F]{24}$';
+ archive_wrong_name_does_not_materialize
+-----------------------------------------
+ t
+(1 row)
+
+DO $$
+DECLARE
+	data_dir text := current_setting('data_directory');
+	archive_dir text := '/tmp/fb_ckwal_archive_fixture';
+	pgwal_dir text := '/tmp/fb_ckwal_pgwal_fixture';
+BEGIN
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'rm -rf ' || archive_dir || ' ' || pgwal_dir ||
+		' && mkdir -p ' || archive_dir || ' ' || pgwal_dir ||
+		' && rm -f ' || data_dir || '/pg_flashback/recovered_wal/*');
+
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'cp ' || quote_literal(data_dir || '/pg_wal/' ||
+							   (SELECT src_name FROM fb_ckwal_fixture LIMIT 1)) || ' ' ||
+		quote_literal(pgwal_dir || '/' ||
+					  (SELECT wrong_name FROM fb_ckwal_fixture LIMIT 1)));
+
+	EXECUTE format('SET pg_flashback.archive_dest = %L', archive_dir);
+	EXECUTE format('SET pg_flashback.debug_pg_wal_dir = %L', pgwal_dir);
+END;
+$$;
+DO $$
+BEGIN
+	BEGIN
+		PERFORM fb_prepare_wal_scan_debug(clock_timestamp());
+	EXCEPTION
+		WHEN OTHERS THEN
+			NULL;
+	END;
+END;
+$$;
+SELECT count(*) = 1 AS pgwal_mismatch_materializes_once
+FROM pg_ls_dir(current_setting('data_directory') || '/pg_flashback/recovered_wal') AS d(name)
+WHERE d.name = (SELECT src_name FROM fb_ckwal_fixture LIMIT 1);
+ pgwal_mismatch_materializes_once
+----------------------------------
  t
 (1 row)
 

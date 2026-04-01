@@ -34,6 +34,9 @@ DROP TABLE IF EXISTS fb_wal_parallel_payload_noise;
 DROP TABLE IF EXISTS fb_wal_parallel_payload_mark;
 DROP TABLE IF EXISTS fb_wal_parallel_payload_dense;
 DROP TABLE IF EXISTS fb_wal_parallel_payload_dense_mark;
+DROP TABLE IF EXISTS fb_wal_parallel_payload_sparse;
+DROP TABLE IF EXISTS fb_wal_parallel_payload_sparse_noise;
+DROP TABLE IF EXISTS fb_wal_parallel_payload_sparse_mark;
 
 CREATE TABLE fb_wal_parallel_payload_target (
 	id integer PRIMARY KEY,
@@ -47,6 +50,16 @@ CREATE TABLE fb_wal_parallel_payload_noise (
 
 CREATE TABLE fb_wal_parallel_payload_dense (
 	id integer PRIMARY KEY,
+	payload text
+);
+
+CREATE TABLE fb_wal_parallel_payload_sparse (
+	id integer PRIMARY KEY,
+	payload text
+);
+
+CREATE TABLE fb_wal_parallel_payload_sparse_noise (
+	id bigserial PRIMARY KEY,
 	payload text
 );
 
@@ -128,7 +141,8 @@ SELECT :'serial_summary' LIKE '%parallel=off%' AS serial_parallel_off,
 SELECT :'parallel_summary' LIKE '%parallel=on%' AS parallel_parallel_on,
 	   :'parallel_summary' LIKE '%prefilter=on%' AS parallel_prefilter_on,
 	   :'parallel_summary' LIKE '%payload_windows=%' AS parallel_payload_windows,
-	   :'parallel_summary' LIKE '%payload_parallel_workers=0%' AS parallel_payload_workers_zero;
+	   substring(:'parallel_summary' FROM 'payload_parallel_workers=([0-9]+)')::int > 0
+	   AS parallel_payload_workers_enabled;
 
 CREATE TEMP TABLE fb_wal_parallel_payload_serial_result AS
 SELECT *
@@ -198,5 +212,49 @@ SELECT fb_recordref_debug(
 
 SELECT substring(:'dense_parallel_summary' FROM 'payload_windows=([0-9]+)')::int > 1
 	   AS dense_payload_windows_split,
-	   :'dense_parallel_summary' LIKE '%payload_parallel_workers=0%'
-	   AS dense_payload_workers_zero;
+	   substring(:'dense_parallel_summary' FROM 'payload_parallel_workers=([0-9]+)')::int > 0
+	   AS dense_payload_workers_enabled;
+
+CHECKPOINT;
+
+INSERT INTO fb_wal_parallel_payload_sparse VALUES (0, repeat('s', 400));
+
+CREATE TABLE fb_wal_parallel_payload_sparse_mark (
+	target_ts timestamptz NOT NULL
+);
+
+INSERT INTO fb_wal_parallel_payload_sparse_mark VALUES (clock_timestamp());
+
+DO $$
+BEGIN
+	PERFORM pg_sleep(1.1);
+END;
+$$;
+
+DO $$
+DECLARE
+	i integer;
+BEGIN
+	FOR i IN 1..96 LOOP
+		UPDATE fb_wal_parallel_payload_sparse
+		SET payload = repeat(md5(i::text), 4)
+		WHERE id = 0;
+		INSERT INTO fb_wal_parallel_payload_sparse_noise(payload)
+		VALUES (repeat(md5((i + 100000)::text), 3));
+	END LOOP;
+END;
+$$;
+
+SET pg_flashback.parallel_workers = 4;
+
+SELECT fb_recordref_debug(
+	'fb_wal_parallel_payload_sparse'::regclass,
+	(SELECT target_ts FROM fb_wal_parallel_payload_sparse_mark)
+) AS sparse_parallel_summary
+\gset
+
+SELECT :'sparse_parallel_summary' LIKE '%payload_scan_mode=sparse%'
+	   AS sparse_payload_scan_mode,
+	   substring(:'sparse_parallel_summary'
+				 FROM 'payload_sparse_reader_reuses=([0-9]+)')::bigint > 0
+	   AS sparse_payload_reader_reuses;

@@ -27,6 +27,12 @@ typedef struct FbReplayResult
 	uint64 target_update_count;
 	uint64 tracked_bytes;
 	uint64 memory_limit_bytes;
+	uint32 precomputed_missing_blocks;
+	uint32 discover_rounds;
+	uint32 discover_skipped;
+	uint32 summary_anchor_hits;
+	uint32 summary_anchor_fallback;
+	uint32 summary_anchor_segments_read;
 } FbReplayResult;
 
 typedef struct FbReplayDiscoverState FbReplayDiscoverState;

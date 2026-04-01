@@ -133,12 +133,14 @@ resolver 会检查：
 
 ## 七、`fb_ckwal` 当前到底做什么
 
-当前内嵌 `fb_ckwal` 不是外部恢复工具壳子，只做最小闭环：
+当前内嵌 `fb_ckwal` 不是外部恢复工具壳子，只做最小闭环。
 
-1. 在 archive / `pg_wal` / `recovered_wal` 中查找需要的 segment
-2. 若文件名和真实内容一致，直接复制到 `recovered_wal`
-3. 若文件名和真实内容不一致，但页头可读，则按真实 segno 重命名物化
-4. 若三处都没有可信段，则失败
+当前收紧后的目标口径：
+
+1. archive 有目标 segment 时，resolver 直接消费 archive，不再复制到 `recovered_wal`
+2. `recovered_wal` 只复用“历史上已经恢复好的真实 segname 文件”
+3. 只有 `pg_wal` 文件名与真实内容不一致、但页头可读，且 archive 无法提供对应真实 segment 时，才按真实 segno 物化到 `recovered_wal`
+4. archive、`pg_wal` 修复路径、`recovered_wal` 复用都不可用时，失败
 
 它当前不做：
 

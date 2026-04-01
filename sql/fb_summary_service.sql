@@ -95,7 +95,7 @@ SELECT to_regclass('pg_flashback_summary_progress') IS NOT NULL
 	   to_regclass('pg_flashback_summary_service_debug') IS NOT NULL
 	   AS has_debug_progress_view;
 
-SELECT count(*) = 15 AS sane_user_columns
+SELECT count(*) = 19 AS sane_user_columns
 FROM information_schema.columns
 WHERE table_schema = 'public'
   AND table_name = 'pg_flashback_summary_progress';
@@ -224,6 +224,84 @@ SELECT missing_segments = 1 AS tracks_deleted_wal_gap,
 	   first_gap_from_oldest_segno = (SELECT segno FROM fb_summary_gap_fixture ORDER BY segno OFFSET 1 LIMIT 1)
 	   AS oldest_gap_matches_deleted,
 	   progress_pct < 100.0 AS progress_pct_drops
+FROM pg_flashback_summary_progress;
+
+DROP TABLE IF EXISTS fb_summary_query_status_target;
+DROP TABLE IF EXISTS fb_summary_query_status_mark;
+
+CREATE TABLE fb_summary_query_status_target (
+	id integer PRIMARY KEY,
+	payload text
+);
+
+CHECKPOINT;
+
+INSERT INTO fb_summary_query_status_target VALUES (0, 'seed');
+
+CREATE TABLE fb_summary_query_status_mark (
+	target_ts timestamptz NOT NULL
+);
+
+INSERT INTO fb_summary_query_status_mark VALUES (clock_timestamp());
+
+INSERT INTO fb_summary_query_status_target VALUES (1, 'alpha');
+UPDATE fb_summary_query_status_target
+SET payload = 'alpha-updated'
+WHERE id = 1;
+DELETE FROM fb_summary_query_status_target
+WHERE id = 0;
+
+DO $$
+BEGIN
+	PERFORM pg_switch_wal();
+	PERFORM pg_switch_wal();
+END;
+$$;
+
+DO $$
+BEGIN
+	EXECUTE format('SET pg_flashback.archive_dest = %L', current_setting('data_directory') || '/pg_wal');
+	EXECUTE format('SET pg_flashback.debug_pg_wal_dir = %L', current_setting('data_directory') || '/pg_wal');
+END;
+$$;
+
+SELECT fb_summary_build_available_debug() > 0 AS built_query_status_summary;
+
+DO $$
+DECLARE
+	data_dir text := current_setting('data_directory');
+BEGIN
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'rm -f ' || quote_literal(data_dir || '/pg_flashback/meta/summary/*'));
+END;
+$$;
+
+SET pg_flashback.show_progress = off;
+
+SELECT count(*) = 1 AS query_after_summary_rm_returns_rows
+FROM pg_flashback(
+	NULL::public.fb_summary_query_status_target,
+	(SELECT target_ts::text FROM fb_summary_query_status_mark)
+);
+
+SELECT last_query_observed_at IS NOT NULL AS query_status_records_timestamp,
+	   last_query_summary_ready = false AS query_status_reports_degraded,
+	   last_query_summary_span_fallback_segments > 0 AS query_status_tracks_span_fallback,
+	   last_query_metadata_fallback_segments > 0 AS query_status_tracks_metadata_fallback
+FROM pg_flashback_summary_progress;
+
+SELECT fb_summary_build_available_debug() > 0 AS rebuilt_query_status_summary;
+
+SELECT count(*) = 1 AS query_after_summary_rebuild_returns_rows
+FROM pg_flashback(
+	NULL::public.fb_summary_query_status_target,
+	(SELECT target_ts::text FROM fb_summary_query_status_mark)
+);
+
+SELECT last_query_summary_ready = true AS query_status_recovers_ready,
+	   coalesce(last_query_summary_span_fallback_segments, -1) = 0 AS query_status_clears_span_fallback,
+	   coalesce(last_query_metadata_fallback_segments, -1) = 0 AS query_status_clears_metadata_fallback
 FROM pg_flashback_summary_progress;
 
 SELECT pending_hot + pending_cold + running_hot + running_cold <= queue_capacity

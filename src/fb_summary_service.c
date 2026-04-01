@@ -89,6 +89,9 @@ typedef struct FbSummaryServiceShared
 	uint64 build_count;
 	uint64 cleanup_count;
 	TimestampTz last_scan_at;
+	TimestampTz last_query_observed_at;
+	uint32 last_query_summary_span_fallback_segments;
+	uint32 last_query_metadata_fallback_segments;
 	FbSummaryServiceTask tasks[FLEXIBLE_ARRAY_MEMBER];
 } FbSummaryServiceShared;
 
@@ -152,6 +155,10 @@ typedef struct FbSummaryServiceProgressStats
 	TimestampTz first_gap_from_oldest_ts;
 	uint32 summary_files;
 	uint64 summary_bytes;
+	TimestampTz last_query_observed_at;
+	bool last_query_summary_ready;
+	uint32 last_query_summary_span_fallback_segments;
+	uint32 last_query_metadata_fallback_segments;
 } FbSummaryServiceProgressStats;
 
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -204,6 +211,25 @@ static bool fb_summary_service_hash_in_list(const uint64 *hashes,
 static void fb_summary_service_collect_protected_hashes(uint64 **hashes_out,
 														 int *count_out,
 														 bool include_snapshot);
+
+void
+fb_summary_service_report_query_summary_usage(TimestampTz observed_at,
+												   uint32 summary_span_fallback_segments,
+												   uint32 metadata_fallback_segments)
+{
+	if (!fb_summary_service_enabled() ||
+		fb_summary_service == NULL ||
+		fb_summary_service_lock == NULL)
+		return;
+
+	LWLockAcquire(fb_summary_service_lock, LW_EXCLUSIVE);
+	fb_summary_service->last_query_observed_at = observed_at;
+	fb_summary_service->last_query_summary_span_fallback_segments =
+		summary_span_fallback_segments;
+	fb_summary_service->last_query_metadata_fallback_segments =
+		metadata_fallback_segments;
+	LWLockRelease(fb_summary_service_lock);
+}
 
 void
 fb_summary_service_shmem_init(void)
@@ -775,8 +801,13 @@ fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats)
 			stats->scan_count = fb_summary_service->scan_count;
 			stats->enqueue_count = fb_summary_service->enqueue_count;
 			stats->build_count = fb_summary_service->build_count;
-		stats->cleanup_count = fb_summary_service->cleanup_count;
-		stats->last_scan_at = fb_summary_service->last_scan_at;
+			stats->cleanup_count = fb_summary_service->cleanup_count;
+			stats->last_scan_at = fb_summary_service->last_scan_at;
+			stats->last_query_observed_at = fb_summary_service->last_query_observed_at;
+			stats->last_query_summary_span_fallback_segments =
+				fb_summary_service->last_query_summary_span_fallback_segments;
+			stats->last_query_metadata_fallback_segments =
+				fb_summary_service->last_query_metadata_fallback_segments;
 		for (i = 0; i < lengthof(fb_summary_service->worker_pids); i++)
 		{
 			if (fb_summary_service->worker_pids[i] != 0)
@@ -816,6 +847,10 @@ fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats)
 		}
 		LWLockRelease(fb_summary_service_lock);
 	}
+	stats->last_query_summary_ready =
+		(stats->last_query_observed_at != 0 &&
+		 stats->last_query_summary_span_fallback_segments == 0 &&
+		 stats->last_query_metadata_fallback_segments == 0);
 
 	candidate_count = fb_summary_collect_build_candidates(&candidates, false);
 	use_snapshot_filter = snapshot_valid;
@@ -1171,8 +1206,8 @@ fb_summary_progress_internal(PG_FUNCTION_ARGS)
 	FbSummaryServiceProgressStats stats;
 	TupleDesc tupdesc;
 	HeapTuple tuple;
-	Datum values[15];
-	bool nulls[15];
+	Datum values[19];
+	bool nulls[19];
 	double progress_pct;
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -1238,6 +1273,22 @@ fb_summary_progress_internal(PG_FUNCTION_ARGS)
 	values[12] = Int64GetDatum((int64) stats.completed_summaries);
 	values[13] = Int64GetDatum((int64) stats.missing_summaries);
 	values[14] = Float8GetDatum(progress_pct);
+	if (stats.last_query_observed_at == 0)
+		nulls[15] = true;
+	else
+		values[15] = TimestampTzGetDatum(stats.last_query_observed_at);
+	if (stats.last_query_observed_at == 0)
+		nulls[16] = true;
+	else
+		values[16] = BoolGetDatum(stats.last_query_summary_ready);
+	if (stats.last_query_observed_at == 0)
+		nulls[17] = true;
+	else
+		values[17] = Int64GetDatum((int64) stats.last_query_summary_span_fallback_segments);
+	if (stats.last_query_observed_at == 0)
+		nulls[18] = true;
+	else
+		values[18] = Int64GetDatum((int64) stats.last_query_metadata_fallback_segments);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));

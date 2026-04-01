@@ -6,7 +6,6 @@ BEGIN
 END;
 $$;
 CREATE EXTENSION pg_flashback;
-
 DO $$
 BEGIN
 	EXECUTE format('SET pg_flashback.archive_dir = %L', current_setting('data_directory') || '/pg_wal');
@@ -14,7 +13,6 @@ END;
 $$;
 SET pg_flashback.parallel_workers = 0;
 SET pg_flashback.show_progress = off;
-
 DO $$
 BEGIN
 	IF to_regprocedure('fb_summary_build_available_debug()') IS NOT NULL THEN
@@ -28,55 +26,53 @@ BEGIN
 	END IF;
 END;
 $$;
-
 CREATE FUNCTION fb_summary_build_available_debug()
 RETURNS integer
 AS '$libdir/pg_flashback', 'fb_summary_build_available_debug'
 LANGUAGE C;
-
 CREATE FUNCTION fb_summary_block_anchor_debug(regclass)
 RETURNS integer
 AS '$libdir/pg_flashback', 'fb_summary_block_anchor_debug'
 LANGUAGE C;
-
 CREATE FUNCTION fb_replay_debug(regclass, timestamptz)
 RETURNS text
 AS '$libdir/pg_flashback', 'fb_replay_debug'
 LANGUAGE C;
-
 DROP TABLE IF EXISTS fb_replay_target;
+NOTICE:  table "fb_replay_target" does not exist, skipping
 DROP TABLE IF EXISTS fb_replay_mark;
-
+NOTICE:  table "fb_replay_mark" does not exist, skipping
 CREATE TABLE fb_replay_target (
 	id integer PRIMARY KEY,
 	payload text
 );
-
 CHECKPOINT;
-
 INSERT INTO fb_replay_target VALUES (0, 'seed');
-
 CREATE TABLE fb_replay_mark (
 	target_ts timestamptz NOT NULL
 );
-
 INSERT INTO fb_replay_mark VALUES (clock_timestamp());
-
 INSERT INTO fb_replay_target VALUES (1, 'alpha');
 UPDATE fb_replay_target SET payload = 'alpha-updated' WHERE id = 1;
 DELETE FROM fb_replay_target WHERE id = 0;
-
 DO $$
 BEGIN
 	PERFORM pg_switch_wal();
 	PERFORM pg_switch_wal();
 END;
 $$;
-
 SELECT fb_summary_build_available_debug() > 0 AS built_summary;
+ built_summary 
+---------------
+ t
+(1 row)
 
 SELECT fb_summary_block_anchor_debug('fb_replay_target'::regclass) > 0
 	   AS block_anchor_summary_present;
+ block_anchor_summary_present 
+------------------------------
+ t
+(1 row)
 
 SELECT substring(
 		   fb_replay_debug(
@@ -92,6 +88,10 @@ SELECT substring(
 		   )
 		   FROM 'discover_rounds=([0-9]+)')::int = 0
 	   AS skips_discover_rounds;
+ avoids_precomputed_missing_blocks | skips_discover_rounds 
+-----------------------------------+-----------------------
+ t                                 | t
+(1 row)
 
 SELECT *
 FROM pg_flashback(
@@ -99,3 +99,8 @@ FROM pg_flashback(
 	(SELECT target_ts::text FROM fb_replay_mark)
 )
 ORDER BY id;
+ id | payload 
+----+---------
+  0 | seed
+(1 row)
+

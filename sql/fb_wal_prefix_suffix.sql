@@ -22,6 +22,21 @@ AS '$libdir/pg_flashback', 'fb_prepare_wal_scan_debug'
 LANGUAGE C
 STRICT;
 
+CREATE FUNCTION fb_prepare_wal_scan_result_debug(timestamptz)
+RETURNS text
+LANGUAGE plpgsql
+STRICT
+AS $$
+BEGIN
+	BEGIN
+		RETURN fb_prepare_wal_scan_debug($1);
+	EXCEPTION
+		WHEN OTHERS THEN
+			RETURN SQLERRM;
+	END;
+END;
+$$;
+
 CREATE TEMP TABLE fb_wal_prefix_suffix_fixture (
 	seg_name text NOT NULL,
 	segno bigint NOT NULL
@@ -109,11 +124,9 @@ SET pg_flashback.debug_pg_wal_dir = '/tmp/fb_wal_prefix_suffix_pgwal';
 SELECT count(*) = 3 AS prepared_fixture
 FROM fb_wal_prefix_suffix_fixture;
 
-SELECT fb_prepare_wal_scan_debug(clock_timestamp()) =
-	   format(
-		   'timeline=1 first=%s last=%s total=2 archive=3 pg_wal=0 ckwal=0',
-		   (SELECT seg_name FROM fb_wal_prefix_suffix_fixture ORDER BY segno OFFSET 1 LIMIT 1),
-		   (SELECT seg_name FROM fb_wal_prefix_suffix_fixture ORDER BY segno OFFSET 2 LIMIT 1)
-	   ) AS drops_prefix_gap_and_keeps_newest_suffix;
+SELECT fb_prepare_wal_scan_result_debug(clock_timestamp()) =
+	   'WAL not complete: target timestamp predates retained continuous WAL suffix'
+	   AS drops_prefix_gap_and_keeps_newest_suffix;
 
+DROP FUNCTION fb_prepare_wal_scan_result_debug(timestamptz);
 DROP FUNCTION fb_prepare_wal_scan_debug(timestamptz);

@@ -287,8 +287,14 @@ fb_progress_update_percent(FbProgressStage stage, uint32 percent, const char *de
 
 	if (!fb_progress_ctx.active || !def->percent)
 		return;
+	if (fb_progress_ctx.current_stage != stage)
+		return;
 
-	bucket = fb_progress_bucket_percent(percent);
+	if (stage == FB_PROGRESS_STAGE_BUILD_INDEX &&
+		detail != NULL && detail[0] != '\0')
+		bucket = Min(percent, 100U);
+	else
+		bucket = fb_progress_bucket_percent(percent);
 	if ((int) bucket <= fb_progress_ctx.last_percent)
 		return;
 
