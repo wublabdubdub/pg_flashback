@@ -577,8 +577,8 @@ static void fb_wal_reset_record_stats(FbWalRecordIndex *index);
 static void fb_wal_finalize_record_stats(FbWalRecordIndex *index);
 static HTAB *fb_wal_create_precomputed_missing_block_hash(void);
 static HTAB *fb_wal_create_block_init_state_hash(void);
-static bool fb_wal_record_block_materializes_page(const FbRecordRef *record,
-												  int block_index);
+bool fb_wal_record_block_materializes_page(const FbRecordRef *record,
+										   int block_index);
 static bool fb_wal_record_block_requires_initialized_page(const FbRecordRef *record,
 														  int block_index);
 static void fb_wal_note_precomputed_missing_blocks(FbWalRecordIndex *index,
@@ -652,14 +652,6 @@ static bool fb_try_ckwal_segment(FbWalScanContext *ctx,
 								 int wal_seg_size,
 								 FbWalSegmentEntry *entry);
 /*
- * fb_convert_mismatched_pg_wal_entry
- *    WAL helper.
- */
-
-static bool fb_convert_mismatched_pg_wal_entry(FbWalScanContext *ctx,
-												   FbWalSegmentEntry *entry,
-												   FbWalSegmentEntry *converted);
-/*
  * fb_record_is_speculative_insert
  *    WAL helper.
  */
@@ -671,6 +663,23 @@ static bool fb_record_is_speculative_insert(const FbRecordRef *record);
  */
 
 static bool fb_record_is_super_delete(const FbRecordRef *record);
+static char *fb_copy_bytes(const char *data, Size len);
+static void fb_record_release_temp(FbRecordRef *record);
+static void fb_fill_record_block_ref(FbRecordBlockRef *block_ref,
+									 XLogReaderState *reader,
+									 uint8 block_id,
+									 const FbRelationInfo *info,
+									 FbWalRecordIndex *index);
+static bool fb_heap_record_matches_target(XLogReaderState *reader,
+										  const FbRelationInfo *info);
+static bool fb_wal_build_heap_record_ref(XLogReaderState *reader,
+										 const FbRelationInfo *info,
+										 FbWalRecordKind kind,
+										 FbRecordRef *record_out);
+static bool fb_wal_build_xlog_fpi_record_ref(XLogReaderState *reader,
+											 const FbRelationInfo *info,
+											 FbWalRecordKind kind,
+											 FbRecordRef *record_out);
 /*
  * fb_segment_start_lsn
  *    WAL helper.
@@ -3224,58 +3233,6 @@ fb_try_ckwal_segment(FbWalScanContext *ctx,
 }
 
 /*
- * fb_convert_mismatched_pg_wal_entry
- *    WAL helper.
- */
-
-static bool
-fb_convert_mismatched_pg_wal_entry(FbWalScanContext *ctx,
-								   FbWalSegmentEntry *entry,
-								   FbWalSegmentEntry *converted)
-{
-	TimeLineID actual_tli;
-	XLogSegNo actual_segno;
-	char recovered_path[MAXPGPATH];
-	char fname[MAXPGPATH];
-	struct stat st;
-
-	if (ctx == NULL || entry == NULL || converted == NULL)
-		elog(ERROR, "ckwal conversion inputs must not be NULL");
-
-	if ((FbWalSourceKind) entry->source_kind != FB_WAL_SOURCE_PG_WAL ||
-		!entry->mismatch)
-		return false;
-
-	MemSet(converted, 0, sizeof(*converted));
-	if (!fb_ckwal_convert_mismatched_segment(entry->path,
-											 ctx->wal_seg_size,
-											 &actual_tli,
-											 &actual_segno,
-											 recovered_path,
-											 sizeof(recovered_path)))
-		return false;
-
-	if (stat(recovered_path, &st) != 0)
-		return false;
-
-	XLogFileName(fname, actual_tli, actual_segno, ctx->wal_seg_size);
-	strlcpy(converted->name, fname, sizeof(converted->name));
-	strlcpy(converted->path, recovered_path, sizeof(converted->path));
-	converted->timeline_id = actual_tli;
-	converted->segno = actual_segno;
-	converted->bytes = st.st_size;
-	converted->partial = (st.st_size < ctx->wal_seg_size);
-	converted->valid = true;
-	converted->mismatch = false;
-	converted->ignored = false;
-	converted->source_kind = (int) FB_WAL_SOURCE_CKWAL;
-	ctx->ckwal_invoked = true;
-
-	entry->ignored = true;
-	return true;
-}
-
-/*
  * fb_collect_archive_segments
  *    WAL helper.
  */
@@ -3284,6 +3241,7 @@ static void
 fb_collect_archive_segments(FbWalScanContext *ctx)
 {
 	FbWalSegmentEntry *candidates = NULL;
+	FbWalSegmentEntry *direct = NULL;
 	FbWalSegmentEntry *selected = NULL;
 	pthread_t workers[FB_WAL_PARALLEL_MAX_WORKERS];
 	bool worker_started[FB_WAL_PARALLEL_MAX_WORKERS];
@@ -3295,16 +3253,20 @@ fb_collect_archive_segments(FbWalScanContext *ctx)
 	int *validate_indexes = NULL;
 	int candidate_count = 0;
 	int candidate_capacity = 0;
+	int direct_count = 0;
+	int direct_capacity = 0;
 	int selected_count = 0;
 	int selected_capacity = 0;
 	int highest_tli = 0;
 	int validate_count = 0;
 	int worker_count = 1;
 	int chunk_size = 1;
-	int suffix_start_index = 0;
+	int direct_index = 0;
 	int i;
 	XLogRecPtr last_segment_start;
 	off_t last_segment_bytes;
+	XLogSegNo highest_segno = 0;
+	FbWalSegmentEntry *highest_invalid_pg_entry = NULL;
 
 	archive_dir = fb_resolve_archive_dir(&archive_source, &archive_setting_name);
 	ctx->using_archive_dest = archive_source != FB_ARCHIVE_DIR_SOURCE_LEGACY_DIR;
@@ -3414,39 +3376,6 @@ fb_collect_archive_segments(FbWalScanContext *ctx)
 		}
 	}
 
-	for (i = 0; i < candidate_count; i++)
-	{
-		FbWalSegmentEntry converted_entry;
-		TimeLineID actual_tli;
-		XLogSegNo actual_segno;
-
-		if (candidates[i].timeline_id != ctx->timeline_id)
-			continue;
-		if ((FbWalSourceKind) candidates[i].source_kind != FB_WAL_SOURCE_PG_WAL ||
-			candidates[i].valid || !candidates[i].mismatch)
-			continue;
-		if (!fb_read_segment_identity_path(candidates[i].path,
-										   &actual_tli,
-										   &actual_segno,
-										   ctx->wal_seg_size))
-			continue;
-		if (fb_segment_candidate_exists(candidates,
-										candidate_count,
-										actual_tli,
-										actual_segno,
-										&candidates[i]))
-		{
-			candidates[i].ignored = true;
-			continue;
-		}
-
-		if (fb_convert_mismatched_pg_wal_entry(ctx, &candidates[i],
-											   &converted_entry))
-			fb_append_segment_candidate(&candidates, &candidate_count,
-										&candidate_capacity,
-										&converted_entry);
-	}
-
 	qsort(candidates, candidate_count, sizeof(FbWalSegmentEntry), fb_segment_name_cmp);
 
 	for (i = 0; i < candidate_count; )
@@ -3457,7 +3386,6 @@ fb_collect_archive_segments(FbWalScanContext *ctx)
 		FbWalSegmentEntry *ckwal_entry = NULL;
 		FbWalSegmentEntry *invalid_pg_entry = NULL;
 		FbWalSegmentEntry *chosen;
-		FbWalSegmentEntry recovered_entry;
 		int j;
 
 		if (candidates[i].timeline_id != ctx->timeline_id || candidates[i].ignored)
@@ -3487,36 +3415,83 @@ fb_collect_archive_segments(FbWalScanContext *ctx)
 				archive_entry = &candidates[j];
 		}
 
+		if (invalid_pg_entry != NULL &&
+			(highest_invalid_pg_entry == NULL ||
+			 segno > highest_invalid_pg_entry->segno))
+			highest_invalid_pg_entry = invalid_pg_entry;
+
 		if (archive_entry != NULL)
 			chosen = archive_entry;
 		else if (ckwal_entry != NULL)
 			chosen = ckwal_entry;
 		else if (pg_entry != NULL)
 			chosen = pg_entry;
-		else if (invalid_pg_entry != NULL &&
-				 fb_try_ckwal_segment(ctx, ctx->timeline_id, segno,
-									 ctx->wal_seg_size, &recovered_entry))
-			chosen = &recovered_entry;
-				else if (invalid_pg_entry != NULL)
-					ereport(ERROR,
-							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-							 errmsg("WAL not complete: pg_wal contains recycled or mismatched segments and internal recovery could not reconstruct a usable segment"),
-							 errdetail("segment=%s source=%s",
-									   invalid_pg_entry->name,
-									   invalid_pg_entry->path)));
 		else
 			chosen = NULL;
 
-		if (chosen == NULL)
+		if (chosen != NULL)
+		{
+			if (segno > highest_segno)
+				highest_segno = segno;
+			fb_append_segment_candidate(&direct, &direct_count, &direct_capacity,
+										chosen);
+		}
+
+		i = j;
+	}
+
+	if (highest_segno == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("no WAL segments remain on selected timeline %u", ctx->timeline_id)));
+
+	direct_index = direct_count - 1;
+	while (true)
+	{
+		FbWalSegmentEntry *chosen = NULL;
+		FbWalSegmentEntry recovered_entry;
+
+		while (direct_index >= 0 && direct[direct_index].segno > highest_segno)
+			direct_index--;
+
+		if (direct_index >= 0 && direct[direct_index].segno == highest_segno)
+			chosen = &direct[direct_index--];
+		else if (fb_try_ckwal_segment(ctx, ctx->timeline_id, highest_segno,
+									  ctx->wal_seg_size, &recovered_entry))
+			chosen = &recovered_entry;
+		else if (selected_count == 0 && highest_invalid_pg_entry != NULL &&
+				 highest_invalid_pg_entry->segno == highest_segno)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("WAL not complete: pg_wal contains recycled or mismatched segments and internal recovery could not reconstruct a usable segment"),
+					 errdetail("segment=%s source=%s",
+							   highest_invalid_pg_entry->name,
+							   highest_invalid_pg_entry->path)));
+		else if (selected_count == 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("WAL not complete: could not resolve segment for segno %llu",
-							(unsigned long long) segno)));
+							(unsigned long long) highest_segno)));
+		else
+		{
+			ctx->retained_suffix_only = true;
+			if (direct_index >= 0)
+				strlcpy(ctx->retained_gap_left_segment,
+						direct[direct_index].name,
+						sizeof(ctx->retained_gap_left_segment));
+			if (selected_count > 0)
+				strlcpy(ctx->retained_gap_right_segment,
+						selected[selected_count - 1].name,
+						sizeof(ctx->retained_gap_right_segment));
+			break;
+		}
 
 		fb_append_selected_segment(&selected, &selected_count, &selected_capacity,
 								   chosen, ctx);
 
-		i = j;
+		if (highest_segno == 0)
+			break;
+		highest_segno--;
 	}
 
 	if (selected_count == 0)
@@ -3524,54 +3499,12 @@ fb_collect_archive_segments(FbWalScanContext *ctx)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("no WAL segments remain on selected timeline %u", ctx->timeline_id)));
 
-	for (i = 1; i < selected_count; i++)
+	for (i = 0; i < selected_count / 2; i++)
 	{
-		XLogSegNo expected_segno = selected[i - 1].segno + 1;
-		bool prefix_gap = false;
+		FbWalSegmentEntry tmp = selected[i];
 
-		while (expected_segno < selected[i].segno)
-		{
-			FbWalSegmentEntry recovered_entry;
-
-			if (!fb_try_ckwal_segment(ctx, ctx->timeline_id, expected_segno,
-									  ctx->wal_seg_size, &recovered_entry))
-			{
-				/*
-				 * A gap before the newest contiguous suffix is acceptable. Query
-				 * correctness only needs WAL completeness from the retained
-				 * target-era suffix forward to query_now. Keep scanning so later
-				 * gaps can move the suffix start further right.
-				 */
-				suffix_start_index = i;
-				prefix_gap = true;
-				strlcpy(ctx->retained_gap_left_segment,
-						selected[i - 1].name,
-						sizeof(ctx->retained_gap_left_segment));
-				strlcpy(ctx->retained_gap_right_segment,
-						selected[i].name,
-						sizeof(ctx->retained_gap_right_segment));
-				break;
-			}
-
-			fb_append_selected_segment(&selected, &selected_count, &selected_capacity,
-									   &recovered_entry, ctx);
-			memmove(&selected[i + 1], &selected[i],
-					sizeof(FbWalSegmentEntry) * (selected_count - i - 1));
-			selected[i] = recovered_entry;
-			expected_segno++;
-			i++;
-		}
-
-		if (prefix_gap)
-			continue;
-	}
-
-	if (suffix_start_index > 0)
-	{
-		ctx->retained_suffix_only = true;
-		selected_count -= suffix_start_index;
-		memmove(selected, &selected[suffix_start_index],
-				sizeof(FbWalSegmentEntry) * selected_count);
+		selected[i] = selected[selected_count - i - 1];
+		selected[selected_count - i - 1] = tmp;
 	}
 
 	strlcpy(ctx->first_segment, selected[0].name, sizeof(ctx->first_segment));
@@ -3597,6 +3530,8 @@ fb_collect_archive_segments(FbWalScanContext *ctx)
 
 	if (candidates != NULL)
 		pfree(candidates);
+	if (direct != NULL)
+		pfree(direct);
 	if (validate_indexes != NULL)
 		pfree(validate_indexes);
 	if (pg_wal_dir != NULL)
@@ -4182,6 +4117,217 @@ fb_wal_record_load(const FbWalRecordIndex *index,
 	return ok;
 }
 
+static bool
+fb_wal_build_heap_record_ref(XLogReaderState *reader,
+							 const FbRelationInfo *info,
+							 FbWalRecordKind kind,
+							 FbRecordRef *record_out)
+{
+	int block_count = 0;
+	int block_id;
+
+	if (reader == NULL || info == NULL || record_out == NULL)
+		return false;
+
+	MemSet(record_out, 0, sizeof(*record_out));
+	record_out->kind = kind;
+	record_out->lsn = reader->ReadRecPtr;
+	record_out->end_lsn = reader->EndRecPtr;
+	record_out->xid = fb_record_xid(reader);
+	record_out->info = XLogRecGetInfo(reader);
+	record_out->init_page = ((XLogRecGetInfo(reader) & XLOG_HEAP_INIT_PAGE) != 0);
+	record_out->main_data = fb_copy_bytes(XLogRecGetData(reader),
+										  XLogRecGetDataLen(reader));
+	record_out->main_data_len = XLogRecGetDataLen(reader);
+
+	for (block_id = 0;
+		 block_id <= FB_XLOGREC_MAX_BLOCK_ID(reader) &&
+		 block_count < FB_WAL_MAX_BLOCK_REFS;
+		 block_id++)
+	{
+		RelFileLocator locator;
+		ForkNumber forknum;
+		BlockNumber blkno;
+
+		if (!fb_xlogrec_get_block_tag(reader, block_id, &locator, &forknum, &blkno))
+			continue;
+		if (forknum != MAIN_FORKNUM)
+			continue;
+		if (!fb_locator_matches_relation(&locator, info))
+			continue;
+
+		fb_fill_record_block_ref(&record_out->blocks[block_count],
+								 reader,
+								 block_id,
+								 info,
+								 NULL);
+		block_count++;
+	}
+
+	record_out->block_count = block_count;
+	return block_count > 0;
+}
+
+static bool
+fb_wal_build_xlog_fpi_record_ref(XLogReaderState *reader,
+								 const FbRelationInfo *info,
+								 FbWalRecordKind kind,
+								 FbRecordRef *record_out)
+{
+	int block_count = 0;
+	int block_id;
+
+	if (reader == NULL || info == NULL || record_out == NULL)
+		return false;
+
+	MemSet(record_out, 0, sizeof(*record_out));
+	record_out->kind = kind;
+	record_out->lsn = reader->ReadRecPtr;
+	record_out->end_lsn = reader->EndRecPtr;
+	record_out->xid = InvalidTransactionId;
+	record_out->info = XLogRecGetInfo(reader);
+	record_out->init_page = false;
+
+	for (block_id = 0;
+		 block_id <= FB_XLOGREC_MAX_BLOCK_ID(reader) &&
+		 block_count < FB_WAL_MAX_BLOCK_REFS;
+		 block_id++)
+	{
+		RelFileLocator locator;
+		ForkNumber forknum;
+		BlockNumber blkno;
+
+		if (!fb_xlogrec_get_block_tag(reader, block_id, &locator, &forknum, &blkno))
+			continue;
+		if (forknum != MAIN_FORKNUM)
+			continue;
+		if (!fb_locator_matches_relation(&locator, info))
+			continue;
+
+		fb_fill_record_block_ref(&record_out->blocks[block_count],
+								 reader,
+								 block_id,
+								 info,
+								 NULL);
+		block_count++;
+	}
+
+	record_out->block_count = block_count;
+	return block_count > 0;
+}
+
+bool
+fb_wal_decode_record_ref(XLogReaderState *reader,
+						   const FbRelationInfo *info,
+						   FbRecordRef *record_out)
+{
+	uint8 rmid;
+
+	if (reader == NULL || info == NULL || record_out == NULL)
+		return false;
+
+	rmid = XLogRecGetRmid(reader);
+
+	if (rmid == RM_HEAP_ID)
+	{
+		uint8 info_code = XLogRecGetInfo(reader) & XLOG_HEAP_OPMASK;
+
+		if (!fb_heap_record_matches_target(reader, info))
+			return false;
+
+		switch (info_code)
+		{
+			case XLOG_HEAP_INSERT:
+				return fb_wal_build_heap_record_ref(reader, info,
+													 FB_WAL_RECORD_HEAP_INSERT,
+													 record_out);
+			case XLOG_HEAP_DELETE:
+				return fb_wal_build_heap_record_ref(reader, info,
+													 FB_WAL_RECORD_HEAP_DELETE,
+													 record_out);
+			case XLOG_HEAP_UPDATE:
+				return fb_wal_build_heap_record_ref(reader, info,
+													 FB_WAL_RECORD_HEAP_UPDATE,
+													 record_out);
+			case XLOG_HEAP_HOT_UPDATE:
+				return fb_wal_build_heap_record_ref(reader, info,
+													 FB_WAL_RECORD_HEAP_HOT_UPDATE,
+													 record_out);
+			case XLOG_HEAP_CONFIRM:
+				return fb_wal_build_heap_record_ref(reader, info,
+													 FB_WAL_RECORD_HEAP_CONFIRM,
+													 record_out);
+			case XLOG_HEAP_LOCK:
+				return fb_wal_build_heap_record_ref(reader, info,
+													 FB_WAL_RECORD_HEAP_LOCK,
+													 record_out);
+			case XLOG_HEAP_INPLACE:
+				return fb_wal_build_heap_record_ref(reader, info,
+													 FB_WAL_RECORD_HEAP_INPLACE,
+													 record_out);
+			default:
+				return false;
+		}
+	}
+	else if (rmid == RM_HEAP2_ID)
+	{
+		uint8 info_code = XLogRecGetInfo(reader) & XLOG_HEAP_OPMASK;
+
+		if (
+#if PG_VERSION_NUM >= 170000
+			(info_code == XLOG_HEAP2_PRUNE_ON_ACCESS ||
+			 info_code == XLOG_HEAP2_PRUNE_VACUUM_SCAN ||
+			 info_code == XLOG_HEAP2_PRUNE_VACUUM_CLEANUP) &&
+#elif PG_VERSION_NUM >= 140000
+			info_code == XLOG_HEAP2_PRUNE &&
+#else
+			info_code == XLOG_HEAP2_CLEAN &&
+#endif
+			fb_record_touches_relation(reader, info))
+			return fb_wal_build_heap_record_ref(reader, info,
+												 FB_WAL_RECORD_HEAP2_PRUNE,
+												 record_out);
+		if (info_code == XLOG_HEAP2_VISIBLE &&
+			fb_record_touches_relation(reader, info))
+			return fb_wal_build_heap_record_ref(reader, info,
+												 FB_WAL_RECORD_HEAP2_VISIBLE,
+												 record_out);
+		if (info_code == XLOG_HEAP2_MULTI_INSERT &&
+			fb_record_touches_relation(reader, info))
+			return fb_wal_build_heap_record_ref(reader, info,
+												 FB_WAL_RECORD_HEAP2_MULTI_INSERT,
+												 record_out);
+		if (info_code == XLOG_HEAP2_LOCK_UPDATED &&
+			fb_record_touches_relation(reader, info))
+			return fb_wal_build_heap_record_ref(reader, info,
+												 FB_WAL_RECORD_HEAP2_LOCK_UPDATED,
+												 record_out);
+		return false;
+	}
+	else if (rmid == RM_XLOG_ID)
+	{
+		uint8 info_code = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+
+		if ((info_code == XLOG_FPI || info_code == XLOG_FPI_FOR_HINT) &&
+			fb_record_touches_relation(reader, info))
+			return fb_wal_build_xlog_fpi_record_ref(reader,
+													  info,
+													  info_code == XLOG_FPI ?
+													  FB_WAL_RECORD_XLOG_FPI :
+													  FB_WAL_RECORD_XLOG_FPI_FOR_HINT,
+													  record_out);
+		return false;
+	}
+
+	return false;
+}
+
+void
+fb_wal_release_record(FbRecordRef *record)
+{
+	fb_record_release_temp(record);
+}
+
 static void
 fb_wal_reset_record_stats(FbWalRecordIndex *index)
 {
@@ -4235,7 +4381,7 @@ fb_wal_create_block_init_state_hash(void)
 					   HASH_ELEM | HASH_BLOBS);
 }
 
-static bool
+bool
 fb_wal_record_block_materializes_page(const FbRecordRef *record, int block_index)
 {
 	const FbRecordBlockRef *block_ref;
@@ -4248,7 +4394,7 @@ fb_wal_record_block_materializes_page(const FbRecordRef *record, int block_index
 	block_ref = &record->blocks[block_index];
 	if (!block_ref->in_use)
 		return false;
-	if (block_ref->has_image)
+	if (fb_record_block_has_applicable_image(block_ref))
 		return true;
 
 	switch (record->kind)
@@ -7170,6 +7316,7 @@ fb_wal_visit_records(FbWalScanContext *ctx, FbWalRecordVisitor visitor, void *ar
 
 void
 fb_wal_visit_resolved_records(const FbWalRecordIndex *index,
+							 XLogRecPtr start_lsn,
 							 XLogRecPtr end_lsn,
 							 FbWalRecordVisitor visitor,
 							 void *arg)
@@ -7188,9 +7335,10 @@ fb_wal_visit_resolved_records(const FbWalRecordIndex *index,
 	ctx.resolved_segments = (void *) index->resolved_segments;
 	ctx.resolved_segment_count = index->resolved_segment_count;
 	ctx.current_segment_may_hit = true;
-	ctx.start_lsn = InvalidXLogRecPtr;
-	XLogSegNoOffsetToRecPtr(index->resolved_segments[0].segno, 0,
-							index->wal_seg_size, ctx.start_lsn);
+	ctx.start_lsn = start_lsn;
+	if (XLogRecPtrIsInvalid(ctx.start_lsn))
+		XLogSegNoOffsetToRecPtr(index->resolved_segments[0].segno, 0,
+								index->wal_seg_size, ctx.start_lsn);
 	if (XLogRecPtrIsInvalid(end_lsn))
 	{
 		XLogSegNoOffsetToRecPtr(index->resolved_segments[index->resolved_segment_count - 1].segno,

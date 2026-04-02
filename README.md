@@ -1,19 +1,16 @@
 # pg_flashback
 
-`pg_flashback` 是一个 PostgreSQL 历史查询与原表闪回扩展，用于查询业务表过去某个时间点的结果集，或直接把 keyed 原表回退到目标时间点。
+`pg_flashback` 是一个 PostgreSQL 历史查询扩展，用于查询业务表过去某个时间点的结果集。
 
 它面向的典型场景是：
 
 - 排查误更新、误删除后的历史状态
 - 对账、审计、取证
-- 在不恢复整库的前提下查看历史结果或回退单表
+- 在不恢复整库的前提下查看历史结果
 
-当前安装包对外提供两类能力：
+当前安装包对外提供一类能力：
 
 - `pg_flashback(anyelement, text)`：不落地的历史结果集查询
-- `pg_flashback_to(regclass, text)`：直接改写 keyed 原表，把它回退到目标时间点
-
-扩展不会自动执行 undo SQL，但 `pg_flashback_to()` 会真实改写业务表。
 
 ## 版本支持
 
@@ -35,17 +32,9 @@
 
 - `fb_version()`
 - `fb_check_relation(regclass)`
-- `pg_flashback_to(regclass, text)`
 - `pg_flashback(anyelement, text)`
 
-其中两个客户入口分别是：
-
-```sql
-SELECT pg_flashback_to(
-  'public.orders'::regclass,
-  '2026-03-26 10:00:00+08'
-);
-```
+客户入口是：
 
 ```sql
 SELECT *
@@ -66,13 +55,6 @@ FROM pg_flashback(
 - 不要求手写 `::regclass`
 - 不要求手写 `::timestamptz`
 - 直接返回结果集，不创建结果表
-
-`pg_flashback_to()` 的限制是：
-
-- 只支持 keyed relation
-- 当前只支持单列稳定键
-- 执行时会拿 `AccessExclusiveLock`
-- 检测到外键或用户触发器直接报错
 
 ## 安装
 

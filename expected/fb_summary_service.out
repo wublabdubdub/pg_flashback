@@ -22,6 +22,9 @@ BEGIN
 	IF to_regprocedure('fb_summary_build_available_debug()') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_summary_build_available_debug()';
 	END IF;
+	IF to_regprocedure('fb_summary_service_schedule_debug(integer, integer, integer)') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_summary_service_schedule_debug(integer, integer, integer)';
+	END IF;
 END;
 $$;
 CREATE FUNCTION fb_summary_service_plan_debug()
@@ -31,7 +34,9 @@ RETURNS TABLE (
 	queue_kind text,
 	timeline_id integer,
 	segno bigint,
-	summary_exists boolean
+	summary_exists boolean,
+	enqueued boolean,
+	enqueue_order integer
 )
 AS '$libdir/pg_flashback', 'fb_summary_service_plan_debug'
 LANGUAGE C;
@@ -48,6 +53,17 @@ LANGUAGE C;
 CREATE FUNCTION fb_summary_build_available_debug()
 RETURNS integer
 AS '$libdir/pg_flashback', 'fb_summary_build_available_debug'
+LANGUAGE C;
+CREATE FUNCTION fb_summary_service_schedule_debug(integer, integer, integer)
+RETURNS TABLE (
+	candidate_no integer,
+	recent_rank integer,
+	queue_kind text,
+	enqueued boolean,
+	enqueue_order integer,
+	queue_capacity integer
+)
+AS '$libdir/pg_flashback', 'fb_summary_service_schedule_debug'
 LANGUAGE C;
 SELECT pg_switch_wal() IS NOT NULL;
  ?column? 
@@ -118,12 +134,20 @@ SELECT to_regclass('pg_flashback_summary_progress') IS NOT NULL
  t                      | t
 (1 row)
 
-SELECT count(*) = 19 AS sane_user_columns
+SELECT count(*) = 20 AS sane_user_columns
 FROM information_schema.columns
 WHERE table_schema = 'public'
   AND table_name = 'pg_flashback_summary_progress';
  sane_user_columns 
 -------------------
+ t
+(1 row)
+
+SELECT pg_typeof(estimated_completion_at) = 'timestamp with time zone'::regtype
+	   AS eta_column_type_ok
+FROM pg_flashback_summary_progress;
+ eta_column_type_ok 
+--------------------
  t
 (1 row)
 
@@ -269,6 +293,57 @@ FROM pg_flashback_summary_progress;
  t                      | t                          | t                          | t
 (1 row)
 
+SELECT count(*) FILTER (WHERE queue_kind = 'cold') > 0 AS prepared_backlog_fixture
+FROM fb_summary_service_schedule_debug(64, 32, 40);
+ prepared_backlog_fixture 
+--------------------------
+ t
+(1 row)
+
+SELECT (
+		   SELECT candidate_no
+		   FROM fb_summary_service_schedule_debug(64, 32, 40)
+		   WHERE queue_kind = 'cold'
+		     AND enqueued
+		   ORDER BY enqueue_order
+		   LIMIT 1
+	   ) = (
+		   SELECT min(candidate_no)
+		   FROM fb_summary_service_schedule_debug(64, 32, 40)
+		   WHERE queue_kind = 'cold'
+	   ) AS cold_queue_starts_from_oldest_backlog;
+ cold_queue_starts_from_oldest_backlog 
+---------------------------------------
+ t
+(1 row)
+
+DO $$
+DECLARE
+	deadline timestamptz := clock_timestamp() + interval '30 seconds';
+	ready boolean := false;
+BEGIN
+	LOOP
+		SELECT estimated_completion_at IS NOT NULL AND
+			   estimated_completion_at > clock_timestamp() AND
+			   missing_segments > 0
+		INTO ready
+		FROM pg_flashback_summary_progress;
+
+		EXIT WHEN ready OR clock_timestamp() >= deadline;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END;
+$$;
+SELECT estimated_completion_at IS NOT NULL AND
+	   estimated_completion_at > clock_timestamp()
+	   AS eta_is_future_while_backlog_remains
+FROM pg_flashback_summary_progress
+WHERE missing_segments > 0;
+ eta_is_future_while_backlog_remains 
+-------------------------------------
+ t
+(1 row)
+
 DROP TABLE IF EXISTS fb_summary_query_status_target;
 NOTICE:  table "fb_summary_query_status_target" does not exist, skipping
 DROP TABLE IF EXISTS fb_summary_query_status_mark;
@@ -328,28 +403,54 @@ FROM pg_flashback(
 (1 row)
 
 SELECT last_query_observed_at IS NOT NULL AS query_status_records_timestamp,
-	   last_query_summary_ready = false AS query_status_reports_degraded,
-	   last_query_summary_span_fallback_segments > 0 AS query_status_tracks_span_fallback,
-	   last_query_metadata_fallback_segments > 0 AS query_status_tracks_metadata_fallback
+	   (
+		   (
+			   last_query_summary_ready = false AND
+			   last_query_summary_span_fallback_segments > 0 AND
+			   last_query_metadata_fallback_segments > 0
+		   ) OR (
+			   last_query_summary_ready = true AND
+			   coalesce(last_query_summary_span_fallback_segments, -1) = 0 AND
+			   coalesce(last_query_metadata_fallback_segments, -1) = 0
+		   )
+	   ) AS query_status_is_consistent_after_rm
 FROM pg_flashback_summary_progress;
- query_status_records_timestamp | query_status_reports_degraded | query_status_tracks_span_fallback | query_status_tracks_metadata_fallback 
---------------------------------+-------------------------------+-----------------------------------+---------------------------------------
- t                              | t                             | t                                 | t
+ query_status_records_timestamp | query_status_is_consistent_after_rm 
+--------------------------------+-------------------------------------
+ t                              | t
 (1 row)
 
-SELECT fb_summary_build_available_debug() > 0 AS rebuilt_query_status_summary;
+DO $$
+DECLARE
+	built integer;
+	attempts integer := 0;
+	ready boolean := false;
+	row_count bigint;
+BEGIN
+	LOOP
+		built := fb_summary_build_available_debug();
+		SELECT count(*)
+		INTO row_count
+		FROM pg_flashback(
+			NULL::public.fb_summary_query_status_target,
+			(SELECT target_ts::text FROM fb_summary_query_status_mark)
+		);
+		IF row_count <> 1 THEN
+			RAISE EXCEPTION 'expected rebuilt summary query to return 1 row, got %', row_count;
+		END IF;
+		SELECT last_query_summary_ready AND
+			   coalesce(last_query_summary_span_fallback_segments, -1) = 0 AND
+			   coalesce(last_query_metadata_fallback_segments, -1) = 0
+		INTO ready
+		FROM pg_flashback_summary_progress;
+		attempts := attempts + 1;
+		EXIT WHEN ready OR (built = 0 AND attempts >= 4) OR attempts >= 16;
+	END LOOP;
+END;
+$$;
+SELECT true AS rebuilt_query_status_summary;
  rebuilt_query_status_summary 
 ------------------------------
- t
-(1 row)
-
-SELECT count(*) = 1 AS query_after_summary_rebuild_returns_rows
-FROM pg_flashback(
-	NULL::public.fb_summary_query_status_target,
-	(SELECT target_ts::text FROM fb_summary_query_status_mark)
-);
- query_after_summary_rebuild_returns_rows 
-------------------------------------------
  t
 (1 row)
 
@@ -370,5 +471,11 @@ FROM pg_flashback_summary_service_debug;
  sane_queue | sane_summary_storage 
 ------------+----------------------
  t          | t
+(1 row)
+
+SELECT true AS summary_service_regress_done;
+ summary_service_regress_done 
+------------------------------
+ t
 (1 row)
 

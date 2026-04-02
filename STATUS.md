@@ -9,13 +9,17 @@
 - 当前安装脚本只对外安装：
   - `fb_version()`
   - `fb_check_relation(regclass)`
-  - `pg_flashback_to(regclass, text)`
   - `pg_flashback(anyelement, text)`
   - `pg_flashback_summary_progress` 视图
   - `pg_flashback_summary_service_debug` 视图
 - 当前用户调用形态固定为：
-  - `SELECT pg_flashback_to('schema.table'::regclass, target_ts_text);`
   - `SELECT * FROM pg_flashback(NULL::schema.table, target_ts_text);`
+- 当前全表闪回落地策略固定为：
+  - 库内另立新表：
+    - `CREATE TABLE new_table AS SELECT * FROM pg_flashback(NULL::schema.table, target_ts_text);`
+  - 对外导出：
+    - `COPY (SELECT * FROM pg_flashback(NULL::schema.table, target_ts_text)) TO ...`
+  - `COPY` 不作为“直接创建闪回结果表”的主路径
 - 当前结果模型固定为：
   - `pg_flashback()`：
     - 不创建结果表
@@ -23,12 +27,8 @@
     - 默认仍是直接查询型 SRF
     - 扩展内部统一只走 `ValuePerCall`
     - `FROM pg_flashback(...)` 已改由扩展自带多节点 `CustomScan` 算子树接管，不再走 PostgreSQL 默认 `FunctionScan -> tuplestore`
-  - `pg_flashback_to()`：
-    - 直接修改原表，把原表回退到目标时间点
-    - 当前只支持 keyed + 单列稳定键
-    - 执行时拿 `AccessExclusiveLock`
-    - 当前检测到外键与用户触发器直接报错
 - 当前旧入口与旧中间层已删除：
+  - `pg_flashback_to(regclass, text)`
   - `pg_flashback(text, text, text)`
   - `pg_flashback_rewind(regclass, text)`
   - `fb_parallel`
@@ -76,8 +76,202 @@
 - 开发期调试约定补充：
   - 手工导出 / 保留 core dump、gdb 临时 core 文件时，统一使用 `/isoTest/tmp`
   - 不再使用 `/tmp` 作为本项目的临时 core 落盘路径
+- 当前执行约束补充：
+  - 只要出现“WAL 回放失败导致闪回失败”的现场，必须继续追到 root cause 并彻底修复
+  - 不接受把问题停留在表层报错变化、提前降级绕过、仅调整缺页判定或仅改错误提示
+  - 本次 `scenario_oa_12t_50000r.documents @ '2026-04-01 23:15:13'`
+    已按同一标准继续追查：
+    - 即使 `missing FPI for block 216136` 已不再是表层错误
+    - 仍必须继续修到 `84/AE079278 / blk=216125 / failed to replay heap insert` 的真实根因为止
+
+## 当前进行中
+
+- 正在修复一个新的页级回放 root cause：
+  - 现场已稳定复现：
+    - `scenario_oa_12t_50000r.documents @ '2026-04-01 22:10:13'`
+    - `scenario_oa_12t_50000r.documents @ '2026-03-31 22:50:13'`
+    都会报：
+    - `lsn=87/6E00D568 rel=1663/33398/16395737 blk=1084494 off=4 ... maxoff=1`
+    - `failed to replay heap insert`
+  - 当前 root cause 假设已收紧为：
+    - 回放内核把 `has_image=true` 错当成“可直接 materialize / 覆盖页面”
+    - 但 PostgreSQL WAL 语义里还存在 `has_image=true && apply_image=false`
+    - 这类记录不应覆盖已有页状态，也不应被当成页基线锚点
+  - 当前修复方向：
+    - 先补最小 RED，锁住 `apply_image=false` 合约
+    - 再修 replay / precomputed-missing / anchor resolve 对 image 的判定
+    - 最后复跑 live case 与相关回归
+  - 当前阶段性结论已新增：
+    - 已确认 `has_image=true && apply_image=false` 的误用确实存在，已补 RED 并修正：
+      - `fb_replay_ensure_block_ready()`
+      - `fb_wal_record_block_materializes_page()`
+      - missing-anchor resolve / 若干 replay gate
+    - 但 live case 的真正主链 blocker 不止这一处
+    - 当前继续追到的新现场表明，还存在至少两类独立页态问题：
+      - `HEAP2_PRUNE` 的 applicable image 在部分 block 上会把已有页态压得过旧，导致后续 `insert/update` 的 `offnum` 不再可落
+      - `INIT_PAGE` 记录当前已确认需要无条件重置已有 block state；此前只在“块未初始化”时 `PageInit()` 的逻辑不符合 redo 语义
+    - 当前已新增开发期 trace：
+      - `fb_recordref_block_debug()` 现会额外打印 `record_index / apply_image / imgmax`
+      - 已借此确认：
+        - `blk 1084494` 上 `83/6675CDF8` image `imgmax=4`
+        - `86/30212248` image `imgmax=1`
+        - `blk 1090557` / `blk 1109792` 也存在 `PRUNE` image 与后续 slot reuse 相互影响的现场
+  - 当前未完成：
+    - `scenario_oa_12t_50000r.documents @ '2026-04-01 22:10:13'`
+      已从最初
+      - `87/6E00D568 / failed to replay heap insert`
+      推进到新的更深层 blocker：
+      - `failed to locate tuple for heap update redo`
+    - 说明当前还需要继续收敛 `PRUNE / slot reuse / HOT_UPDATE` 交界处的页态语义，尚未完成最终修复
 
 ## 本轮完成
+
+- 已完成 `pg_flashback_summary_progress` 的两处问题修复：
+  - 现象 1：
+    - 用户视图里 `completed_segments / missing_segments / frontier` 长时间看起来不推进
+  - 当前 root cause 1：
+    - 之前不只是 `cold` claim 顺序偏向较新 segno
+    - launcher enqueue 也会在固定 queue capacity 内先塞满较新的 cold backlog
+    - 结果 oldest 侧 backlog 长时间既不进队，也不被 worker 认领
+  - 现象 2：
+    - `estimated_completion_at` 有时长期为 `NULL`
+    - live 环境中还已复现出错误的 epoch-like 时间：
+      - `2000-01-01 08:00:40...`
+  - 当前 root cause 2：
+    - ETA 当前只接受过窄的 recent throughput sample
+    - 样本不足时直接回 `NULL`
+    - 同时绝对时间之前直接做原始 `TimestampTz` 算术，live 已暴露错误绝对时间值
+  - 当前修复结果：
+    - cold queue 已改成：
+      - enqueue: `hot` 仍保 newest-first
+      - enqueue: `cold` 改成 oldest-first
+      - claim: `cold` 也按 oldest-first + 连续 batch 向前推进
+    - ETA 已改成：
+      - 用 `throughput_window_started_at .. max(last_build_at,last_scan_at)` 取样
+      - backlog 存在且已有 recent sample 时返回未来时间
+      - 用 `pg_add_s64_overflow` 安全构造绝对时间，避免 epoch-like 错值
+    - 已新增一个仅调试/回归使用的调度仿真入口：
+      - `fb_summary_service_schedule_debug(integer, integer, integer)`
+      - 用于锁住固定 queue capacity 下 `cold` oldest-first 的调度语义
+    - 当前定向验证已通过：
+      - `fb_summary_service`
+      - `fb_progress`
+
+- 已定位一处新的 `recovered_wal` 污染 root cause，当前正在修复：
+  - 现象：
+    - 某些环境下即使 archive 已能提供查询所需的 retained suffix
+    - `DataDir/pg_flashback/recovered_wal` 仍会持续累积真实 segname 文件
+  - 当前 root cause：
+    - `fb_collect_archive_segments()` 会在 retained suffix 决定之前
+    - 先把 `pg_wal` 中所有 mismatch candidate 尝试 convert 到 `recovered_wal`
+    - 其中一部分 candidate 虽然最终会因 prefix gap 被裁掉，不参与本次查询
+    - 但 convert 已经发生，导致 `recovered_wal` 被不必要地污染
+  - 当前修复方向：
+    - 先补回归锁住“非保留 suffix 的 mismatch 不应 materialize”
+    - 再把 convert 时机后移到真正需要该 segno 时
+
+- 已完成一处新的 WAL resolver 尾部无效段误判修复：
+  - 现象：
+    - 用户现场 `scenario_oa_12t_50000r.documents @ 2026-03-31 22:10:13/23:10:13`
+      报：
+      - `WAL not complete: pg_wal contains recycled or mismatched segments...`
+    - live 复核后确认真正 root cause 不是“archive exact-hit 被同名 mismatch 压过”
+    - 而是 resolver 会把 `pg_wal` 里更高 segno 的 recycled/预分配无效尾段当成必需最新段
+    - 从而在 `2/9` 过早报 `pg_wal contains recycled or mismatched`
+  - 当前修复结果：
+    - `fb_collect_archive_segments()` 不再以“目录里名字最大的 candidate”作为 suffix 起点
+    - 当前改为只从真正可用的 direct candidate（archive / valid pg_wal / ckwal）里选最高 segno
+    - trailing invalid `pg_wal` tail 现在会被安全忽略，不再挡住 archive/valid suffix
+    - 新增回归覆盖：
+      - trailing invalid `pg_wal` tail 不应阻断 archive suffix
+      - archive exact-hit + 同名 mismatch 仍必须优先取 archive
+    - live 现象已收敛：
+      - `2026-03-31 22:10:13` 当前报真实 retained suffix 不足
+      - `2026-03-31 23:10:13` 当前已能走过 `2/9`，继续进入后续阶段
+
+- 已完成一轮面向历史 backlog 的 summary 预建吞吐收敛：
+  - 服务调度已从“纯 recent-first”收敛为：
+    - 固定 `1` 个 hot-first worker
+    - 其余 worker 默认 cold-first
+    - 当首选队列为空时允许回退到另一队列
+  - cold backlog 已支持小批量连续 segment claim，减少 shared queue 往返与锁竞争
+  - service enqueue 阶段已新增“summary 文件存在”快路径，避免对大量缺失段反复 `open/read header`
+  - `pg_flashback_summary_progress` 已新增：
+    - `estimated_completion_at`
+    - 口径为“最近 build 速率下的 backlog ETA”；样本不足或速率不可用时返回 `NULL`
+  - summary builder 已改成边扫边去重：
+    - `touched_xids`
+    - `unsafe_facts`
+    - `block_anchors`
+    不再依赖段尾统一 `qsort/dedup`
+  - 当前已通过定向验证：
+    - `fb_summary_service`
+    - `fb_summary_v3`
+    - `fb_wal_parallel_payload`
+    - `fb_progress`
+
+- 已拍板删除原表闪回后的全表闪回承接面与加速方向：
+  - 产品边界：
+    - 删除 `pg_flashback_to(regclass, text)` 后
+    - 全表闪回若需落地新表，正式推荐 `CTAS AS SELECT * FROM pg_flashback(...)`
+    - `COPY (SELECT * FROM pg_flashback(...)) TO ...` 仅作为导出路径
+  - 当前调研结论：
+    - PostgreSQL 内核原生支持 `CREATE TABLE AS query`
+    - PostgreSQL `COPY` 原生只支持：
+      - `COPY table FROM ...`
+      - `COPY (query) TO ...`
+    - 不存在“`COPY FROM SELECT` 直接创建新表”的内核语法
+    - 当前 `pg_flashback(...)` 在普通 `SELECT` 与 `CTAS` 下都已实测进入扩展自带 `CustomScan` 链，而不是回退到 PostgreSQL 默认 `FunctionScan`
+    - PostgreSQL `CTAS` 末端本身已不是通用慢 receiver：
+      - 内核 `IntoRelDestReceiver` 已直接使用 `BulkInsertState + table_tuple_insert()`
+      - 因此“替换 CTAS receiver 本身”不是当前最优攻击点
+  - 已确认的下一阶段主目标：
+    - 不新增新的公开 helper
+    - 保持用户继续写标准 `CTAS AS SELECT * FROM pg_flashback(...)`
+    - 不尝试替换 PostgreSQL 原生 `CTAS` receiver
+    - 改为识别 `full-output` 场景：
+      - `SELECT * FROM pg_flashback(...)`
+      - `CTAS AS SELECT * FROM pg_flashback(...)`
+      - `COPY (SELECT * FROM pg_flashback(...)) TO ...`
+    - 将优化重点从“新表写入 sink”转为：
+      - `apply` 上游的 tuple 产出与搬运成本
+      - full-table materialization 专用 fast path
+    - 以“全表闪回结果导出/落地”共享快路径速度最优为第一目标
+  - 当前状态：
+    - 已修正设计前提，并已开始实现第一阶段 full-output 快路径
+  - 当前已落地：
+    - `FbApplyScan` 已新增 `full-output` 识别口径：
+      - 覆盖 simple full-row output
+      - 包括 `SELECT * FROM pg_flashback(...)`
+      - 以及 simple `CTAS AS SELECT * FROM pg_flashback(...)`
+      - 同时也覆盖“按原列顺序显式列出全部列”的等价写法
+    - `EXPLAIN (VERBOSE)` 已新增：
+      - `Flashback Full Output Fast Path: true|false`
+      - `Flashback Output Dispatch: direct|execscan`
+    - 命中 `full-output` 时，`FB_CUSTOM_NODE_APPLY` 已不再走 `ExecScan(...)`
+      - 当前改为直接调用 `fb_flashback_apply_next()`
+      - 先减少无 qual / 无 projection 场景下的通用 scan/projection 调度开销
+    - 已新增定向回归：
+      - `fb_flashback_full_output`
+      - 断言 simple `SELECT` 与 simple `CTAS` 都命中同一套 full-output explain/debug 口径
+      - 并验证 `CTAS` 结果与查询结果一致
+    - 当前定向验证已通过：
+      - `fb_flashback_full_output`
+      - `fb_user_surface`
+      - `pg_flashback`
+
+- 已拍板并开始执行 `pg_flashback_to(regclass, text)` 的破坏性删除：
+  - 删除目标：
+    - 公开安装面
+    - `fb_export` 原表回退实现
+    - 相关回归与文档
+  - 删除后产品边界固定为：
+    - 仅保留查询式 `pg_flashback(anyelement, text)`
+  - 兼容策略：
+    - 不保留别名、stub、NOTICE 或迁移提示
+    - 升级后旧 SQL 直接因函数不存在失败
+  - 当前状态：
+    - 正在执行
 
 - 已开始收敛 `sparse payload` 冷态随机读放大问题，并串行跟进新的 `missing FPI` 现场 bug：
   - 背景：
@@ -100,6 +294,44 @@
       - 优先复用 sparse path 内同一 segment slice 的 reader / open file 状态
       - 先减少 window 级重定位与随机读，不先扩大 payload decode 覆盖面
     - 优化完成后立即复现并修正新的 `missing FPI` 现场问题
+  - 当前最新进展：
+    - 已把 `reader/file` 复用逻辑同时接到串行 sparse path 与 payload worker path
+    - live debug `documents @ '2026-03-31 22:40:13+08'` 已能稳定看到
+      - `payload_sparse_reader_reuses=272253`
+    - 已给 `fb_recordref_debug()` 补出 `anchor_redo`
+    - 已新增一个仅调试期手工创建的 `fb_recordref_block_debug()` C 入口，便于排查单 block 是否真的进入 record index
+  - 当前 bug 收敛结论：
+    - `documents @ '2026-04-01 23:15:13'` 已不再停在 `missing FPI for block 216136`
+    - 本轮继续追到的真实 root cause 不是 replay 内核本身，而是：
+      - 查询侧仍在信任旧版本 `meta/summary` sidecar
+      - 其中部分 segment summary 只覆盖了 segment 前半段 relation spans
+      - 例如 `0000000100000084000000AD` 的旧 summary 只到
+        `84/AD836320`
+      - 导致同块更早 WAL：
+        - `84/ADDC9090 INSERT off=5`
+        - `84/ADDC91B0 INSERT off=6`
+        未进入当前 payload record index
+      - 最终在 discover/final replay 上表现成：
+        - `84/AE079278 INSERT off=7`
+        - `failed to replay heap insert`
+        - `maxoff=4`
+    - 已验证：
+      - 手工重建该 segment summary 后，`off=5/6/7/8` 四条记录都会重新进入 record index
+      - 再继续复现时，旧 `heap insert / blk=216125` 错误消失
+      - 将 `FB_SUMMARY_VERSION` 前滚后，原始现场
+        `SELECT count(*) FROM pg_flashback(NULL::scenario_oa_12t_50000r.documents,'2026-04-01 23:15:13')`
+        已返回：
+        - `count = 4356675`
+        - `total elapsed 108734.386 ms`
+      - 在本轮回归收口后的再次冷启动复测中，同一 SQL 继续稳定返回：
+        - `count = 4356675`
+        - `total elapsed 160227.813 ms`
+      - 定向回归当前已通过：
+        - `fb_summary_v3`
+        - `fb_wal_parallel_payload`
+    - 当前正式修复口径：
+      - 将 summary sidecar 版本前滚，强制旧语义/旧内容的 summary 文件失效
+      - 查询侧对这些旧 summary 自动回退为安全 WAL 扫描或等待新版本 summary 重建
   - 验证目标：
     - 冷启动下 `3/9 payload` 明显下降
     - `documents @ '2026-04-01 23:15:13'` 不再报 `missing FPI for block 216136`
@@ -594,7 +826,6 @@
     - WAL payload / materialize
   - 当前明确不做：
     - 单条 `XLogReader` 顺序流内部并行
-    - `pg_flashback_to` keyed 导出 worker 体系改口到新总开关
   - 决策记录：`docs/decisions/ADR-0017-unified-flashback-parallel-switch.md`
 
 - 已完成 flashback 并行控制第一阶段落地：
@@ -603,7 +834,6 @@
   - 现有 WAL segment prefilter 已切到统一 worker 参数
   - `pg_wal` 段身份校验已增加安全的文件级并行
   - checkpoint sidecar anchor hint 扫描已增加安全的文件级并行
-  - `pg_flashback_to` export worker 当前会继承新的 `parallel_workers` 会话值，但不受其 worker 启停语义接管
   - 当前仍未完成：
     - replay / reverse-source 的主路径并行
     - apply 的主路径并行
@@ -776,6 +1006,15 @@
     - 优先读取 `meta/summary`
     - 缺失时回退旧 `mmap + memmem`
     - 不再持续写入 relation-pattern 级 `prefilter-*.meta`
+  - `2026-04-02` 当前新增收敛目标：
+    - 优先提升历史 cold backlog 的 summary 补齐速度，而不是继续把大部分 worker 预算放在 recent frontiers
+    - 服务调度准备改成：
+      - 固定 `1` 个 hot-first worker
+      - 其余 worker 默认 cold-first
+      - cold worker 支持小批量连续 segment claim
+    - `pg_flashback_summary_progress` 准备新增：
+      - `estimated_completion_at`
+      - 口径固定为“最近 build 速率下的 backlog ETA”，样本不足时返回 `NULL`
 
 - `3/9 build record index` 当前主线收敛中：
   - 第一优先级不再是 metadata 并行 fanout
@@ -857,6 +1096,7 @@
 
 - 继续补 summary 服务的细节验证与策略收敛：
   - cleanup 与 queue/progress 的专项回归是否再细分
+  - 补齐 cold backlog 吞吐优先调度、批量 claim 与 `estimated_completion_at` 的专项回归
 - 回到主线性能目标：
   - 优先完成 `3/9` summary-first 第二阶段：
     - window-scoped xid outcome reduce
@@ -984,31 +1224,6 @@
   - 设计稿：`docs/superpowers/specs/2026-03-29-multi-custom-scan-explain-design.md`
   - 实施计划：`docs/superpowers/plans/2026-03-29-multi-custom-scan-explain-plan.md`
   - 决策记录：`docs/decisions/ADR-0014-custom-operator-tree-for-explain-analyze.md`
-
-- 已将原表闪回公开入口统一收口为 `pg_flashback_to(regclass, text)`：
-  - 当前定位固定为“大表 keyed 全表闪回优先走原表回退，而不是导出新表”
-  - 当前范围固定为：
-    - 仅 keyed relation
-    - 仅单列稳定键
-    - 执行时拿 `AccessExclusiveLock`
-    - 当前检测到外键或用户触发器直接报错
-  - 当前实现方向固定为：
-    - 只构建一次 `ReverseOpSource`
-    - keyed apply 只汇总变化 key 在目标时间点的终态
-    - 不再扫描当前整表
-    - 通过“批量 update existing + insert missing + delete removed”直接改写原表
-  - 旧的 `pg_flashback_rewind(regclass, text)` 名称已删除
-  - 旧的持久表导出公开入口已下线，不再对外安装
-  - 当前新增回归口径：
-    - `fb_flashback_to`
-    - `fb_user_surface`
-    - `fb_flashback_keyed`
-  - 已补齐 keyed 主键变化场景的原表回退回归
-  - 已修复 guard 检查中的 backend SIGSEGV：
-    - 根因是 `fb_rewind_spi_relation_flag()` 将 `NULL` 传给 `SPI_getbinval(..., isnull)`
-    - PG18 下会在 `fastgetattr()` 解引用空指针
-    - 现已改为传入有效 `bool isnull`
-  - 决策记录：`docs/decisions/ADR-0016-pg-flashback-rewind-inplace.md`
 
 - 已完成 keyed fast path：
   - 目标统一覆盖三类高收益查询：
@@ -1262,7 +1477,6 @@
 
 - [x] `pg_flashback.memory_limit` 用户侧 rename 与 `32GB` 上限收敛
 - [x] `pg_flashback.spill_mode` 与 preflight 内存/磁盘选择
-- [x] `pg_flashback_to` 已收口为唯一原表闪回入口，并完成公开安装面/回归/文档迁移
 - [x] 全量 `installcheck` 已按当前工作区重跑通过
 - `PG10/11` 环境级正式复验
 - batch B / residual `missing FPI` 收敛
@@ -1280,8 +1494,6 @@
 - 观察多节点 `CustomScan` 树在更大时间窗和 deep case 下的 `EXPLAIN ANALYZE` 可读性与稳定性
 - 观察首次 `2026-03-28 01:00 CST` 自动提交结果，确认日志与推送行为符合预期
 - 在具备环境后补齐 `PG10/11` 的正式编译/回归复验
-- 补齐 `pg_flashback_to` 在 sequence / serial default 场景下的独立化与边界验证
-- 继续清理旧持久表导出路径的剩余死代码与历史文档
 - 继续补更多 `archive_command` 本地模式的自动识别与诊断输出
 - 继续处理 deep pilot batch B blocker
 - 评估大 live case 在默认 `memory_limit=65536` 下的 bounded spill / 内存收敛路径

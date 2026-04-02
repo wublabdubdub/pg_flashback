@@ -26,6 +26,9 @@ BEGIN
 	IF to_regprocedure('fb_replay_debug(regclass,timestamptz)') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_replay_debug(regclass, timestamptz)';
 	END IF;
+	IF to_regprocedure('fb_replay_apply_image_contract_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_replay_apply_image_contract_debug()';
+	END IF;
 END;
 $$;
 
@@ -43,6 +46,17 @@ CREATE FUNCTION fb_replay_debug(regclass, timestamptz)
 RETURNS text
 AS '$libdir/pg_flashback', 'fb_replay_debug'
 LANGUAGE C;
+
+CREATE FUNCTION fb_replay_apply_image_contract_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_replay_apply_image_contract_debug'
+LANGUAGE C;
+
+SELECT fb_replay_apply_image_contract_debug() AS apply_image_contract
+\gset
+
+SELECT :'apply_image_contract' LIKE '%preserve_existing=true%' AS preserve_existing,
+	   :'apply_image_contract' LIKE '%materialize_requires_apply=true%' AS materialize_requires_apply;
 
 DROP TABLE IF EXISTS fb_replay_target;
 DROP TABLE IF EXISTS fb_replay_mark;

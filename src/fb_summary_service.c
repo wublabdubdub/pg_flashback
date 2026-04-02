@@ -5,7 +5,9 @@
 
 #include "postgres.h"
 
+#include "common/int.h"
 #include <dirent.h>
+#include <math.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -37,16 +39,21 @@
 #define FB_SUMMARY_SERVICE_RECENT_PROTECT_SECS 5
 #define FB_SUMMARY_SERVICE_HOT_WINDOW_MIN 32
 #define FB_SUMMARY_SERVICE_HOT_WINDOW_PER_WORKER 16
+#define FB_SUMMARY_SERVICE_COLD_BATCH_SIZE 8
+#define FB_SUMMARY_SERVICE_RATE_WINDOW_MS (5 * 60 * 1000)
+#define FB_SUMMARY_SERVICE_RATE_MIN_SAMPLE_MS 5000
 
 PG_FUNCTION_INFO_V1(fb_summary_progress_internal);
 PG_FUNCTION_INFO_V1(fb_summary_service_debug_internal);
 PG_FUNCTION_INFO_V1(fb_summary_cleanup_plan_debug);
 PG_FUNCTION_INFO_V1(fb_summary_service_plan_debug);
+PG_FUNCTION_INFO_V1(fb_summary_service_schedule_debug);
 
 PGDLLEXPORT Datum fb_summary_progress_internal(PG_FUNCTION_ARGS);
 PGDLLEXPORT Datum fb_summary_service_debug_internal(PG_FUNCTION_ARGS);
 PGDLLEXPORT Datum fb_summary_cleanup_plan_debug(PG_FUNCTION_ARGS);
 PGDLLEXPORT Datum fb_summary_service_plan_debug(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum fb_summary_service_schedule_debug(PG_FUNCTION_ARGS);
 
 typedef enum FbSummaryServiceTaskState
 {
@@ -89,6 +96,9 @@ typedef struct FbSummaryServiceShared
 	uint64 build_count;
 	uint64 cleanup_count;
 	TimestampTz last_scan_at;
+	TimestampTz throughput_window_started_at;
+	TimestampTz last_build_at;
+	uint64 throughput_window_builds;
 	TimestampTz last_query_observed_at;
 	uint32 last_query_summary_span_fallback_segments;
 	uint32 last_query_metadata_fallback_segments;
@@ -98,6 +108,8 @@ typedef struct FbSummaryServiceShared
 typedef struct FbSummaryServicePlanDebugContext
 {
 	FbSummaryBuildCandidate *candidates;
+	bool *enqueued;
+	int *enqueue_order;
 	int candidate_count;
 	int hot_window;
 	int index;
@@ -115,6 +127,16 @@ typedef struct FbSummaryCleanupPlanDebugContext
 	XLogSegNo snapshot_newest_segno;
 	int index;
 } FbSummaryCleanupPlanDebugContext;
+
+typedef struct FbSummaryServiceScheduleDebugContext
+{
+	int total_candidates;
+	int hot_window;
+	int queue_capacity;
+	bool *enqueued;
+	int *enqueue_order;
+	int index;
+} FbSummaryServiceScheduleDebugContext;
 
 typedef struct FbSummaryServiceProgressStats
 {
@@ -140,6 +162,9 @@ typedef struct FbSummaryServiceProgressStats
 	uint64 build_count;
 	uint64 cleanup_count;
 	TimestampTz last_scan_at;
+	TimestampTz throughput_window_started_at;
+	TimestampTz last_build_at;
+	uint64 throughput_window_builds;
 	uint64 stable_candidates;
 	uint64 completed_summaries;
 	uint64 missing_summaries;
@@ -156,6 +181,7 @@ typedef struct FbSummaryServiceProgressStats
 	uint32 summary_files;
 	uint64 summary_bytes;
 	TimestampTz last_query_observed_at;
+	TimestampTz estimated_completion_at;
 	bool last_query_summary_ready;
 	uint32 last_query_summary_span_fallback_segments;
 	uint32 last_query_metadata_fallback_segments;
@@ -191,15 +217,21 @@ static int fb_summary_service_compare_priority(int queue_kind_a,
 static bool fb_summary_service_worker_pid_known_locked(pid_t owner_pid);
 static void fb_summary_service_recover_stale_tasks_locked(void);
 static FbSummaryServiceTask *fb_summary_service_find_task_locked(uint64 file_identity_hash);
+static bool fb_summary_service_candidate_summary_exists_fast(const FbSummaryBuildCandidate *candidate);
+static bool fb_summary_service_candidate_summary_exists_for_enqueue(const FbSummaryBuildCandidate *candidate);
 static bool fb_summary_service_try_enqueue(const FbSummaryBuildCandidate *candidate,
 											 int queue_kind,
 											 int recent_rank);
-static bool fb_summary_service_claim_task(FbSummaryBuildCandidate *candidate_out,
-											int *slot_index_out);
+static int fb_summary_service_claim_tasks(FbSummaryBuildCandidate *candidates_out,
+										   int *slot_indexes_out,
+										   int max_count,
+										   int preferred_queue_kind,
+										   bool allow_fallback_queue);
 static void fb_summary_service_finish_task(int slot_index, bool built);
 static void fb_summary_service_run_scan(void);
 static void fb_summary_service_run_cleanup(void);
 static void fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats);
+static void fb_summary_service_compute_eta(FbSummaryServiceProgressStats *stats);
 static bool fb_summary_service_candidate_in_snapshot(bool snapshot_valid,
 													 TimeLineID snapshot_timeline_id,
 													 XLogSegNo snapshot_oldest_segno,
@@ -391,10 +423,20 @@ fb_summary_service_compare_priority(int queue_kind_a,
 		return -1;
 	if (timeline_id_a > timeline_id_b)
 		return 1;
-	if (segno_a < segno_b)
-		return -1;
-	if (segno_a > segno_b)
-		return 1;
+	if (queue_kind_a == FB_SUMMARY_SERVICE_QUEUE_COLD)
+	{
+		if (segno_a < segno_b)
+			return 1;
+		if (segno_a > segno_b)
+			return -1;
+	}
+	else
+	{
+		if (segno_a < segno_b)
+			return -1;
+		if (segno_a > segno_b)
+			return 1;
+	}
 	if (recent_rank_a > recent_rank_b)
 		return -1;
 	if (recent_rank_a < recent_rank_b)
@@ -447,6 +489,113 @@ fb_summary_service_sigterm(SIGNAL_ARGS)
 	errno = save_errno;
 }
 
+static bool
+fb_summary_service_candidate_summary_exists_fast(const FbSummaryBuildCandidate *candidate)
+{
+	char summary_path[MAXPGPATH];
+	struct stat st;
+	uint64 file_identity_hash;
+	int written;
+
+	if (candidate == NULL)
+		return false;
+
+	file_identity_hash = fb_summary_candidate_identity_hash(candidate);
+	if (file_identity_hash == 0)
+		return false;
+
+	written = snprintf(summary_path,
+					   sizeof(summary_path),
+					   "%s/pg_flashback/meta/summary/summary-%016llx.meta",
+					   DataDir,
+					   (unsigned long long) file_identity_hash);
+	if (written < 0 || written >= (int) sizeof(summary_path))
+		return false;
+
+	return stat(summary_path, &st) == 0;
+}
+
+static bool
+fb_summary_service_candidate_summary_exists_for_enqueue(const FbSummaryBuildCandidate *candidate)
+{
+	if (!fb_summary_service_candidate_summary_exists_fast(candidate))
+		return false;
+
+	return fb_summary_candidate_summary_exists(candidate);
+}
+
+static int
+fb_summary_service_find_best_task_slot_locked(int queue_kind)
+{
+	int i;
+	int best_slot = -1;
+	FbSummaryServiceTask *best_task = NULL;
+
+	for (i = 0; i < fb_summary_service->queue_capacity; i++)
+	{
+		FbSummaryServiceTask *task = &fb_summary_service->tasks[i];
+
+		if (task->state != FB_SUMMARY_SERVICE_TASK_PENDING)
+			continue;
+		if (queue_kind != 0 && task->queue_kind != queue_kind)
+			continue;
+		if (best_task == NULL ||
+			fb_summary_service_compare_priority(task->queue_kind,
+											   task->candidate.timeline_id,
+											   task->candidate.segno,
+											   task->recent_rank,
+											   best_task->queue_kind,
+											   best_task->candidate.timeline_id,
+											   best_task->candidate.segno,
+											   best_task->recent_rank) > 0)
+		{
+			best_slot = i;
+			best_task = task;
+		}
+	}
+
+	return best_slot;
+}
+
+static int
+fb_summary_service_find_contiguous_cold_slot_locked(TimeLineID timeline_id,
+													 XLogSegNo segno)
+{
+	int i;
+
+	for (i = 0; i < fb_summary_service->queue_capacity; i++)
+	{
+		FbSummaryServiceTask *task = &fb_summary_service->tasks[i];
+
+		if (task->state != FB_SUMMARY_SERVICE_TASK_PENDING)
+			continue;
+		if (task->queue_kind != FB_SUMMARY_SERVICE_QUEUE_COLD)
+			continue;
+		if (task->candidate.timeline_id != timeline_id ||
+			task->candidate.segno != segno)
+			continue;
+		return i;
+	}
+
+	return -1;
+}
+
+static void
+fb_summary_service_mark_task_running_locked(FbSummaryServiceTask *task,
+											 FbSummaryBuildCandidate *candidate_out,
+											 int *slot_index_out,
+											 int slot_index)
+{
+	task->state = FB_SUMMARY_SERVICE_TASK_RUNNING;
+	task->owner_pid = MyProcPid;
+	task->attempt_count++;
+	task->lease_started_at = GetCurrentTimestamp();
+	if (candidate_out != NULL)
+		*candidate_out = task->candidate;
+	if (slot_index_out != NULL)
+		*slot_index_out = slot_index;
+}
+
 static FbSummaryServiceTask *
 fb_summary_service_find_task_locked(uint64 file_identity_hash)
 {
@@ -478,7 +627,7 @@ fb_summary_service_try_enqueue(const FbSummaryBuildCandidate *candidate,
 	file_identity_hash = fb_summary_candidate_identity_hash(candidate);
 	if (file_identity_hash == 0)
 		return false;
-	if (fb_summary_candidate_summary_exists(candidate))
+	if (fb_summary_service_candidate_summary_exists_for_enqueue(candidate))
 		return false;
 
 	LWLockAcquire(fb_summary_service_lock, LW_EXCLUSIVE);
@@ -526,52 +675,69 @@ fb_summary_service_try_enqueue(const FbSummaryBuildCandidate *candidate,
 	return queued;
 }
 
-static bool
-fb_summary_service_claim_task(FbSummaryBuildCandidate *candidate_out,
-							  int *slot_index_out)
+static int
+fb_summary_service_claim_tasks(FbSummaryBuildCandidate *candidates_out,
+							   int *slot_indexes_out,
+							   int max_count,
+							   int preferred_queue_kind,
+							   bool allow_fallback_queue)
 {
-	int i;
-	int best_slot = -1;
-	FbSummaryServiceTask *best_task = NULL;
+	int claim_count = 0;
+	int slot_index = -1;
+	int first_queue_kind = 0;
+	TimeLineID batch_timeline_id = 0;
+	XLogSegNo next_batch_segno = 0;
 
 	LWLockAcquire(fb_summary_service_lock, LW_EXCLUSIVE);
 	fb_summary_service_recover_stale_tasks_locked();
-	for (i = 0; i < fb_summary_service->queue_capacity; i++)
+	slot_index = fb_summary_service_find_best_task_slot_locked(preferred_queue_kind);
+	if (slot_index < 0 && allow_fallback_queue)
 	{
-		FbSummaryServiceTask *task = &fb_summary_service->tasks[i];
+		int fallback_queue_kind =
+			(preferred_queue_kind == FB_SUMMARY_SERVICE_QUEUE_HOT) ?
+			FB_SUMMARY_SERVICE_QUEUE_COLD :
+			FB_SUMMARY_SERVICE_QUEUE_HOT;
 
-		if (task->state != FB_SUMMARY_SERVICE_TASK_PENDING)
-			continue;
-		if (best_task == NULL ||
-			fb_summary_service_compare_priority(task->queue_kind,
-											   task->candidate.timeline_id,
-											   task->candidate.segno,
-											   task->recent_rank,
-											   best_task->queue_kind,
-											   best_task->candidate.timeline_id,
-											   best_task->candidate.segno,
-											   best_task->recent_rank) > 0)
-		{
-			best_slot = i;
-			best_task = task;
-		}
+		slot_index = fb_summary_service_find_best_task_slot_locked(fallback_queue_kind);
 	}
-
-	if (best_task != NULL)
+	if (slot_index >= 0)
 	{
-		best_task->state = FB_SUMMARY_SERVICE_TASK_RUNNING;
-		best_task->owner_pid = MyProcPid;
-		best_task->attempt_count++;
-		best_task->lease_started_at = GetCurrentTimestamp();
-		if (candidate_out != NULL)
-			*candidate_out = best_task->candidate;
-		if (slot_index_out != NULL)
-			*slot_index_out = best_slot;
-		LWLockRelease(fb_summary_service_lock);
-		return true;
+		FbSummaryServiceTask *task = &fb_summary_service->tasks[slot_index];
+
+		fb_summary_service_mark_task_running_locked(task,
+												   (candidates_out != NULL) ?
+												   &candidates_out[claim_count] : NULL,
+												   (slot_indexes_out != NULL) ?
+												   &slot_indexes_out[claim_count] : NULL,
+												   slot_index);
+		first_queue_kind = task->queue_kind;
+		batch_timeline_id = task->candidate.timeline_id;
+		next_batch_segno = (first_queue_kind == FB_SUMMARY_SERVICE_QUEUE_COLD) ?
+			task->candidate.segno + 1 :
+			task->candidate.segno - 1;
+		claim_count++;
+	}
+	while (claim_count < max_count &&
+		   first_queue_kind == FB_SUMMARY_SERVICE_QUEUE_COLD)
+	{
+		FbSummaryServiceTask *task;
+
+		slot_index = fb_summary_service_find_contiguous_cold_slot_locked(batch_timeline_id,
+																	  next_batch_segno);
+		if (slot_index < 0)
+			break;
+		task = &fb_summary_service->tasks[slot_index];
+		fb_summary_service_mark_task_running_locked(task,
+												   (candidates_out != NULL) ?
+												   &candidates_out[claim_count] : NULL,
+												   (slot_indexes_out != NULL) ?
+												   &slot_indexes_out[claim_count] : NULL,
+												   slot_index);
+		claim_count++;
+		next_batch_segno++;
 	}
 	LWLockRelease(fb_summary_service_lock);
-	return false;
+	return claim_count;
 }
 
 static void
@@ -582,7 +748,22 @@ fb_summary_service_finish_task(int slot_index, bool built)
 
 	LWLockAcquire(fb_summary_service_lock, LW_EXCLUSIVE);
 	if (built)
+	{
+		TimestampTz now = GetCurrentTimestamp();
+
 		fb_summary_service->build_count++;
+		if (fb_summary_service->throughput_window_started_at == 0 ||
+			TimestampDifferenceExceeds(fb_summary_service->throughput_window_started_at,
+									 now,
+									 FB_SUMMARY_SERVICE_RATE_WINDOW_MS))
+		{
+			fb_summary_service->throughput_window_started_at = now;
+			fb_summary_service->throughput_window_builds = 1;
+		}
+		else
+			fb_summary_service->throughput_window_builds++;
+		fb_summary_service->last_build_at = now;
+	}
 	MemSet(&fb_summary_service->tasks[slot_index], 0, sizeof(FbSummaryServiceTask));
 	LWLockRelease(fb_summary_service_lock);
 }
@@ -629,6 +810,19 @@ fb_summary_service_run_scan(void)
 		int recent_rank = fb_summary_service_recent_rank_for_index(i, candidate_count);
 		int queue_kind = fb_summary_service_queue_kind_for_rank(recent_rank, hot_window);
 
+		if (queue_kind != FB_SUMMARY_SERVICE_QUEUE_HOT)
+			continue;
+		if (!fb_summary_service_try_enqueue(&candidates[i], queue_kind, recent_rank))
+			continue;
+	}
+
+	for (i = 0; i < candidate_count; i++)
+	{
+		int recent_rank = fb_summary_service_recent_rank_for_index(i, candidate_count);
+		int queue_kind = fb_summary_service_queue_kind_for_rank(recent_rank, hot_window);
+
+		if (queue_kind != FB_SUMMARY_SERVICE_QUEUE_COLD)
+			continue;
 		if (!fb_summary_service_try_enqueue(&candidates[i], queue_kind, recent_rank))
 			continue;
 	}
@@ -803,6 +997,11 @@ fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats)
 			stats->build_count = fb_summary_service->build_count;
 			stats->cleanup_count = fb_summary_service->cleanup_count;
 			stats->last_scan_at = fb_summary_service->last_scan_at;
+			stats->throughput_window_started_at =
+				fb_summary_service->throughput_window_started_at;
+			stats->last_build_at = fb_summary_service->last_build_at;
+			stats->throughput_window_builds =
+				fb_summary_service->throughput_window_builds;
 			stats->last_query_observed_at = fb_summary_service->last_query_observed_at;
 			stats->last_query_summary_span_fallback_segments =
 				fb_summary_service->last_query_summary_span_fallback_segments;
@@ -1000,6 +1199,60 @@ fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats)
 	if (filtered_segnos != NULL)
 		pfree(filtered_segnos);
 	fb_summary_free_build_candidates(candidates);
+	fb_summary_service_compute_eta(stats);
+}
+
+static void
+fb_summary_service_compute_eta(FbSummaryServiceProgressStats *stats)
+{
+	long secs = 0;
+	int microsecs = 0;
+	double elapsed_secs;
+	double builds_per_sec;
+	double remaining_usecs;
+	TimestampTz sample_end_at;
+	TimestampTz now;
+	int64 eta_offset;
+	int64 eta_at;
+
+	if (stats == NULL ||
+		!stats->service_enabled ||
+		stats->missing_summaries == 0 ||
+		stats->throughput_window_started_at == 0 ||
+		stats->throughput_window_builds == 0)
+		return;
+
+	sample_end_at = stats->last_build_at;
+	if (stats->last_scan_at != 0 &&
+		(sample_end_at == 0 || stats->last_scan_at > sample_end_at))
+		sample_end_at = stats->last_scan_at;
+	if (sample_end_at == 0)
+		return;
+
+	TimestampDifference(stats->throughput_window_started_at,
+						sample_end_at,
+						&secs,
+						&microsecs);
+	elapsed_secs = (double) secs + ((double) microsecs / 1000000.0);
+	if (elapsed_secs < ((double) FB_SUMMARY_SERVICE_RATE_MIN_SAMPLE_MS / 1000.0))
+		return;
+
+	builds_per_sec = (double) stats->throughput_window_builds / elapsed_secs;
+	if (builds_per_sec <= 0.0)
+		return;
+
+	remaining_usecs =
+		((double) stats->missing_summaries / builds_per_sec) * 1000000.0;
+	if (remaining_usecs <= 0.0 ||
+		remaining_usecs > (double) PG_INT64_MAX)
+		return;
+
+	now = GetCurrentTimestamp();
+	eta_offset = (int64) rint(remaining_usecs);
+	if (pg_add_s64_overflow(now, eta_offset, &eta_at))
+		return;
+
+	stats->estimated_completion_at = eta_at;
 }
 
 static bool
@@ -1160,9 +1413,13 @@ fb_summary_service_launcher_main(Datum main_arg)
 void
 fb_summary_service_worker_main(Datum main_arg)
 {
-	FbSummaryBuildCandidate candidate;
-	int slot_index = -1;
+	FbSummaryBuildCandidate candidates[FB_SUMMARY_SERVICE_COLD_BATCH_SIZE];
+	int slot_indexes[FB_SUMMARY_SERVICE_COLD_BATCH_SIZE];
 	int worker_index = DatumGetInt32(main_arg);
+	int preferred_queue_kind =
+		(worker_index == 0) ?
+		FB_SUMMARY_SERVICE_QUEUE_HOT :
+		FB_SUMMARY_SERVICE_QUEUE_COLD;
 
 	pqsignal(SIGTERM, fb_summary_service_sigterm);
 	BackgroundWorkerUnblockSignals();
@@ -1176,15 +1433,26 @@ fb_summary_service_worker_main(Datum main_arg)
 
 	while (!fb_summary_service_got_sigterm)
 	{
+		int claimed_count;
 		int rc;
 
-		if (fb_summary_service_claim_task(&candidate, &slot_index))
+		claimed_count = fb_summary_service_claim_tasks(candidates,
+													  slot_indexes,
+													  FB_SUMMARY_SERVICE_COLD_BATCH_SIZE,
+													  preferred_queue_kind,
+													  true);
+		if (claimed_count > 0)
 		{
-			bool built = false;
+			int i;
 
-			if (!fb_summary_candidate_summary_exists(&candidate))
-				built = fb_summary_build_candidate(&candidate);
-			fb_summary_service_finish_task(slot_index, built);
+			for (i = 0; i < claimed_count; i++)
+			{
+				bool built = false;
+
+				if (!fb_summary_candidate_summary_exists(&candidates[i]))
+					built = fb_summary_build_candidate(&candidates[i]);
+				fb_summary_service_finish_task(slot_indexes[i], built);
+			}
 			continue;
 		}
 
@@ -1206,8 +1474,8 @@ fb_summary_progress_internal(PG_FUNCTION_ARGS)
 	FbSummaryServiceProgressStats stats;
 	TupleDesc tupdesc;
 	HeapTuple tuple;
-	Datum values[19];
-	bool nulls[19];
+	Datum values[20];
+	bool nulls[20];
 	double progress_pct;
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -1289,6 +1557,10 @@ fb_summary_progress_internal(PG_FUNCTION_ARGS)
 		nulls[18] = true;
 	else
 		values[18] = Int64GetDatum((int64) stats.last_query_metadata_fallback_segments);
+	if (stats.estimated_completion_at == 0)
+		nulls[19] = true;
+	else
+		values[19] = TimestampTzGetDatum(stats.estimated_completion_at);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
@@ -1376,6 +1648,47 @@ fb_summary_service_plan_debug(PG_FUNCTION_ARGS)
 		ctx = palloc0(sizeof(*ctx));
 		ctx->candidate_count = fb_summary_collect_build_candidates(&ctx->candidates, true);
 		ctx->hot_window = fb_summary_service_hot_window();
+		if (ctx->candidate_count > 0)
+		{
+			int queue_capacity = fb_summary_service_queue_size();
+			int enqueue_limit;
+			int enqueue_count = 0;
+			int i;
+
+			if (fb_summary_service != NULL && fb_summary_service->queue_capacity > 0)
+				queue_capacity = fb_summary_service->queue_capacity;
+			enqueue_limit = Min(ctx->candidate_count, queue_capacity);
+
+			ctx->enqueued = palloc0(sizeof(bool) * ctx->candidate_count);
+			ctx->enqueue_order = palloc0(sizeof(int) * ctx->candidate_count);
+
+			for (i = ctx->candidate_count - 1;
+				 i >= 0 && enqueue_count < enqueue_limit;
+				 i--)
+			{
+				int recent_rank = fb_summary_service_recent_rank_for_index(i,
+																		  ctx->candidate_count);
+				int queue_kind = fb_summary_service_queue_kind_for_rank(recent_rank,
+																		 ctx->hot_window);
+
+				if (queue_kind != FB_SUMMARY_SERVICE_QUEUE_HOT)
+					continue;
+				ctx->enqueued[i] = true;
+				ctx->enqueue_order[i] = ++enqueue_count;
+			}
+			for (i = 0; i < ctx->candidate_count && enqueue_count < enqueue_limit; i++)
+			{
+				int recent_rank = fb_summary_service_recent_rank_for_index(i,
+																		  ctx->candidate_count);
+				int queue_kind = fb_summary_service_queue_kind_for_rank(recent_rank,
+																		 ctx->hot_window);
+
+				if (queue_kind != FB_SUMMARY_SERVICE_QUEUE_COLD)
+					continue;
+				ctx->enqueued[i] = true;
+				ctx->enqueue_order[i] = ++enqueue_count;
+			}
+		}
 		ctx->index = 0;
 		funcctx->user_fctx = ctx;
 		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -1396,8 +1709,8 @@ fb_summary_service_plan_debug(PG_FUNCTION_ARGS)
 		int recent_rank = fb_summary_service_recent_rank_for_index(candidate_index,
 																   ctx->candidate_count);
 		int queue_kind = fb_summary_service_queue_kind_for_rank(recent_rank, ctx->hot_window);
-		Datum values[6];
-		bool nulls[6];
+		Datum values[8];
+		bool nulls[8];
 		HeapTuple tuple;
 
 		MemSet(nulls, 0, sizeof(nulls));
@@ -1407,6 +1720,11 @@ fb_summary_service_plan_debug(PG_FUNCTION_ARGS)
 		values[3] = Int32GetDatum((int32) candidate->timeline_id);
 		values[4] = Int64GetDatum((int64) candidate->segno);
 		values[5] = BoolGetDatum(fb_summary_candidate_summary_exists(candidate));
+		values[6] = BoolGetDatum(ctx->enqueued != NULL && ctx->enqueued[candidate_index]);
+		if (ctx->enqueue_order == NULL || ctx->enqueue_order[candidate_index] == 0)
+			nulls[7] = true;
+		else
+			values[7] = Int32GetDatum(ctx->enqueue_order[candidate_index]);
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
 	}
@@ -1416,6 +1734,103 @@ fb_summary_service_plan_debug(PG_FUNCTION_ARGS)
 		fb_summary_free_build_candidates(ctx->candidates);
 		ctx->candidates = NULL;
 	}
+	SRF_RETURN_DONE(funcctx);
+}
+
+Datum
+fb_summary_service_schedule_debug(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	FbSummaryServiceScheduleDebugContext *ctx;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext oldcontext;
+		TupleDesc tupdesc;
+		int total_candidates = PG_GETARG_INT32(0);
+		int hot_window = PG_GETARG_INT32(1);
+		int queue_capacity = PG_GETARG_INT32(2);
+		int enqueue_limit;
+		int enqueue_count = 0;
+		int i;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+		ctx = palloc0(sizeof(*ctx));
+		ctx->total_candidates = Max(0, total_candidates);
+		ctx->hot_window = Max(0, hot_window);
+		ctx->queue_capacity = Max(0, queue_capacity);
+		if (ctx->total_candidates > 0)
+		{
+			ctx->enqueued = palloc0(sizeof(bool) * ctx->total_candidates);
+			ctx->enqueue_order = palloc0(sizeof(int) * ctx->total_candidates);
+			enqueue_limit = Min(ctx->total_candidates, ctx->queue_capacity);
+
+			for (i = ctx->total_candidates - 1;
+				 i >= 0 && enqueue_count < enqueue_limit;
+				 i--)
+			{
+				int recent_rank = fb_summary_service_recent_rank_for_index(i,
+																		  ctx->total_candidates);
+				int queue_kind = fb_summary_service_queue_kind_for_rank(recent_rank,
+																		 ctx->hot_window);
+
+				if (queue_kind != FB_SUMMARY_SERVICE_QUEUE_HOT)
+					continue;
+				ctx->enqueued[i] = true;
+				ctx->enqueue_order[i] = ++enqueue_count;
+			}
+			for (i = 0; i < ctx->total_candidates && enqueue_count < enqueue_limit; i++)
+			{
+				int recent_rank = fb_summary_service_recent_rank_for_index(i,
+																		  ctx->total_candidates);
+				int queue_kind = fb_summary_service_queue_kind_for_rank(recent_rank,
+																		 ctx->hot_window);
+
+				if (queue_kind != FB_SUMMARY_SERVICE_QUEUE_COLD)
+					continue;
+				ctx->enqueued[i] = true;
+				ctx->enqueue_order[i] = ++enqueue_count;
+			}
+		}
+		ctx->index = 0;
+		funcctx->user_fctx = ctx;
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("fb_summary_service_schedule_debug must return a composite type")));
+		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	ctx = (FbSummaryServiceScheduleDebugContext *) funcctx->user_fctx;
+
+	while (ctx->index < ctx->total_candidates)
+	{
+		int candidate_index = ctx->index++;
+		int recent_rank = fb_summary_service_recent_rank_for_index(candidate_index,
+																   ctx->total_candidates);
+		int queue_kind = fb_summary_service_queue_kind_for_rank(recent_rank,
+																 ctx->hot_window);
+		Datum values[6];
+		bool nulls[6];
+		HeapTuple tuple;
+
+		MemSet(nulls, 0, sizeof(nulls));
+		values[0] = Int32GetDatum(candidate_index + 1);
+		values[1] = Int32GetDatum(recent_rank);
+		values[2] = CStringGetTextDatum(fb_summary_service_queue_kind_name(queue_kind));
+		values[3] = BoolGetDatum(ctx->enqueued != NULL && ctx->enqueued[candidate_index]);
+		if (ctx->enqueue_order == NULL || ctx->enqueue_order[candidate_index] == 0)
+			nulls[4] = true;
+		else
+			values[4] = Int32GetDatum(ctx->enqueue_order[candidate_index]);
+		values[5] = Int32GetDatum(ctx->queue_capacity);
+		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+	}
+
 	SRF_RETURN_DONE(funcctx);
 }
 

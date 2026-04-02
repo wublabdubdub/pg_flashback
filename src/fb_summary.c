@@ -38,7 +38,7 @@ PG_FUNCTION_INFO_V1(fb_summary_block_anchor_debug);
 PG_FUNCTION_INFO_V1(fb_summary_meta_stats_debug);
 
 #define FB_SUMMARY_MAGIC ((uint32) 0x4642534d)
-#define FB_SUMMARY_VERSION 5
+#define FB_SUMMARY_VERSION 6
 #define FB_SUMMARY_LOCATOR_BLOOM_BYTES 64
 #define FB_SUMMARY_RELTAG_BLOOM_BYTES 64
 #define FB_SUMMARY_SECTION_COUNT 6
@@ -212,6 +212,22 @@ typedef struct FbSummaryRelTagHashEntry
 	uint16 slot;
 } FbSummaryRelTagHashEntry;
 
+typedef struct FbSummaryTouchedXidHashEntry
+{
+	TransactionId xid;
+} FbSummaryTouchedXidHashEntry;
+
+typedef struct FbSummaryUnsafeFactHashEntry
+{
+	FbSummaryUnsafeFact fact;
+} FbSummaryUnsafeFactHashEntry;
+
+typedef struct FbSummaryBlockAnchorHashEntry
+{
+	BlockNumber blkno;
+	uint32 index;
+} FbSummaryBlockAnchorHashEntry;
+
 typedef struct FbSummaryBuildRelationEntry
 {
 	uint16 kind;
@@ -219,6 +235,9 @@ typedef struct FbSummaryBuildRelationEntry
 	RelFileLocator locator;
 	Oid db_oid;
 	Oid rel_oid;
+	HTAB *touched_xid_set;
+	HTAB *unsafe_fact_set;
+	HTAB *block_anchor_map;
 	FbSummarySpan *spans;
 	uint32 span_count;
 	uint32 span_capacity;
@@ -321,6 +340,9 @@ static bool fb_summary_bloom_maybe_contains(const unsigned char *bits, Size bits
 static HTAB *fb_summary_create_locator_hash(void);
 static HTAB *fb_summary_create_reltag_hash(void);
 static HTAB *fb_summary_create_xid_outcome_hash(void);
+static HTAB *fb_summary_create_touched_xid_hash(void);
+static HTAB *fb_summary_create_unsafe_fact_hash(void);
+static HTAB *fb_summary_create_block_anchor_hash(void);
 static HTAB *fb_summary_create_query_cache_hash(MemoryContext mcxt);
 static FbSummaryBuildRelationEntry *fb_summary_get_or_add_locator_relation(FbSummaryBuildState *state,
 																		   const RelFileLocator *locator);
@@ -419,14 +441,9 @@ static bool fb_summary_relation_entry_matches_info(const FbSummaryDiskRelationEn
 												   const FbRelationInfo *info);
 static FbSummaryBuildRelationEntry *fb_summary_find_relation_by_slot(FbSummaryBuildState *state,
 																	 uint16 slot);
-static int fb_summary_transactionid_cmp(const void *lhs, const void *rhs);
 static void fb_summary_collect_meta_counts(FbSummaryMetaCounts *counts);
 static int fb_summary_collect_selected_segments(FbSummarySegmentEntry **selected_out,
 												 int *wal_seg_size_out);
-static int fb_summary_disk_touched_xid_cmp(const void *lhs, const void *rhs);
-static int fb_summary_disk_unsafe_fact_cmp(const void *lhs, const void *rhs);
-static int fb_summary_block_anchor_cmp(const void *lhs, const void *rhs);
-static int fb_summary_disk_block_anchor_cmp(const void *lhs, const void *rhs);
 #if PG_VERSION_NUM >= 130000
 static void fb_summary_open_segment(XLogReaderState *state, XLogSegNo next_segno,
 									TimeLineID *timeline_id);
@@ -804,6 +821,45 @@ fb_summary_create_xid_outcome_hash(void)
 }
 
 static HTAB *
+fb_summary_create_touched_xid_hash(void)
+{
+	HASHCTL ctl;
+
+	MemSet(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(TransactionId);
+	ctl.entrysize = sizeof(FbSummaryTouchedXidHashEntry);
+	ctl.hcxt = CurrentMemoryContext;
+	return hash_create("fb summary touched xids", 64, &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+static HTAB *
+fb_summary_create_unsafe_fact_hash(void)
+{
+	HASHCTL ctl;
+
+	MemSet(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(FbSummaryUnsafeFact);
+	ctl.entrysize = sizeof(FbSummaryUnsafeFactHashEntry);
+	ctl.hcxt = CurrentMemoryContext;
+	return hash_create("fb summary unsafe facts", 32, &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+static HTAB *
+fb_summary_create_block_anchor_hash(void)
+{
+	HASHCTL ctl;
+
+	MemSet(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(BlockNumber);
+	ctl.entrysize = sizeof(FbSummaryBlockAnchorHashEntry);
+	ctl.hcxt = CurrentMemoryContext;
+	return hash_create("fb summary block anchors", 64, &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+static HTAB *
 fb_summary_create_query_cache_hash(MemoryContext mcxt)
 {
 	HASHCTL ctl;
@@ -962,7 +1018,14 @@ static void
 fb_summary_relation_append_touched_xid(FbSummaryBuildRelationEntry *entry,
 									   TransactionId xid)
 {
+	bool found = false;
+
 	if (entry == NULL || !TransactionIdIsValid(xid))
+		return;
+	if (entry->touched_xid_set == NULL)
+		entry->touched_xid_set = fb_summary_create_touched_xid_hash();
+	hash_search(entry->touched_xid_set, &xid, HASH_ENTER, &found);
+	if (found)
 		return;
 
 	if (entry->touched_xid_count == entry->touched_xid_capacity)
@@ -990,9 +1053,27 @@ fb_summary_relation_append_block_anchor(FbSummaryBuildRelationEntry *entry,
 										uint16 flags)
 {
 	FbSummaryBlockAnchor *anchor;
+	FbSummaryBlockAnchorHashEntry *hash_entry;
+	bool found = false;
 
 	if (entry == NULL || locator == NULL || XLogRecPtrIsInvalid(anchor_lsn))
 		return;
+	if (entry->block_anchor_map == NULL)
+		entry->block_anchor_map = fb_summary_create_block_anchor_hash();
+	hash_entry = (FbSummaryBlockAnchorHashEntry *)
+		hash_search(entry->block_anchor_map, &blkno, HASH_ENTER, &found);
+	if (found)
+	{
+		anchor = &entry->block_anchors[hash_entry->index];
+		if (anchor_lsn > anchor->anchor_lsn)
+		{
+			anchor->anchor_lsn = anchor_lsn;
+			anchor->flags = flags;
+		}
+		else if (anchor_lsn == anchor->anchor_lsn)
+			anchor->flags |= flags;
+		return;
+	}
 
 	if (entry->block_anchor_count == entry->block_anchor_capacity)
 	{
@@ -1014,6 +1095,7 @@ fb_summary_relation_append_block_anchor(FbSummaryBuildRelationEntry *entry,
 	anchor->blkno = blkno;
 	anchor->anchor_lsn = anchor_lsn;
 	anchor->flags = flags;
+	hash_entry->index = entry->block_anchor_count - 1;
 }
 
 static void
@@ -1029,8 +1111,28 @@ fb_summary_relation_append_unsafe_fact_common(FbSummaryBuildRelationEntry *entry
 											  Oid rel_oid)
 {
 	FbSummaryUnsafeFact *fact;
+	FbSummaryUnsafeFact unsafe_fact;
+	bool found = false;
 
 	if (entry == NULL)
+		return;
+	if (entry->unsafe_fact_set == NULL)
+		entry->unsafe_fact_set = fb_summary_create_unsafe_fact_hash();
+
+	MemSet(&unsafe_fact, 0, sizeof(unsafe_fact));
+	unsafe_fact.reason = (uint8) reason;
+	unsafe_fact.scope = (uint8) scope;
+	unsafe_fact.storage_op = (uint8) storage_op;
+	unsafe_fact.match_kind = match_kind;
+	unsafe_fact.xid = xid;
+	unsafe_fact.record_lsn = record_lsn;
+	if (locator != NULL)
+		unsafe_fact.locator = *locator;
+	unsafe_fact.db_oid = db_oid;
+	unsafe_fact.rel_oid = rel_oid;
+
+	hash_search(entry->unsafe_fact_set, &unsafe_fact, HASH_ENTER, &found);
+	if (found)
 		return;
 
 	if (entry->unsafe_fact_count == entry->unsafe_fact_capacity)
@@ -1047,17 +1149,7 @@ fb_summary_relation_append_unsafe_fact_common(FbSummaryBuildRelationEntry *entry
 	}
 
 	fact = &entry->unsafe_facts[entry->unsafe_fact_count++];
-	MemSet(fact, 0, sizeof(*fact));
-	fact->reason = (uint8) reason;
-	fact->scope = (uint8) scope;
-	fact->storage_op = (uint8) storage_op;
-	fact->match_kind = match_kind;
-	fact->xid = xid;
-	fact->record_lsn = record_lsn;
-	if (locator != NULL)
-		fact->locator = *locator;
-	fact->db_oid = db_oid;
-	fact->rel_oid = rel_oid;
+	*fact = unsafe_fact;
 }
 
 static void
@@ -1193,132 +1285,6 @@ fb_summary_relation_entry_matches_info(const FbSummaryDiskRelationEntry *entry,
 		return true;
 
 	return false;
-}
-
-static int
-fb_summary_transactionid_cmp(const void *lhs, const void *rhs)
-{
-	TransactionId left = *((const TransactionId *) lhs);
-	TransactionId right = *((const TransactionId *) rhs);
-
-	if (TransactionIdPrecedes(left, right))
-		return -1;
-	if (TransactionIdPrecedes(right, left))
-		return 1;
-	return 0;
-}
-
-static int
-fb_summary_disk_touched_xid_cmp(const void *lhs, const void *rhs)
-{
-	const FbSummaryDiskTouchedXid *left = (const FbSummaryDiskTouchedXid *) lhs;
-	const FbSummaryDiskTouchedXid *right = (const FbSummaryDiskTouchedXid *) rhs;
-
-	if (left->slot < right->slot)
-		return -1;
-	if (left->slot > right->slot)
-		return 1;
-	if (TransactionIdPrecedes(left->xid, right->xid))
-		return -1;
-	if (TransactionIdPrecedes(right->xid, left->xid))
-		return 1;
-	return 0;
-}
-
-static int
-fb_summary_disk_unsafe_fact_cmp(const void *lhs, const void *rhs)
-{
-	const FbSummaryDiskUnsafeFact *left = (const FbSummaryDiskUnsafeFact *) lhs;
-	const FbSummaryDiskUnsafeFact *right = (const FbSummaryDiskUnsafeFact *) rhs;
-
-	if (left->slot < right->slot)
-		return -1;
-	if (left->slot > right->slot)
-		return 1;
-	if (left->match_kind < right->match_kind)
-		return -1;
-	if (left->match_kind > right->match_kind)
-		return 1;
-	if (left->reason < right->reason)
-		return -1;
-	if (left->reason > right->reason)
-		return 1;
-	if (left->scope < right->scope)
-		return -1;
-	if (left->scope > right->scope)
-		return 1;
-	if (left->storage_op < right->storage_op)
-		return -1;
-	if (left->storage_op > right->storage_op)
-		return 1;
-	if (TransactionIdPrecedes(left->xid, right->xid))
-		return -1;
-	if (TransactionIdPrecedes(right->xid, left->xid))
-		return 1;
-	if (left->record_lsn < right->record_lsn)
-		return -1;
-	if (left->record_lsn > right->record_lsn)
-		return 1;
-	return memcmp(&left->locator, &right->locator, sizeof(left->locator)) != 0 ?
-		memcmp(&left->locator, &right->locator, sizeof(left->locator)) :
-		((left->db_oid < right->db_oid) ? -1 :
-		 (left->db_oid > right->db_oid) ? 1 :
-		 (left->rel_oid < right->rel_oid) ? -1 :
-		 (left->rel_oid > right->rel_oid) ? 1 : 0);
-}
-
-static int
-fb_summary_block_anchor_cmp(const void *lhs, const void *rhs)
-{
-	const FbSummaryBlockAnchor *left = (const FbSummaryBlockAnchor *) lhs;
-	const FbSummaryBlockAnchor *right = (const FbSummaryBlockAnchor *) rhs;
-	int locator_cmp;
-
-	locator_cmp = memcmp(&left->locator, &right->locator, sizeof(left->locator));
-	if (locator_cmp != 0)
-		return locator_cmp;
-	if (left->forknum < right->forknum)
-		return -1;
-	if (left->forknum > right->forknum)
-		return 1;
-	if (left->blkno < right->blkno)
-		return -1;
-	if (left->blkno > right->blkno)
-		return 1;
-	if (left->anchor_lsn < right->anchor_lsn)
-		return -1;
-	if (left->anchor_lsn > right->anchor_lsn)
-		return 1;
-	if (left->flags < right->flags)
-		return -1;
-	if (left->flags > right->flags)
-		return 1;
-	return 0;
-}
-
-static int
-fb_summary_disk_block_anchor_cmp(const void *lhs, const void *rhs)
-{
-	const FbSummaryDiskBlockAnchor *left = (const FbSummaryDiskBlockAnchor *) lhs;
-	const FbSummaryDiskBlockAnchor *right = (const FbSummaryDiskBlockAnchor *) rhs;
-
-	if (left->slot < right->slot)
-		return -1;
-	if (left->slot > right->slot)
-		return 1;
-	if (left->blkno < right->blkno)
-		return -1;
-	if (left->blkno > right->blkno)
-		return 1;
-	if (left->anchor_lsn < right->anchor_lsn)
-		return -1;
-	if (left->anchor_lsn > right->anchor_lsn)
-		return 1;
-	if (left->flags < right->flags)
-		return -1;
-	if (left->flags > right->flags)
-		return 1;
-	return 0;
 }
 
 static int
@@ -2264,8 +2230,6 @@ fb_summary_build_file_for_segment(const FbSummarySegmentEntry *entry,
 		FbSummaryBuildRelationEntry *src = &state.relations[i];
 		FbSummaryDiskRelationEntry *dst = &disk_relations[i];
 		uint32 j;
-		uint32 unique_touched = 0;
-		uint32 unique_unsafe = 0;
 
 		dst->kind = src->kind;
 		dst->slot = src->slot;
@@ -2287,34 +2251,16 @@ fb_summary_build_file_for_segment(const FbSummarySegmentEntry *entry,
 			span_index++;
 		}
 
-		if (src->touched_xid_count > 1)
-			qsort(src->touched_xids,
-				  src->touched_xid_count,
-				  sizeof(*src->touched_xids),
-				  fb_summary_transactionid_cmp);
 		for (j = 0; j < src->touched_xid_count; j++)
 		{
-			if (j > 0 && src->touched_xids[j] == src->touched_xids[j - 1])
-				continue;
 			disk_touched_xids[touched_xid_index].slot = src->slot;
 			disk_touched_xids[touched_xid_index].xid = src->touched_xids[j];
 			touched_xid_index++;
-			unique_touched++;
 		}
-		dst->touched_xid_count = unique_touched;
+		dst->touched_xid_count = src->touched_xid_count;
 
-		if (src->unsafe_fact_count > 1)
-			qsort(src->unsafe_facts,
-				  src->unsafe_fact_count,
-				  sizeof(*src->unsafe_facts),
-				  fb_summary_disk_unsafe_fact_cmp);
 		for (j = 0; j < src->unsafe_fact_count; j++)
 		{
-			if (j > 0 &&
-				fb_summary_disk_unsafe_fact_cmp(&src->unsafe_facts[j - 1],
-											 &src->unsafe_facts[j]) == 0)
-				continue;
-
 			disk_unsafe_facts[unsafe_fact_index].slot = src->slot;
 			disk_unsafe_facts[unsafe_fact_index].reason = src->unsafe_facts[j].reason;
 			disk_unsafe_facts[unsafe_fact_index].scope = src->unsafe_facts[j].scope;
@@ -2326,23 +2272,11 @@ fb_summary_build_file_for_segment(const FbSummarySegmentEntry *entry,
 			disk_unsafe_facts[unsafe_fact_index].db_oid = src->unsafe_facts[j].db_oid;
 			disk_unsafe_facts[unsafe_fact_index].rel_oid = src->unsafe_facts[j].rel_oid;
 			unsafe_fact_index++;
-			unique_unsafe++;
 		}
-		dst->unsafe_fact_count = unique_unsafe;
+		dst->unsafe_fact_count = src->unsafe_fact_count;
 
-		if (src->block_anchor_count > 1)
-			qsort(src->block_anchors,
-				  src->block_anchor_count,
-				  sizeof(*src->block_anchors),
-				  fb_summary_block_anchor_cmp);
 		for (j = 0; j < src->block_anchor_count; j++)
 		{
-			if (j > 0 &&
-				memcmp(&src->block_anchors[j - 1],
-					   &src->block_anchors[j],
-					   sizeof(*src->block_anchors)) == 0)
-				continue;
-
 			disk_block_anchors[block_anchor_index].slot = src->slot;
 			disk_block_anchors[block_anchor_index].flags = src->block_anchors[j].flags;
 			disk_block_anchors[block_anchor_index].blkno = src->block_anchors[j].blkno;

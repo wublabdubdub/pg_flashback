@@ -81,6 +81,7 @@ typedef struct FbFlashbackCustomScanState
 	FbReplayResult replay_result;
 	FbReverseOpSource *reverse;
 	FbApplyContext *apply;
+	bool		full_output_fast_path;
 } FbFlashbackCustomScanState;
 
 typedef struct FbPlannerFastPathSpec
@@ -134,6 +135,9 @@ static CustomPath *fb_flashback_make_custom_path(PlannerInfo *root,
 												 bool has_fast_path,
 												 const FbPlannerFastPathSpec *fast_path);
 static List *fb_flashback_build_scan_tlist(Index relid, Oid source_relid);
+static bool fb_flashback_is_full_output_targetlist(List *tlist,
+												   Index relid,
+												   Oid source_relid);
 static bool fb_flashback_build_planner_fast_path(PlannerInfo *root,
 												 RelOptInfo *rel,
 												 Oid source_relid,
@@ -142,6 +146,7 @@ static bool fb_flashback_build_planner_fast_path(PlannerInfo *root,
 static List *fb_flashback_serialize_fast_path(const FbPlannerFastPathSpec *spec);
 static void fb_flashback_deserialize_fast_path(List *custom_private,
 											   FbFlashbackCustomScanState *state);
+static bool fb_flashback_private_full_output_fast_path(List *custom_private);
 
 static char *
 fb_flashback_relation_label(Oid relid)
@@ -397,6 +402,78 @@ fb_flashback_build_scan_tlist(Index relid, Oid source_relid)
 
 	relation_close(rel, AccessShareLock);
 	return tlist;
+}
+
+static bool
+fb_flashback_is_full_output_targetlist(List *tlist,
+									   Index relid,
+									   Oid source_relid)
+{
+	Relation	rel;
+	TupleDesc	tupdesc;
+	int			attno;
+	ListCell   *lc;
+
+	if (tlist == NIL || !OidIsValid(source_relid))
+		return false;
+
+	rel = relation_open(source_relid, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
+	lc = list_head(tlist);
+
+	for (attno = 1; attno <= tupdesc->natts; attno++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, attno - 1);
+		TargetEntry *tle;
+		Node	   *expr;
+		Var		   *var;
+
+		if (attr->attisdropped)
+			continue;
+		if (lc == NULL)
+		{
+			relation_close(rel, AccessShareLock);
+			return false;
+		}
+
+		tle = lfirst_node(TargetEntry, lc);
+		lc = lnext(tlist, lc);
+		if (tle->resjunk)
+		{
+			relation_close(rel, AccessShareLock);
+			return false;
+		}
+
+		expr = strip_implicit_coercions((Node *) tle->expr);
+		if (!IsA(expr, Var))
+		{
+			relation_close(rel, AccessShareLock);
+			return false;
+		}
+
+		var = castNode(Var, expr);
+		if (var->varno != relid ||
+			var->varattno != attno ||
+			var->varlevelsup != 0)
+		{
+			relation_close(rel, AccessShareLock);
+			return false;
+		}
+	}
+
+	for (; lc != NULL; lc = lnext(tlist, lc))
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		if (!tle->resjunk)
+		{
+			relation_close(rel, AccessShareLock);
+			return false;
+		}
+	}
+
+	relation_close(rel, AccessShareLock);
+	return true;
 }
 
 static FuncExpr *
@@ -1219,7 +1296,8 @@ fb_flashback_private_source_relid(List *custom_private)
 static List *
 fb_flashback_make_private(FbCustomNodeKind kind,
 						  Oid source_relid,
-						  const FbPlannerFastPathSpec *fast_path)
+						  const FbPlannerFastPathSpec *fast_path,
+						  bool full_output_fast_path)
 {
 	List *private;
 
@@ -1237,9 +1315,28 @@ fb_flashback_make_private(FbCustomNodeKind kind,
 		else
 			private = list_concat(private,
 								  fb_flashback_serialize_fast_path(NULL));
+		private = lappend(private,
+						  makeConst(BOOLOID, -1, InvalidOid, sizeof(bool),
+									BoolGetDatum(full_output_fast_path),
+									false, true));
 	}
 
 	return private;
+}
+
+static bool
+fb_flashback_private_full_output_fast_path(List *custom_private)
+{
+	Node	   *node;
+
+	if (custom_private == NIL || list_length(custom_private) < 4)
+		return false;
+
+	node = llast(custom_private);
+	if (node == NULL || !IsA(node, Const) || exprType(node) != BOOLOID)
+		return false;
+
+	return DatumGetBool(castNode(Const, node)->constvalue);
 }
 
 static FbFlashbackCustomScanState *
@@ -1726,7 +1823,8 @@ fb_flashback_make_custom_path(PlannerInfo *root,
 	cpath->custom_restrictinfo = NIL;
 	cpath->custom_private = fb_flashback_make_private(kind,
 													 source_relid,
-													 fast_path);
+													 fast_path,
+													 false);
 	cpath->methods = fb_custom_path_methods(kind);
 	return cpath;
 }
@@ -1748,6 +1846,7 @@ fb_flashback_plan_custom_path(PlannerInfo *root,
 	List	   *scan_tlist;
 	FbPlannerFastPathSpec fast_path;
 	bool has_fast_path;
+	bool full_output_fast_path = false;
 	List	   *private;
 
 	rte = planner_rt_fetch(rel->relid, root);
@@ -1760,15 +1859,25 @@ fb_flashback_plan_custom_path(PlannerInfo *root,
 	scan_tlist = fb_flashback_build_scan_tlist(rel->relid, source_relid);
 	has_fast_path = false;
 	if (kind == FB_CUSTOM_NODE_APPLY)
+	{
 		has_fast_path = fb_flashback_build_planner_fast_path(root,
 															 rel,
 															 source_relid,
 															 extract_actual_clauses(clauses, false),
 															 &fast_path);
+		full_output_fast_path =
+			!has_fast_path &&
+			clauses == NIL &&
+			root->query_pathkeys == NIL &&
+			fb_flashback_is_full_output_targetlist(tlist,
+												   rel->relid,
+												   source_relid);
+	}
 	private = fb_flashback_make_private(kind,
 										source_relid,
 										(kind == FB_CUSTOM_NODE_APPLY && has_fast_path) ?
-										&fast_path : NULL);
+										&fast_path : NULL,
+										full_output_fast_path);
 	if (kind == FB_CUSTOM_NODE_WAL_INDEX)
 		target_ts_expr = copyObject(lsecond(func->args));
 
@@ -1923,6 +2032,8 @@ fb_flashback_begin_custom_scan(CustomScanState *node,
 	source_relid_const = lsecond_node(Const, cscan->custom_private);
 	state->source_relid = DatumGetObjectId(source_relid_const->constvalue);
 	fb_flashback_deserialize_fast_path(cscan->custom_private, state);
+	state->full_output_fast_path =
+		fb_flashback_private_full_output_fast_path(cscan->custom_private);
 
 	if (state->kind == FB_CUSTOM_NODE_APPLY && OidIsValid(state->source_relid))
 	{
@@ -1961,6 +2072,8 @@ fb_flashback_exec_custom_scan(CustomScanState *node)
 	{
 		PG_TRY();
 		{
+			if (state->full_output_fast_path)
+				return fb_flashback_apply_next(&state->css.ss);
 			return ExecScan(&state->css.ss,
 							fb_flashback_apply_next,
 							fb_flashback_custom_recheck);
@@ -2136,6 +2249,12 @@ fb_flashback_explain_custom_scan(CustomScanState *node,
 
 	rel_label = fb_flashback_relation_label(state->source_relid);
 	ExplainPropertyText("Flashback Relation", rel_label, es);
+	ExplainPropertyBool("Flashback Full Output Fast Path",
+						state->full_output_fast_path,
+						es);
+	ExplainPropertyText("Flashback Output Dispatch",
+						state->full_output_fast_path ? "direct" : "execscan",
+						es);
 	if (state->fast_path.mode != FB_FAST_PATH_NONE)
 	{
 		ExplainPropertyText("Fast Path",

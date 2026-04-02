@@ -128,8 +128,8 @@ FROM pg_flashback(
 );
 NOTICE:  [1/9] validating target relation and runtime (+1.000 ms)
 NOTICE:  [2/9] preparing wal scan context (+2.000 ms)
-NOTICE:  [3/9 100%] scanning wal and building record index (+0.000 ms)
-ERROR:  WAL not complete: retained WAL contains no checkpoint record
+ERROR:  WAL not complete: target timestamp predates retained continuous WAL suffix
+DETAIL:  target=1999-12-31 16:00:00-08 first_retained_segment=000000010000008700000085 gap_between= and 000000010000008700000085
 SELECT fb_progress_debug_reset_clock();
  fb_progress_debug_reset_clock 
 -------------------------------

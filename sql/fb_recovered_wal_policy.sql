@@ -27,6 +27,18 @@ CREATE TEMP TABLE fb_ckwal_fixture (
 	wrong_name text NOT NULL
 );
 
+CREATE TEMP TABLE fb_ckwal_prefix_fixture (
+	old_src_name text NOT NULL,
+	old_wrong_name text NOT NULL,
+	keep_name text NOT NULL,
+	keep_segno bigint NOT NULL
+);
+
+CREATE TEMP TABLE fb_archive_exact_hit_fixture (
+	archive_name text NOT NULL,
+	mismatch_src_name text NOT NULL
+);
+
 DO $$
 DECLARE
 	src_name text;
@@ -78,16 +90,13 @@ BEGIN
 END;
 $$;
 
-DO $$
-BEGIN
-	BEGIN
-		PERFORM fb_prepare_wal_scan_debug(clock_timestamp());
-	EXCEPTION
-		WHEN OTHERS THEN
-			NULL;
-	END;
-END;
-$$;
+SELECT fb_prepare_wal_scan_debug(clock_timestamp()) LIKE
+	   ('%first=' ||
+		(SELECT src_name FROM fb_ckwal_fixture LIMIT 1) ||
+		' last=' ||
+		(SELECT src_name FROM fb_ckwal_fixture LIMIT 1) ||
+		' total=1 archive=1 pg_wal=0 ckwal=0')
+	   AS trailing_invalid_pgwal_tail_does_not_block_archive_suffix;
 
 SELECT count(*) = 0 AS recovered_stays_empty
 FROM pg_ls_dir(current_setting('data_directory') || '/pg_flashback/recovered_wal') AS d(name)
@@ -138,6 +147,63 @@ DECLARE
 	archive_dir text := '/tmp/fb_ckwal_archive_fixture';
 	pgwal_dir text := '/tmp/fb_ckwal_pgwal_fixture';
 BEGIN
+	TRUNCATE fb_archive_exact_hit_fixture;
+
+	INSERT INTO fb_archive_exact_hit_fixture(archive_name, mismatch_src_name)
+	WITH wal AS (
+		SELECT name,
+			   row_number() OVER (ORDER BY name) AS rn
+		FROM pg_ls_dir(data_dir || '/pg_wal') AS d(name)
+		WHERE d.name ~ '^[0-9A-F]{24}$'
+	)
+	SELECT keep.name, mismatch.name
+	FROM wal keep
+	JOIN wal mismatch ON mismatch.rn = keep.rn + 1
+	WHERE keep.rn = 1;
+
+	IF (SELECT count(*) FROM fb_archive_exact_hit_fixture) <> 1 THEN
+		RAISE EXCEPTION 'failed to prepare archive exact-hit fixture';
+	END IF;
+
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'rm -rf ' || archive_dir || ' ' || pgwal_dir ||
+		' && mkdir -p ' || archive_dir || ' ' || pgwal_dir ||
+		' && rm -f ' || data_dir || '/pg_flashback/recovered_wal/*');
+
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'cp ' || quote_literal(data_dir || '/pg_wal/' ||
+							   (SELECT archive_name FROM fb_archive_exact_hit_fixture LIMIT 1)) || ' ' ||
+		quote_literal(archive_dir || '/' ||
+					  (SELECT archive_name FROM fb_archive_exact_hit_fixture LIMIT 1)));
+
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'cp ' || quote_literal(data_dir || '/pg_wal/' ||
+							   (SELECT mismatch_src_name FROM fb_archive_exact_hit_fixture LIMIT 1)) || ' ' ||
+		quote_literal(pgwal_dir || '/' ||
+					  (SELECT archive_name FROM fb_archive_exact_hit_fixture LIMIT 1)));
+
+	EXECUTE format('SET pg_flashback.archive_dest = %L', archive_dir);
+	EXECUTE format('SET pg_flashback.debug_pg_wal_dir = %L', pgwal_dir);
+END;
+$$;
+
+SELECT fb_prepare_wal_scan_debug(clock_timestamp()) LIKE
+	   ('%first=' ||
+		(SELECT archive_name FROM fb_archive_exact_hit_fixture LIMIT 1) ||
+		' last=' ||
+		(SELECT archive_name FROM fb_archive_exact_hit_fixture LIMIT 1) ||
+		' total=1 archive=1 pg_wal=0 ckwal=0')
+	   AS archive_exact_hit_beats_same_name_mismatch;
+
+DO $$
+DECLARE
+	data_dir text := current_setting('data_directory');
+	archive_dir text := '/tmp/fb_ckwal_archive_fixture';
+	pgwal_dir text := '/tmp/fb_ckwal_pgwal_fixture';
+BEGIN
 	EXECUTE format(
 		'COPY (SELECT '''') TO PROGRAM %L',
 		'rm -rf ' || archive_dir || ' ' || pgwal_dir ||
@@ -167,8 +233,101 @@ BEGIN
 END;
 $$;
 
-SELECT count(*) = 1 AS pgwal_mismatch_materializes_once
+SELECT count(*) = 0 AS unrequested_pgwal_mismatch_does_not_materialize
 FROM pg_ls_dir(current_setting('data_directory') || '/pg_flashback/recovered_wal') AS d(name)
 WHERE d.name = (SELECT src_name FROM fb_ckwal_fixture LIMIT 1);
+
+DO $$
+DECLARE
+	data_dir text := current_setting('data_directory');
+	archive_dir text := '/tmp/fb_ckwal_archive_fixture';
+	pgwal_dir text := '/tmp/fb_ckwal_pgwal_fixture';
+	rec record;
+BEGIN
+	TRUNCATE fb_ckwal_prefix_fixture;
+
+	WITH wal AS (
+		SELECT name,
+			   (('x' || substr(name, 9, 8))::bit(32)::bigint *
+				(4294967296::bigint / pg_size_bytes(current_setting('wal_segment_size'))) +
+				('x' || substr(name, 17, 8))::bit(32)::bigint) AS segno
+		FROM pg_ls_dir(data_dir || '/pg_wal') AS d(name)
+		WHERE d.name ~ '^[0-9A-F]{24}$'
+	),
+	latest_suffix AS (
+		SELECT w1.segno AS start_segno
+		FROM wal w1
+		JOIN wal w2 ON w2.segno = w1.segno + 1
+		JOIN wal w3 ON w3.segno = w1.segno + 2
+		ORDER BY w1.segno DESC
+		LIMIT 1
+	),
+	older_pick AS (
+		SELECT name, segno
+		FROM wal
+		WHERE segno < (SELECT start_segno FROM latest_suffix) - 1
+		ORDER BY segno DESC
+		LIMIT 1
+	)
+	INSERT INTO fb_ckwal_prefix_fixture(old_src_name, old_wrong_name, keep_name, keep_segno)
+	SELECT older_pick.name,
+		   upper(substr(older_pick.name, 1, 16) ||
+				 lpad(to_hex(('x' || substr(older_pick.name, 17, 8))::bit(32)::bigint + 1), 8, '0')),
+		   wal.name,
+		   wal.segno
+	FROM wal
+	CROSS JOIN latest_suffix
+	CROSS JOIN older_pick
+	WHERE wal.segno BETWEEN latest_suffix.start_segno AND latest_suffix.start_segno + 2
+	ORDER BY wal.segno;
+
+	IF (SELECT count(*) FROM fb_ckwal_prefix_fixture) <> 3 THEN
+		RAISE EXCEPTION 'failed to prepare retained suffix fixture';
+	END IF;
+
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'rm -rf ' || archive_dir || ' ' || pgwal_dir ||
+		' && mkdir -p ' || archive_dir || ' ' || pgwal_dir ||
+		' && rm -f ' || data_dir || '/pg_flashback/recovered_wal/*');
+
+	FOR rec IN
+		SELECT keep_name
+		FROM fb_ckwal_prefix_fixture
+		ORDER BY keep_segno
+	LOOP
+		EXECUTE format(
+			'COPY (SELECT '''') TO PROGRAM %L',
+			'cp ' || quote_literal(data_dir || '/pg_wal/' || rec.keep_name) || ' ' ||
+			quote_literal(archive_dir || '/' || rec.keep_name));
+	END LOOP;
+
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'cp ' ||
+		quote_literal(data_dir || '/pg_wal/' ||
+					  (SELECT old_src_name FROM fb_ckwal_prefix_fixture LIMIT 1)) || ' ' ||
+		quote_literal(pgwal_dir || '/' ||
+					  (SELECT old_wrong_name FROM fb_ckwal_prefix_fixture LIMIT 1)));
+
+	EXECUTE format('SET pg_flashback.archive_dest = %L', archive_dir);
+	EXECUTE format('SET pg_flashback.debug_pg_wal_dir = %L', pgwal_dir);
+END;
+$$;
+
+DO $$
+BEGIN
+	BEGIN
+		PERFORM fb_prepare_wal_scan_debug(clock_timestamp());
+	EXCEPTION
+		WHEN OTHERS THEN
+			NULL;
+	END;
+END;
+$$;
+
+SELECT count(*) = 0 AS older_mismatch_outside_retained_suffix_does_not_materialize
+FROM pg_ls_dir(current_setting('data_directory') || '/pg_flashback/recovered_wal') AS d(name)
+WHERE d.name = (SELECT old_src_name FROM fb_ckwal_prefix_fixture LIMIT 1);
 
 DROP FUNCTION fb_prepare_wal_scan_debug(timestamptz);

@@ -150,3 +150,18 @@ To github.com:wublabdubdub/pg_flashback.git
 To github.com:wublabdubdub/pg_flashback.git
    04f2e9b..abb0d8a  main -> main
 [2026-04-01 01:00:06 CST] auto update finished
+[2026-04-02 01:00:01 CST] committing changes to origin/main
+[main 6828879] update
+ 39 files changed, 4263 insertions(+), 350 deletions(-)
+ create mode 100644 docs/decisions/ADR-0024-block-anchor-summary-v1.md
+ create mode 100644 docs/superpowers/plans/2026-04-01-build-index-progress-and-payload-plan.md
+ create mode 100644 docs/superpowers/plans/2026-04-01-heap-insert-root-cause-debug.md
+ create mode 100644 docs/superpowers/plans/2026-04-01-recovered-wal-policy-tightening.md
+ create mode 100644 docs/superpowers/specs/2026-04-01-build-index-progress-and-payload-design.md
+ create mode 100644 expected/fb_replay.out
+ create mode 100644 expected/fb_wal_error_surface.out
+ create mode 100644 sql/fb_wal_error_surface.sql
+[2026-04-02 01:00:01 CST] pushing to origin/main
+To github.com:wublabdubdub/pg_flashback.git
+   abb0d8a..6828879  main -> main
+[2026-04-02 01:00:06 CST] auto update finished

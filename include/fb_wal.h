@@ -220,6 +220,14 @@ typedef struct FbRecordRef
 	Size main_data_len;
 } FbRecordRef;
 
+static inline bool
+fb_record_block_has_applicable_image(const FbRecordBlockRef *block_ref)
+{
+	return block_ref != NULL &&
+		block_ref->has_image &&
+		block_ref->apply_image;
+}
+
 /*
  * FbWalRecordIndex
  *    WAL structure.
@@ -324,6 +332,12 @@ void fb_wal_record_cursor_close(FbWalRecordCursor *cursor);
 bool fb_wal_record_load(const FbWalRecordIndex *index,
 						 uint32 record_index,
 						 FbRecordRef *record);
+bool fb_wal_record_block_materializes_page(const FbRecordRef *record,
+										   int block_index);
+bool fb_wal_decode_record_ref(XLogReaderState *reader,
+							  const FbRelationInfo *info,
+							  FbRecordRef *record_out);
+void fb_wal_release_record(FbRecordRef *record);
 /*
  * fb_wal_visit_records
  *    WAL API.
@@ -332,6 +346,7 @@ bool fb_wal_record_load(const FbWalRecordIndex *index,
 void fb_wal_visit_records(FbWalScanContext *ctx, FbWalRecordVisitor visitor,
 						  void *arg);
 void fb_wal_visit_resolved_records(const FbWalRecordIndex *index,
+								   XLogRecPtr start_lsn,
 								   XLogRecPtr end_lsn,
 								   FbWalRecordVisitor visitor,
 								   void *arg);

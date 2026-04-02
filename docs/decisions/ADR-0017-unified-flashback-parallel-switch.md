@@ -22,12 +22,6 @@
 1. 用户看到“并行开关”，但它实际上只覆盖一个子阶段，语义过窄。
 2. 接下来要继续把 flashback 主链其余可安全并行的阶段并进来时，原参数名已经不再准确。
 
-同时，当前仓库已存在：
-
-- `pg_flashback.export_parallel_workers`
-
-它服务的是 `pg_flashback_to` keyed 导出 worker 体系，不属于本次 flashback 查询主链并行总开关改造范围。
-
 ## 决策
 
 将 flashback 主链并行控制统一收口为：
@@ -79,11 +73,6 @@
   - Phase A：metadata worker 并行收集 checkpoint / touched_xids / unsafe
   - Phase B：leader 串行只扫 `RM_XACT_ID` 回填事务状态
   - correctness 合同可成立，但 live case 上尚未稳定打赢串行 metadata 基线
-
-明确不纳入本次统一开关接管范围：
-
-- `pg_flashback.export_parallel_workers`
-- `pg_flashback_to` keyed 导出 worker 体系
 
 旧参数处理固定为：
 

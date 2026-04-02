@@ -31,7 +31,6 @@ static char *fb_spill_mode_setting = NULL;
 static uint64 fb_memory_limit_kb = UINT64CONST(1048576);
 static FbSpillMode fb_spill_mode = FB_SPILL_MODE_AUTO;
 static int	fb_parallel_workers_setting = 8;
-static int	fb_export_parallel_workers_setting = 0;
 static bool fb_show_progress = true;
 static bool fb_summary_service_setting = true;
 static int fb_summary_service_workers_setting = 2;
@@ -163,19 +162,6 @@ _PG_init(void)
 							8,
 							0,
 							16,
-							PGC_USERSET,
-							0,
-							NULL,
-							NULL,
-							NULL);
-
-	DefineCustomIntVariable("pg_flashback.export_parallel_workers",
-							"Enable keyed-only parallel workers for pg_flashback_to.",
-							"When greater than 1, keyed single-column relations may use independent export workers and a finalizer to build the flashback table.",
-							&fb_export_parallel_workers_setting,
-							0,
-							0,
-							8,
 							PGC_USERSET,
 							0,
 							NULL,
@@ -497,12 +483,6 @@ int
 fb_parallel_workers(void)
 {
 	return fb_parallel_workers_setting;
-}
-
-int
-fb_export_parallel_workers(void)
-{
-	return fb_export_parallel_workers_setting;
 }
 
 bool

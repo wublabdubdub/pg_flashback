@@ -105,7 +105,6 @@ const char *fb_spill_mode_name(FbSpillMode mode);
  */
 
 int fb_parallel_workers(void);
-int fb_export_parallel_workers(void);
 bool fb_summary_service_enabled(void);
 int fb_summary_service_workers(void);
 int fb_summary_service_scan_interval_ms(void);

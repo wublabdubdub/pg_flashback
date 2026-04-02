@@ -74,6 +74,7 @@ PG_FUNCTION_INFO_V1(fb_keyed_key_debug);
 PG_FUNCTION_INFO_V1(fb_prepare_wal_scan_debug);
 PG_FUNCTION_INFO_V1(fb_replay_debug);
 PG_FUNCTION_INFO_V1(fb_recordref_debug);
+PG_FUNCTION_INFO_V1(fb_recordref_block_debug);
 PG_FUNCTION_INFO_V1(fb_recordref_missing_spool_debug);
 PG_FUNCTION_INFO_V1(fb_progress_debug_set_clock);
 PG_FUNCTION_INFO_V1(fb_progress_debug_reset_clock);
@@ -140,6 +141,42 @@ fb_parse_target_ts_text(text *target_ts_text)
 												   CStringGetDatum(target_ts_cstr),
 												   ObjectIdGetDatum(InvalidOid),
 												   Int32GetDatum(-1)));
+}
+
+static const char *
+fb_record_kind_name(FbWalRecordKind kind)
+{
+	switch (kind)
+	{
+		case FB_WAL_RECORD_HEAP_INSERT:
+			return "heap_insert";
+		case FB_WAL_RECORD_HEAP_DELETE:
+			return "heap_delete";
+		case FB_WAL_RECORD_HEAP_UPDATE:
+			return "heap_update";
+		case FB_WAL_RECORD_HEAP_HOT_UPDATE:
+			return "heap_hot_update";
+		case FB_WAL_RECORD_HEAP_CONFIRM:
+			return "heap_confirm";
+		case FB_WAL_RECORD_HEAP_LOCK:
+			return "heap_lock";
+		case FB_WAL_RECORD_HEAP_INPLACE:
+			return "heap_inplace";
+		case FB_WAL_RECORD_HEAP2_PRUNE:
+			return "heap2_prune";
+		case FB_WAL_RECORD_HEAP2_VISIBLE:
+			return "heap2_visible";
+		case FB_WAL_RECORD_HEAP2_MULTI_INSERT:
+			return "heap2_multi_insert";
+		case FB_WAL_RECORD_HEAP2_LOCK_UPDATED:
+			return "heap2_lock_updated";
+		case FB_WAL_RECORD_XLOG_FPI:
+			return "xlog_fpi";
+		case FB_WAL_RECORD_XLOG_FPI_FOR_HINT:
+			return "xlog_fpi_for_hint";
+	}
+
+	return "unknown";
 }
 
 static const char *
@@ -832,7 +869,7 @@ fb_recordref_debug(PG_FUNCTION_ARGS)
 
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
-						 "anchor=%s unsafe=%s reason=%s meta_refs=%llu payload_refs=%u kept=%llu target_dml=%llu commits=%llu aborts=%llu tail_inline=%s head_gap_refs=%u tail_refs=%u parallel=%s prefilter=%s visited_segments=%u/%u payload_windows=%u payload_scan_mode=%s payload_parallel_workers=%u payload_covered_segments=%u payload_scanned_records=%llu payload_kept_records=%llu payload_sparse_reader_resets=%llu payload_sparse_reader_reuses=%llu summary_span_windows=%u summary_xid_hits=%u summary_xid_fallback=%u summary_xid_segments_read=%u summary_unsafe_hits=%u metadata_fallback_windows=%u",
+						 "anchor=%s unsafe=%s reason=%s meta_refs=%llu payload_refs=%u kept=%llu target_dml=%llu commits=%llu aborts=%llu tail_inline=%s head_gap_refs=%u tail_refs=%u parallel=%s prefilter=%s visited_segments=%u/%u payload_windows=%u payload_scan_mode=%s payload_parallel_workers=%u payload_covered_segments=%u payload_scanned_records=%llu payload_kept_records=%llu payload_sparse_reader_resets=%llu payload_sparse_reader_reuses=%llu summary_span_windows=%u summary_xid_hits=%u summary_xid_fallback=%u summary_xid_segments_read=%u summary_unsafe_hits=%u metadata_fallback_windows=%u anchor_redo=%X/%08X",
 						 index.anchor_found ? "true" : "false",
 						 index.unsafe ? "true" : "false",
 						 fb_wal_unsafe_reason_name(index.unsafe_reason),
@@ -862,7 +899,8 @@ fb_recordref_debug(PG_FUNCTION_ARGS)
 						 scan_ctx.summary_xid_fallback,
 						 scan_ctx.summary_xid_segments_read,
 						 scan_ctx.summary_unsafe_hits,
-						 scan_ctx.metadata_fallback_windows);
+						 scan_ctx.metadata_fallback_windows,
+						 LSN_FORMAT_ARGS(index.anchor_redo_lsn));
 
 		fb_spool_session_destroy(spool);
 		spool = NULL;
@@ -895,6 +933,119 @@ fb_recordref_missing_spool_debug(PG_FUNCTION_ARGS)
 	fb_wal_build_record_index(&info, &scan_ctx, &index);
 
 	PG_RETURN_TEXT_P(cstring_to_text("unexpected success"));
+}
+
+Datum
+fb_recordref_block_debug(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	BlockNumber blkno = PG_GETARG_UINT32(2);
+	FbRelationInfo info;
+	FbWalScanContext scan_ctx;
+	FbWalRecordIndex index;
+	FbSpoolSession *spool = NULL;
+	FbWalRecordCursor *cursor = NULL;
+	FbRecordRef record;
+	uint32 record_index = 0;
+	StringInfoData buf;
+	bool first = true;
+
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+	fb_catalog_load_relation_info(relid, &info);
+
+	PG_TRY();
+	{
+		FbWalPrecomputedMissingBlock *missing;
+
+		spool = fb_spool_session_create();
+		fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
+		fb_wal_build_record_index(&info, &scan_ctx, &index);
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "anchor_redo=%X/%08X block=%u precomputed_first=",
+						 LSN_FORMAT_ARGS(index.anchor_redo_lsn),
+						 blkno);
+		if (index.precomputed_missing_blocks != NULL)
+		{
+			bool found = false;
+			FbWalBlockKey key;
+
+			MemSet(&key, 0, sizeof(key));
+			key.locator = info.locator;
+			key.forknum = MAIN_FORKNUM;
+			key.blkno = blkno;
+			missing = (FbWalPrecomputedMissingBlock *)
+				hash_search(index.precomputed_missing_blocks, &key, HASH_FIND, &found);
+			if (found && missing != NULL)
+				appendStringInfo(&buf, "%X/%08X", LSN_FORMAT_ARGS(missing->first_record_lsn));
+			else
+				appendStringInfoString(&buf, "none");
+		}
+		else
+			appendStringInfoString(&buf, "none");
+
+		appendStringInfoString(&buf, " records=");
+		cursor = fb_wal_record_cursor_open(&index, FB_SPOOL_FORWARD);
+		while (fb_wal_record_cursor_read(cursor, &record, &record_index))
+		{
+			int block_index;
+
+			for (block_index = 0; block_index < record.block_count; block_index++)
+			{
+				const FbRecordBlockRef *block_ref = &record.blocks[block_index];
+
+				if (!block_ref->in_use ||
+					!RelFileLocatorEquals(block_ref->locator, info.locator) ||
+					block_ref->forknum != MAIN_FORKNUM ||
+					block_ref->blkno != blkno)
+					continue;
+
+				if (!first)
+					appendStringInfoString(&buf, ",");
+				first = false;
+				appendStringInfo(&buf,
+								 "#%u@%X/%08X:%s:image=%s:apply=%s:imgmax=%s:init=%s:data=%s",
+								 record_index,
+								 LSN_FORMAT_ARGS(record.lsn),
+								 fb_record_kind_name(record.kind),
+								 block_ref->has_image ? "true" : "false",
+								 block_ref->apply_image ? "true" : "false",
+								 (block_ref->has_image && block_ref->image != NULL) ?
+								 psprintf("%u",
+										  (unsigned int) PageGetMaxOffsetNumber((Page) block_ref->image)) :
+								 "none",
+								 record.init_page ? "true" : "false",
+								 block_ref->has_data ? "true" : "false");
+				break;
+			}
+		}
+
+		if (cursor != NULL)
+		{
+			fb_wal_record_cursor_close(cursor);
+			cursor = NULL;
+		}
+		if (spool != NULL)
+		{
+			fb_spool_session_destroy(spool);
+			spool = NULL;
+		}
+		fb_runtime_cleanup_stale();
+		PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+	}
+	PG_CATCH();
+	{
+		if (cursor != NULL)
+			fb_wal_record_cursor_close(cursor);
+		if (spool != NULL)
+			fb_spool_session_destroy(spool);
+		fb_runtime_cleanup_stale();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 Datum

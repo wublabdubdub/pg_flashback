@@ -2,7 +2,7 @@
 
 ## 项目目标
 
-`pg_flashback` 是一个 PostgreSQL 扩展，提供历史查询、原表闪回与反向操作导出能力。
+`pg_flashback` 是一个 PostgreSQL 扩展，提供历史查询与反向操作导出能力。
 
 当前产品文档交付策略补充为：
 
@@ -18,19 +18,20 @@
 当前代码已安装的用户接口：
 
 ```sql
-SELECT pg_flashback_to(
-  'public.t1'::regclass,
-  '2026-03-22 10:00:00+08'
-);
-```
-
-```sql
 SELECT *
 FROM pg_flashback(
   NULL::public.t1,
   '2026-03-22 10:00:00+08'
 );
 ```
+
+当前全表闪回承接策略固定为：
+
+- 库内另立新表：
+  - `CREATE TABLE new_table AS SELECT * FROM pg_flashback(NULL::schema.table, target_ts_text);`
+- 对外导出：
+  - `COPY (SELECT * FROM pg_flashback(NULL::schema.table, target_ts_text)) TO ...`
+- `COPY` 不作为“直接创建闪回结果表”的主路径
 
 规划中但当前未对外安装的接口：
 
@@ -42,9 +43,7 @@ FROM pg_flashback(
 - 支持必要 TOAST
 - 支持 `INSERT/DELETE/UPDATE`
 - 支持归档 WAL 完整前提下的历史查询
-- 支持直接修改 keyed 原表，把原表回退到目标时间点
 - 支持导出 undo SQL / reverse op
-- 允许按受限条件改写原业务表
 
 ## 首版不支持
 
@@ -60,9 +59,6 @@ FROM pg_flashback(
 - unlogged 表
 - 自动执行 undo SQL
 - 不完整归档下的 best-effort 返回
-- bag 表原表闪回
-- 多列键原表闪回
-- 含外键或用户触发器的原表闪回
 
 ## 结果语义
 
@@ -92,14 +88,12 @@ FROM pg_flashback(
 - 当前安装脚本对外只暴露：
   - `fb_version()`
   - `fb_check_relation(regclass)`
-  - `pg_flashback_to(regclass, text)`
   - `pg_flashback(anyelement, text)`
 - 当前主链已落地：
   - `checkpoint -> RecordRef -> BlockReplayStore -> heap redo`
   - 从页级重放提取 `ForwardOp`
   - 从 `ForwardOp` 构建 `ReverseOp`
   - `keyed` 与 `bag` 两种查询执行模型
-  - `pg_flashback_to(regclass, text)` 原表闪回入口
   - `pg_flashback(anyelement, text)` 真实 flashback 用户入口
 - 当前运行时已落地：
   - `archive_dest + archive_command autodiscovery + pg_wal + recovered_wal` 来源解析
@@ -199,9 +193,12 @@ FROM pg_flashback(
 
 当前代码已实际收口为：
 
-- 对外提供两个用户入口：
-  - `pg_flashback_to(regclass, text)`
+- 对外提供一个用户入口：
   - `pg_flashback(anyelement, text)`
+- 对“全表闪回另立新表”的正式承接方式：
+  - `CTAS AS SELECT * FROM pg_flashback(...)`
+- 对“全表闪回导出”的正式承接方式：
+  - `COPY (SELECT * FROM pg_flashback(...)) TO ...`
 - `fb_export_undo()` 当前尚未对外安装
 - `fb_flashback_materialize()` / `fb_internal_flashback()` 当前未对外安装
 - 用户不需要手写 `AS t(...)`
@@ -209,13 +206,6 @@ FROM pg_flashback(
 ## 当前新增的用户接口决策
 
 当前可用入口是：
-
-```sql
-SELECT pg_flashback_to(
-  'public.fb_live_minute_test'::regclass,
-  '2026-03-23 08:09:30.676307+08'
-);
-```
 
 ```sql
 SELECT *
@@ -227,11 +217,6 @@ FROM pg_flashback(
 
 约束如下：
 
-- `pg_flashback_to(regclass, text)`：
-  - 直接修改原表，把原表回退到目标时间点
-  - 当前仅支持 keyed + 单列稳定键
-  - 当前执行时拿 `AccessExclusiveLock`
-  - 当前检测到外键或用户触发器直接报错
 - 第一个参数：目标表复合类型锚点，典型写法 `NULL::schema.table`
 - 第二个参数：目标时间点，`text`
 - 用户不再需要手写：

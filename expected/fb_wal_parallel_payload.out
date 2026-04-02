@@ -256,3 +256,12 @@ SELECT substring(:'dense_parallel_summary' FROM 'payload_windows=([0-9]+)')::int
  t                           | t
 (1 row)
 
+SELECT :'dense_parallel_summary' LIKE '%payload_sparse_reader_resets=%'
+	   AS tracks_sparse_reader_resets,
+	   :'dense_parallel_summary' LIKE '%payload_sparse_reader_reuses=%'
+	   AS tracks_sparse_reader_reuses;
+ tracks_sparse_reader_resets | tracks_sparse_reader_reuses 
+-----------------------------+-----------------------------
+ t                           | t
+(1 row)
+

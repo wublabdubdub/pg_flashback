@@ -5,13 +5,6 @@
 当前用户入口为：
 
 ```sql
-SELECT pg_flashback_to(
-  'public.t1'::regclass,
-  '2026-03-28 10:00:00+08'
-);
-```
-
-```sql
 SELECT *
 FROM pg_flashback(
   NULL::public.t1,
@@ -23,7 +16,6 @@ FROM pg_flashback(
 
 - `fb_version()`
 - `fb_check_relation(regclass)`
-- `pg_flashback_to(regclass, text)`
 - `pg_flashback(anyelement, text)`
 
 对应安装脚本：
@@ -189,11 +181,16 @@ Custom Scan (FbApplyScan)
 - 在 `shared_preload_libraries` 模式下注册 launcher 与 worker
 - 维护扩展私有 shared queue
 - 显式区分热前沿与冷回填两类任务
+- 当前调度收敛目标是：
+  - 固定 `1` 个 worker 优先跟 hot frontiers
+  - 其余 worker 优先补历史 cold backlog
+  - cold backlog 支持小批量连续 segment claim
 - 周期扫描 archive / `pg_wal` / `recovered_wal`
 - 让 worker 读取 WAL segment 并预建 summary
 - 对 `meta/summary` 执行 summary 专属自动清理
 - 提供 summary 预建进度的 SQL 可观测面：
   - 用户主视图为 `pg_flashback_summary_progress`
+    - 当前同时暴露 backlog 的 best-effort `estimated_completion_at`
   - 服务内部调试视图为 `pg_flashback_summary_service_debug`
   - 并维护最近一次 flashback 查询的 summary 降级观测，区分“summary 文件都在”和“最近查询没有回退到原始 WAL 扫描”
 
@@ -247,7 +244,7 @@ Custom Scan (FbApplyScan)
 - 提供 query 级 spill 目录
 - 提供 append-only spool log / cursor / anchor
 - 给 `RecordRef` payload、reverse-op runs、sidecar 调试路径提供顺序读写介质
-- 给 `pg_flashback_to()` keyed 并行导出提供跨 backend 共享的 reverse-source 顺序读介质
+- 给查询式 flashback 的 reverse-source / spool / debug 路径提供顺序读写介质
 
 ### `fb_wal`
 
@@ -400,25 +397,6 @@ Custom Scan (FbApplyScan)
 - `retired_chunks`
 
 ### `fb_export`
-
-文件：
-
-- `src/fb_export.c`
-- `include/fb_export.h`
-
-职责：
-
-- `pg_flashback_to(regclass, text)` 用户入口
-- 对 keyed + 单列稳定键 relation，支持不扫当前整表的原表回退：
-  - 先汇总变化 key 在目标时间点的终态
-  - 再以批量 `UPDATE / INSERT / DELETE` 直接改写原表
-
-说明：
-
-- `fb_export_undo()` 在 `src/fb_entry.c` 中已有入口骨架
-- 当前仍直接报 `not implemented`
-- `pg_flashback_to()` 已安装到公开 SQL 面
-- 旧的 `pg_flashback_rewind()` 与持久表导出公开入口已下线
 
 ### `fb_compat`
 
