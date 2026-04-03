@@ -25,6 +25,7 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/standbydefs.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/snapmgr.h"
 #include "utils/hsearch.h"
@@ -38,6 +39,8 @@
 #include "fb_summary.h"
 #include "fb_summary_service.h"
 #include "fb_wal.h"
+
+PG_FUNCTION_INFO_V1(fb_wal_payload_window_contract_debug);
 
 #if !defined(HAVE_MEMMEM)
 /*
@@ -898,6 +901,11 @@ static FbWalVisitWindow *fb_copy_visit_windows(const FbWalVisitWindow *windows,
 											   uint32 window_count);
 static bool fb_should_use_sparse_payload_scan(uint32 sparse_window_count,
 											  uint32 windowed_window_count);
+static void fb_wal_prepare_payload_read_window(FbWalScanContext *ctx,
+												 const FbWalVisitWindow *window,
+												 const FbWalSegmentEntry *all_segments,
+												 uint32 all_segment_count,
+												 FbWalVisitWindow *read_window);
 static bool fb_wal_visit_windows_share_segment_slice(const FbWalVisitWindow *lhs,
 													 const FbWalVisitWindow *rhs);
 static uint32 fb_split_parallel_materialize_windows(FbWalScanContext *ctx,
@@ -2658,6 +2666,50 @@ fb_wal_visit_windows_share_segment_slice(const FbWalVisitWindow *lhs,
 
 	return lhs->segments == rhs->segments &&
 		lhs->segment_count == rhs->segment_count;
+}
+
+static void
+fb_wal_prepare_payload_read_window(FbWalScanContext *ctx,
+								   const FbWalVisitWindow *window,
+								   const FbWalSegmentEntry *all_segments,
+								   uint32 all_segment_count,
+								   FbWalVisitWindow *read_window)
+{
+	XLogRecPtr first_segment_start;
+
+	if (read_window != NULL)
+		MemSet(read_window, 0, sizeof(*read_window));
+	if (ctx == NULL || window == NULL || read_window == NULL)
+		return;
+
+	*read_window = *window;
+	if (window->segments == NULL || window->segment_count == 0)
+		return;
+
+	first_segment_start =
+		fb_segment_start_lsn(&window->segments[0], ctx->wal_seg_size);
+	read_window->start_lsn = first_segment_start;
+
+	if (all_segments != NULL &&
+		all_segment_count > 0 &&
+		window->segments >= all_segments &&
+		window->segments < all_segments + all_segment_count)
+	{
+		uint32 start_index = (uint32) (window->segments - all_segments);
+
+		if (start_index > 0)
+		{
+			const FbWalSegmentEntry *previous = &all_segments[start_index - 1];
+
+			if (previous->segno + 1 == window->segments[0].segno)
+			{
+				read_window->segments = (FbWalSegmentEntry *) previous;
+				read_window->segment_count = window->segment_count + 1;
+				read_window->start_lsn =
+					fb_segment_start_lsn(previous, ctx->wal_seg_size);
+			}
+		}
+	}
 }
 
 /*
@@ -6978,7 +7030,7 @@ fb_index_record_visitor(XLogReaderState *reader, void *arg)
 	if (state->capture_payload &&
 		!XLogRecPtrIsInvalid(state->payload_emit_end_lsn))
 		payload_emit_visible =
-			(reader->ReadRecPtr >= state->payload_emit_start_lsn &&
+			(reader->EndRecPtr >= state->payload_emit_start_lsn &&
 			 reader->ReadRecPtr < state->payload_emit_end_lsn);
 	if (state->capture_payload &&
 		reader->ReadRecPtr >= index->anchor_redo_lsn &&
@@ -7477,7 +7529,8 @@ fb_wal_visit_window_batch(FbWalScanContext *ctx,
 	bool *saved_hit_map;
 	bool saved_prefilter_used;
 	bool saved_current_segment_may_hit;
-	const FbWalVisitWindow *previous_window = NULL;
+	FbWalVisitWindow previous_read_window;
+	bool previous_read_valid = false;
 	uint32 i;
 	bool keep_scanning = true;
 
@@ -7528,17 +7581,25 @@ fb_wal_visit_window_batch(FbWalScanContext *ctx,
 	for (i = 0; i < window_count && keep_scanning; i++)
 	{
 		const FbWalVisitWindow *window = &windows[i];
+		FbWalVisitWindow read_window;
 		XLogRecPtr first_record;
 
 		if (window->segments == NULL || window->segment_count == 0 ||
 			window->start_lsn >= window->end_lsn)
 			continue;
 
-		if (previous_window == NULL ||
-			!fb_wal_visit_windows_share_segment_slice(previous_window, window))
+		fb_wal_prepare_payload_read_window(ctx,
+										   window,
+										   (FbWalSegmentEntry *) saved_segments,
+										   saved_segment_count,
+										   &read_window);
+
+		if (!previous_read_valid ||
+			!fb_wal_visit_windows_share_segment_slice(&previous_read_window,
+													 &read_window))
 		{
-			ctx->resolved_segments = window->segments;
-			ctx->resolved_segment_count = window->segment_count;
+			ctx->resolved_segments = read_window.segments;
+			ctx->resolved_segment_count = read_window.segment_count;
 			fb_wal_close_private_file(&private);
 			private.last_open_segno_valid = false;
 			private.last_open_entry = NULL;
@@ -7550,13 +7611,14 @@ fb_wal_visit_window_batch(FbWalScanContext *ctx,
 			ctx->payload_sparse_reader_reuses++;
 		state->payload_emit_start_lsn = window->start_lsn;
 		state->payload_emit_end_lsn = window->end_lsn;
-		private.endptr = window->read_end_lsn;
+		private.endptr = read_window.read_end_lsn;
 		private.endptr_reached = false;
 
-		first_record = XLogFindNextRecord(reader, window->start_lsn);
-		if (XLogRecPtrIsInvalid(first_record) || first_record >= window->read_end_lsn)
+		first_record = XLogFindNextRecord(reader, read_window.start_lsn);
+		if (XLogRecPtrIsInvalid(first_record) || first_record >= read_window.read_end_lsn)
 		{
-			previous_window = window;
+			previous_read_window = read_window;
+			previous_read_valid = true;
 			continue;
 		}
 
@@ -7585,7 +7647,8 @@ fb_wal_visit_window_batch(FbWalScanContext *ctx,
 				keep_scanning = false;
 		}
 
-		previous_window = window;
+		previous_read_window = read_window;
+		previous_read_valid = true;
 	}
 
 	XLogReaderFree(reader);
@@ -8956,6 +9019,7 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 				{
 					for (i = 0; i < payload_windowed_count; i++)
 					{
+						FbWalVisitWindow read_window;
 						XLogRecPtr emit_start = payload_windowed_windows[i].start_lsn;
 
 						if (!XLogRecPtrIsInvalid(payload_emit_floor) &&
@@ -8965,7 +9029,12 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 							continue;
 						state.payload_emit_start_lsn = emit_start;
 						state.payload_emit_end_lsn = payload_windowed_windows[i].end_lsn;
-						fb_wal_visit_window(ctx, &payload_windowed_windows[i],
+						fb_wal_prepare_payload_read_window(ctx,
+														   &payload_windowed_windows[i],
+														   (FbWalSegmentEntry *) ctx->resolved_segments,
+														   ctx->resolved_segment_count,
+														   &read_window);
+						fb_wal_visit_window(ctx, &read_window,
 											fb_index_record_visitor, &state);
 						if (XLogRecPtrIsInvalid(payload_emit_floor) ||
 							payload_windowed_windows[i].end_lsn > payload_emit_floor)
@@ -9023,6 +9092,47 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 		pfree(payload_base_windows);
 	hash_destroy(state.touched_xids);
 	hash_destroy(state.unsafe_xids);
+}
+
+Datum
+fb_wal_payload_window_contract_debug(PG_FUNCTION_ARGS)
+{
+	FbWalScanContext ctx;
+	FbWalSegmentEntry segments[2];
+	FbWalVisitWindow emit_window;
+	FbWalVisitWindow read_window;
+	XLogSegNo current_segno;
+
+	MemSet(&ctx, 0, sizeof(ctx));
+	MemSet(segments, 0, sizeof(segments));
+	MemSet(&emit_window, 0, sizeof(emit_window));
+	MemSet(&read_window, 0, sizeof(read_window));
+
+	ctx.wal_seg_size = 16 * 1024 * 1024;
+	ctx.resolved_segments = segments;
+	ctx.resolved_segment_count = lengthof(segments);
+
+	emit_window.segments = &segments[1];
+	emit_window.segment_count = 1;
+	emit_window.start_lsn = UINT64CONST(0x00000089F0001908);
+	emit_window.end_lsn = UINT64CONST(0x00000089F0001A00);
+	emit_window.read_end_lsn = emit_window.end_lsn;
+
+	XLByteToSeg(emit_window.start_lsn, current_segno, ctx.wal_seg_size);
+	segments[0].segno = current_segno - 1;
+	segments[1].segno = current_segno;
+
+	fb_wal_prepare_payload_read_window(&ctx,
+									   &emit_window,
+									   segments,
+									   lengthof(segments),
+									   &read_window);
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+		"emit_start=%X/%08X read_start=%X/%08X read_segments=%u",
+		LSN_FORMAT_ARGS(emit_window.start_lsn),
+		LSN_FORMAT_ARGS(read_window.start_lsn),
+		read_window.segment_count)));
 }
 
 /*

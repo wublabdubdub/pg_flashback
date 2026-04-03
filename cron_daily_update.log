@@ -165,3 +165,24 @@ To github.com:wublabdubdub/pg_flashback.git
 To github.com:wublabdubdub/pg_flashback.git
    abb0d8a..6828879  main -> main
 [2026-04-02 01:00:06 CST] auto update finished
+[2026-04-03 01:00:02 CST] committing changes to origin/main
+[main 1578d77] update
+ 43 files changed, 3626 insertions(+), 2856 deletions(-)
+ create mode 100644 docs/decisions/ADR-0018-ctas-over-pg-flashback-direct-sink.md
+ create mode 100644 docs/decisions/ADR-0025-summary-backlog-throughput-and-eta.md
+ create mode 100644 docs/superpowers/plans/2026-04-02-ctas-flashback-sink-plan.md
+ create mode 100644 docs/superpowers/plans/2026-04-02-remove-pg-flashback-to-plan.md
+ create mode 100644 docs/superpowers/plans/2026-04-02-summary-backlog-throughput-plan.md
+ create mode 100644 docs/superpowers/specs/2026-04-02-ctas-flashback-sink-design.md
+ create mode 100644 docs/superpowers/specs/2026-04-02-remove-pg-flashback-to-design.md
+ create mode 100644 docs/superpowers/specs/2026-04-02-summary-backlog-throughput-design.md
+ create mode 100644 expected/fb_flashback_full_output.out
+ delete mode 100644 expected/fb_flashback_to.out
+ delete mode 100644 include/fb_export.h
+ create mode 100644 sql/fb_flashback_full_output.sql
+ delete mode 100644 sql/fb_flashback_to.sql
+ delete mode 100644 src/fb_export.c
+[2026-04-03 01:00:02 CST] pushing to origin/main
+To github.com:wublabdubdub/pg_flashback.git
+   6828879..1578d77  main -> main
+[2026-04-03 01:00:06 CST] auto update finished

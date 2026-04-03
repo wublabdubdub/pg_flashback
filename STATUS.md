@@ -86,6 +86,99 @@
 
 ## 当前进行中
 
+- 已完成一份新的发布前 gate 设计规格，准备进入实现拆解：
+  - 规格文件：
+    - `docs/superpowers/specs/2026-04-03-release-gate-design.md`
+  - 目标是建立一套可供 agent 持续复用的 `PG14-18` 发布前功能/性能阻断 gate
+  - 场景固定覆盖：
+    - 空实例清理与 `alldb` 重建
+    - `/root/alldbsimulator` 构造 `50 x 100MB` 表
+    - `1h` DML 压测
+    - 固定目标表扩容到 `5GB`
+    - 五个随机时间点 truth snapshot + flashback 正确性比对
+    - `COPY TO` / `CTAS` 落盘 flashback
+  - 性能口径固定为：
+    - 与仓库内 golden baseline 比较
+    - 采用“相对比例 + 绝对增量”的双阈值阻断
+  - 归档目录口径固定为：
+    - `PG14 -> /walstorage/14waldata`
+    - `PG15 -> /walstorage/15waldata`
+    - `PG16 -> /walstorage/16waldata`
+    - `PG17 -> /walstorage/17waldata`
+    - `PG18 -> /walstorage/18waldata`
+    - 每轮测试前后都必须清理当前版本对应目录
+  - 当前首批骨架已落地：
+    - `tests/release_gate/bin/common.sh`
+    - `tests/release_gate/bin/run_release_gate.sh`
+    - `tests/release_gate/bin/prepare_empty_instance.sh`
+    - `tests/release_gate/bin/selftest.sh`
+    - `tests/release_gate/sql/check_environment.sql`
+    - `tests/release_gate/sql/list_large_databases.sql`
+    - `tests/release_gate/config/release_gate.conf`
+    - `tests/release_gate/config/scenario_matrix.json`
+    - `tests/release_gate/config/thresholds.json`
+    - `tests/release_gate/templates/report.md.tpl`
+  - 当前已验证：
+    - `bash tests/release_gate/bin/selftest.sh`：`PASS`
+- 当前已补齐一个用户面安装/升级缺口：
+  - 历史上曾在同一 `extversion = '0.1.0'` 下先后安装过
+    `pg_flashback(text, text, text)` 与 `pg_flashback(anyelement, text)`
+  - 现已正式前滚到 `0.1.1`，并补齐
+    `sql/pg_flashback--0.1.0.sql`
+    `sql/pg_flashback--0.1.1.sql`
+    `sql/pg_flashback--0.1.0--0.1.1.sql`
+  - 新增回归 `fb_extension_upgrade` 后，当前已锁住：
+    - `CREATE EXTENSION ... VERSION '0.1.0'`
+    - `ALTER EXTENSION pg_flashback UPDATE TO '0.1.1'`
+    - 升级后旧三参入口消失，新二参入口可直接调用
+  - 本机复核：
+    - `make ... installcheck REGRESS='fb_extension_upgrade fb_user_surface pg_flashback'`
+      `All 3 tests passed.`
+    - `alldb` 中执行 `ALTER EXTENSION pg_flashback UPDATE TO '0.1.1'` 后，
+      用户 SQL 已不再报 `function does not exist`
+- 当前第一优先级 blocker 已固定为：
+  - `87/17F73AB8 / rel=1663/33398/16395737 / blk=38724 / off=1 / failed to locate tuple for heap delete redo`
+  - 后续所有“继续修复真实闪回失败”默认先围这条 cold-run first blocker
+  - 在该 blocker 清掉前，不将 summary / 回归 / 性能类问题视为主线完成
+- 当前并行跟踪一个独立 runtime bug：
+  - `pg_flashback summary worker 1/2` 长时间驻留 `7GB+ RSS`
+  - 当前现场：
+    - `PID 1173478` `postgres: pg_flashback summary worker 2` `RSS ~= 7.8GB`
+    - `PID 1173479` `postgres: pg_flashback summary worker 1` `RSS ~= 7.4GB`
+  - 当前怀疑不是单次查询内存，而是 worker 长生命周期内的 MemoryContext / mmap / cache 未及时回落
+  - 该问题按第二优先级并行修复，但不得打断 `blk=38724` 主线追查
+- 当前新增一个已锁定 root cause 的用户 case：
+  - `scenario_oa_12t_50000r.roles @ '2026-04-02 22:10:13'`
+    在 `4/9 replay discover` 报 `missing FPI for block 9990`
+  - 已确认不是 replay discover 不会消费 FPW，而是 query-side payload window
+    把跨 segment 的记录头裁掉了：
+    - `89/EFFFF9D8 DELETE ... blk=9990 FPW` 在 `pg_waldump` 中存在
+    - 但 `fb_recordref_block_debug(..., 9990)` 的首条记录已变成
+      `89/F0001908`
+  - 当前修复方向已固定为：
+    - payload 物化读取必须对“窗口首条可能跨 segment 延续”的场景做向前补读
+    - 只放宽 read 范围，不放宽 emit/filter 边界
+  - 2026-04-03 本轮已完成修复并现场复核：
+    - payload read window 现会为首窗补读前一连续 segment
+    - payload emit gate 已从“仅看 `ReadRecPtr >= emit_start`”
+      修正为“允许 `EndRecPtr = emit_start` 的紧邻前驱记录进入索引”
+    - `fb_recordref_block_debug(..., 9990)` 现已重新看到：
+      - `89/EFFFF9D8 DELETE ... image=true:apply=true`
+    - 同一 live SQL 不再报 `missing FPI for block 9990`
+    - 默认 `memory_limit=1GB` 下已前移为真实 preflight 门限报错
+    - `SET pg_flashback.memory_limit = '3GB'` 后，
+      `select count(*) ... roles ...` 已返回 `98896`
+- 回归面当前已重新收口为绿色基线：
+  - `fb_user_surface + fb_replay` 已复现并修复一处测试夹具幂等性问题
+  - 根因不是 replay 逻辑回退，而是 `sql/fb_replay.sql` 新增
+    `fb_replay_prune_lookahead_snapshot_isolation_debug()` 后，
+    清理段漏掉对应 `DROP FUNCTION`
+  - 当前最小复现与全量回归都已恢复：
+    - `pg_regress ... fb_user_surface fb_replay`：`All 2 tests passed.`
+    - `make ... installcheck`：`All 36 tests passed.`
+  - 主线开发焦点不变：
+    - 继续回到 batch B / deep pilot 的页级 replay root cause
+    - 不把这次回归夹具问题误判成产品行为问题
 - 正在修复一个新的页级回放 root cause：
   - 现场已稳定复现：
     - `scenario_oa_12t_50000r.documents @ '2026-04-01 22:10:13'`
@@ -116,16 +209,130 @@
         - `blk 1084494` 上 `83/6675CDF8` image `imgmax=4`
         - `86/30212248` image `imgmax=1`
         - `blk 1090557` / `blk 1109792` 也存在 `PRUNE` image 与后续 slot reuse 相互影响的现场
+      - 2026-04-03 继续用 final-pass 单块 trace 收敛到更具体现场：
+        - `blk 1084485` 在 final replay 中的连续页态会经过：
+          - `80/D6079340 PRUNE_ON_ACCESS dead=[1,2]`
+          - `83/6674F870 PRUNE_ON_ACCESS dead=[3,4,5] unused=[6]`
+          - `86/30211CD8 PRUNE_VACUUM_CLEANUP FPW`
+        - 到 `87/6E031A08 LOCK off=1` 前，页态已变成 `lp1..lp5 = dead`
+        - 随后 `87/6E031A78 UPDATE old_off=1` 仍要求从同一 block 读取正常旧 tuple
+        - 这说明当前 blocker 已进一步收敛为：
+          - `PRUNE/FPI` 连续页态与后续 `UPDATE old_off=1` 的 WAL 语义之间仍有未解释矛盾
+          - 仅把 final pass 中的 `PRUNE/FPI` 改成“已有页态时只推进 LSN、不覆盖页内容”的保守模式，仍不能消掉该现场
+      - 2026-04-03 最新安装态复现 `scenario_oa_12t_50000r.documents @ '2026-04-01 22:10:13'` 后，
+        targeted trace 已进一步确认：
+        - `blk 1084485 @ 86/30211CD8` 现在确实会进入 preserve 判定
+        - 但结论是 `current_ok=false image_ok=false`
+        - 因而它“没有 preserve 日志”的旧判断已过时；当前不是漏走 preserve gate
+      - 同一轮 live log 继续推进到新的 first blocker：
+        - `87/6E098C40 / blk=1084494 / failed to locate tuple for heap delete redo`
+        - 结合 `fb_recordref_block_debug(..., 1084494)` 与 `pg_waldump` 已确认该块主链为：
+          - `83/6675CDF8` `FPI_FOR_HINT imgmax=4`
+          - `83/6675EC30` `PRUNE_ON_ACCESS dead=[1,2,3] unused=[4]`
+          - `86/30212248` `PRUNE_VACUUM_CLEANUP FPW`
+          - `87/6E00D568` `INSERT off=4`
+          - `87/6E062350` `DELETE off=4`
+          - `87/6E098C40` `DELETE off=3`
+        - 当前最强 root cause 假设已改为：
+          - `prune lookahead` 现在只保存“最近一条 future record”的约束
+          - 这能保住 `insert off=4`
+          - 但会漏掉同一块更后面的 `delete off=3`
+          - 因而 `83/6675EC30` 之后页态仍把 `off=3` 变成 dead，直到 `87/6E098C40` 真正报错
+      - 2026-04-03 本轮已把上述 root cause 落成最小 RED + 单点修复：
+        - 新增 `fb_replay_prune_compose_future_constraints_debug()` 回归
+        - `prune lookahead` 已从“单条 future record 覆盖”修成“按 future record 逆向组合前置页态约束”
+        - 当前 `fb_replay` 专项回归已通过
+      - 修复后同一 live case 已继续推进，不再停在 `1084494`
+        - 新的 first blocker 变为：
+          - `80/C90B5FB8 / rel=1663/33398/16395804 / blk=17079 / off=42 / failed to replay heap insert`
+        - `pg_waldump` 当前已确认该 TOAST block 可见链路至少包含：
+          - `80/C81991E0 PRUNE_ON_ACCESS dead=[23]`
+          - `80/C8199218 DELETE off=24`
+          - `80/C90B5FB8 INSERT off=42`
+          - `80/C91A3B90 PRUNE_ON_ACCESS dead=[24]`
+          - `80/C91A3BC8 DELETE off=42`
+        - 该现场和 `1084494` 不同：
+          - 当前报错时 `maxoff=41 off=42 has_item=false`
+          - 更像页内可用空间/碎片状态异常，不像 line pointer preserve 缺口
+      - 2026-04-03 本轮继续把 `17079` 的 TOAST blocker 收紧成更小 root cause：
+        - targeted trace 已确认该块在 `80/C81991E0 PRUNE_ON_ACCESS dead=[23]` 时
+          - decode 结果正确：`ndead=1 dead_first=23 cleanup_lock=true`
+          - 但修复前的 final replay 里 `prune after` 仍保持 `lp23=normal upper=320`
+        - 根因已确认不是 `PageRepairFragmentation` 本身，而是：
+          - `fb_replay_build_prune_lookahead()` 把 `entry->future = future_entry->future`
+            做成了浅拷贝
+          - 同块更老 record 的 `old_off=23` 会回写污染已存下来的 prune lookahead snapshot
+          - 从而把本不该保留的 `dead[23]` 错判成 future old tuple requirement
+        - 当前修复结果：
+          - 新增 `FbReplayFutureBlockRecord` 深拷贝 helper
+          - `prune lookahead` 存 entry 时改成 clone，不再共享 `Bitmapset *`
+          - 新增 RED `fb_replay_prune_lookahead_snapshot_isolation_debug()`
+            锁住“lookahead snapshot 不能被同块更老 record 污染”
+          - live trace 已确认 `17079` 现在会走成：
+            - `80/C81991E0 prune after: lp23=dead upper=512`
+            - `80/C90B5FB8 insert off=42` 成功
+            - `80/C91A3B90 prune after: lp24=dead upper=512`
+          - `scenario_oa_12t_50000r.documents @ '2026-04-01 22:10:13'`
+            已不再停在 `17079`
+        - 新的 first blocker 已前移为：
+          - `87/6E0B1F10 / rel=1663/33398/16395804 / blk=26273 / off=27 / failed to locate tuple for heap delete redo`
+      - 2026-04-03 最新结论已改线：
+        - `26273` 不是新的 `prune/lookahead` 语义缺口
+        - 真正 root cause 是历史 `summary v6` sidecar 污染：
+          - `87/6D` 的旧 summary relation span 只覆盖到 `87/6D604398`
+          - 漏掉了同段更晚的
+            - `87/6DD491C0` toast insert off=27
+            - `87/6DD4B110` toast insert off=28
+            - `87/6DD4B230` main insert blk=1084489
+          - 从而 query-side payload/materialize window 把整笔 `tx=6343730` 从 record index 中裁掉
+        - 当前已确认：
+          - 临时旁路 `meta/summary` 后，`fb_recordref_block_debug(..., 1084489)` 会重新看到 `87/6DD4B230`
+          - 仅重建 `87/6D` summary 后，summary-on 路径也会重新看到这条记录
+        - 当前永久修复已落地：
+          - `FB_SUMMARY_VERSION` 已前滚到 `7`
+          - 新增回归 helper `fb_summary_v6_rejected_debug()`
+          - `fb_summary_v3` 已锁住“旧 `v6` summary 必须失效”
   - 当前未完成：
     - `scenario_oa_12t_50000r.documents @ '2026-04-01 22:10:13'`
-      已从最初
-      - `87/6E00D568 / failed to replay heap insert`
-      推进到新的更深层 blocker：
-      - `failed to locate tuple for heap update redo`
-    - 说明当前还需要继续收敛 `PRUNE / slot reuse / HOT_UPDATE` 交界处的页态语义，尚未完成最终修复
+      当前已不再停在 `26273`
+      - 复跑结果：`count = 4356677`
+    - 剩余主线仍需继续回到更早 batch B / deep pilot root cause，
+      不能把 `summary v6` 失效修复误当成整条主线已收尾
 
 ## 本轮完成
 
+- 已完成 `fb_replay` 回归夹具幂等性修复：
+  - 现象：
+    - 全量 `installcheck` 一度只剩 `fb_replay` 红
+    - 最小复现已收敛为：
+      - `pg_regress ... fb_user_surface fb_replay`
+  - 根因：
+    - `sql/fb_replay.sql` 新增
+      `fb_replay_prune_lookahead_snapshot_isolation_debug()` 后
+    - 清理段未同步 `DROP FUNCTION`
+    - 在已有脏 `contrib_regression` 数据库里二次执行时，
+      会先撞 `CREATE FUNCTION already exists`
+  - 修复：
+    - 为 `fb_replay_prune_lookahead_snapshot_isolation_debug()` 补齐清理逻辑
+    - 同步 `expected/fb_replay.out`
+  - 验证：
+    - `pg_regress ... fb_user_surface fb_replay`：`All 2 tests passed.`
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config PGPORT=5832 PGUSER=18pg installcheck`
+      ：`All 36 tests passed.`
+- 已完成旧 `summary v6` sidecar 失效修复：
+  - 根因：
+    - 历史 `87/6D` summary 文件 relation span 截断，导致 `tx=6343730`
+      的晚段 main/toast 记录不再进入 query-side payload window
+  - 修复：
+    - `FB_SUMMARY_VERSION` 前滚到 `7`
+    - 新增回归 `fb_summary_v6_rejected_debug()`
+    - `fb_summary_v3` 已通过
+  - live 复核：
+    - `scenario_oa_12t_50000r.documents @ '2026-04-01 22:10:13'`
+      当前返回 `count = 4356677`
+    - `v7` 生效并重启 PG18 后，cold run 已不再回到 `26273`
+      - 新的 first blocker 前移为：
+        - `87/17F73AB8 / rel=1663/33398/16395737 / blk=38724 / off=1 / failed to locate tuple for heap delete redo`
 - 已完成 `pg_flashback_summary_progress` 的两处问题修复：
   - 现象 1：
     - 用户视图里 `completed_segments / missing_segments / frontier` 长时间看起来不推进
@@ -672,6 +879,18 @@
 
 ## 下一步
 
+- 将 `docs/superpowers/specs/2026-04-03-release-gate-design.md` 细化为正式实现计划
+- 为 `tests/release_gate/` 建立独立脚本与配置骨架
+- 固化 `PG14-18` golden baseline 文件结构、双阈值阻断规则与 Markdown 报告模板
+- 继续回到 batch B / deep pilot 的真实 replay blocker：
+  - 当前回归面已绿，优先处理 live case 的页态语义根因
+  - 先围住当前文档里挂着的 cold-run first blocker：
+    - `87/17F73AB8 / rel=1663/33398/16395737 / blk=38724 / off=1 / failed to locate tuple for heap delete redo`
+- 继续补 deep / 冷缓存验证：
+  - `installcheck` 已恢复 `All 36 tests passed.`
+  - 当前尚未完成的是：
+    - `tests/deep/` 同步到当前内嵌恢复模型后的复跑
+    - 冷缓存/更长时间窗下的 batch B 现场复核
 - 已完成 `replay discover` 静态 missing-block 预计算：
   - 当前实现：
     - 在 `fb_wal_finalize_record_stats()` 里顺序扫描 `RecordRef`

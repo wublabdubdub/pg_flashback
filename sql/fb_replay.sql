@@ -29,6 +29,24 @@ BEGIN
 	IF to_regprocedure('fb_replay_apply_image_contract_debug()') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_replay_apply_image_contract_debug()';
 	END IF;
+	IF to_regprocedure('fb_replay_prune_image_short_circuit_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_replay_prune_image_short_circuit_debug()';
+	END IF;
+	IF to_regprocedure('fb_replay_prune_image_preserve_next_insert_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_replay_prune_image_preserve_next_insert_debug()';
+	END IF;
+	IF to_regprocedure('fb_replay_prune_image_preserve_dead_old_tuple_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_replay_prune_image_preserve_dead_old_tuple_debug()';
+	END IF;
+	IF to_regprocedure('fb_replay_prune_image_reject_used_insert_slot_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_replay_prune_image_reject_used_insert_slot_debug()';
+	END IF;
+	IF to_regprocedure('fb_replay_prune_compose_future_constraints_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_replay_prune_compose_future_constraints_debug()';
+	END IF;
+	IF to_regprocedure('fb_replay_prune_lookahead_snapshot_isolation_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_replay_prune_lookahead_snapshot_isolation_debug()';
+	END IF;
 END;
 $$;
 
@@ -52,11 +70,71 @@ RETURNS text
 AS '$libdir/pg_flashback', 'fb_replay_apply_image_contract_debug'
 LANGUAGE C;
 
+CREATE FUNCTION fb_replay_prune_image_short_circuit_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_replay_prune_image_short_circuit_debug'
+LANGUAGE C;
+
+CREATE FUNCTION fb_replay_prune_image_preserve_next_insert_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_replay_prune_image_preserve_next_insert_debug'
+LANGUAGE C;
+
+CREATE FUNCTION fb_replay_prune_image_preserve_dead_old_tuple_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_replay_prune_image_preserve_dead_old_tuple_debug'
+LANGUAGE C;
+
+CREATE FUNCTION fb_replay_prune_image_reject_used_insert_slot_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_replay_prune_image_reject_used_insert_slot_debug'
+LANGUAGE C;
+
+CREATE FUNCTION fb_replay_prune_compose_future_constraints_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_replay_prune_compose_future_constraints_debug'
+LANGUAGE C;
+
+CREATE FUNCTION fb_replay_prune_lookahead_snapshot_isolation_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_replay_prune_lookahead_snapshot_isolation_debug'
+LANGUAGE C;
+
 SELECT fb_replay_apply_image_contract_debug() AS apply_image_contract
 \gset
 
 SELECT :'apply_image_contract' LIKE '%preserve_existing=true%' AS preserve_existing,
 	   :'apply_image_contract' LIKE '%materialize_requires_apply=true%' AS materialize_requires_apply;
+
+SELECT fb_replay_prune_image_short_circuit_debug() AS prune_image_contract
+\gset
+
+SELECT :'prune_image_contract' LIKE '%prune_image_short_circuit=true%' AS prune_image_short_circuit;
+
+SELECT fb_replay_prune_image_preserve_next_insert_debug() AS prune_image_preserve_contract
+\gset
+
+SELECT :'prune_image_preserve_contract' LIKE '%prune_image_preserve_next_insert=true%' AS prune_image_preserve_next_insert;
+
+SELECT fb_replay_prune_image_preserve_dead_old_tuple_debug() AS prune_image_dead_old_tuple_contract
+\gset
+
+SELECT :'prune_image_dead_old_tuple_contract' LIKE '%prune_image_preserve_dead_old_tuple=true%' AS prune_image_preserve_dead_old_tuple;
+
+SELECT fb_replay_prune_image_reject_used_insert_slot_debug() AS prune_image_used_insert_slot_contract
+\gset
+
+SELECT :'prune_image_used_insert_slot_contract' LIKE '%prune_image_reject_used_insert_slot=true%' AS prune_image_reject_used_insert_slot;
+
+SELECT fb_replay_prune_compose_future_constraints_debug() AS prune_compose_future_constraints_contract
+\gset
+
+SELECT :'prune_compose_future_constraints_contract' LIKE '%prune_compose_future_constraints=true%' AS prune_compose_future_constraints;
+
+SELECT fb_replay_prune_lookahead_snapshot_isolation_debug() AS prune_lookahead_snapshot_isolation_contract
+\gset
+
+SELECT :'prune_lookahead_snapshot_isolation_contract' LIKE '%prune_lookahead_snapshot_isolated=true%' AS prune_lookahead_snapshot_isolated;
 
 DROP TABLE IF EXISTS fb_replay_target;
 DROP TABLE IF EXISTS fb_replay_mark;

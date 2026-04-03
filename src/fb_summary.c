@@ -36,9 +36,14 @@
 PG_FUNCTION_INFO_V1(fb_summary_build_available_debug);
 PG_FUNCTION_INFO_V1(fb_summary_block_anchor_debug);
 PG_FUNCTION_INFO_V1(fb_summary_meta_stats_debug);
+PG_FUNCTION_INFO_V1(fb_summary_v6_rejected_debug);
 
 #define FB_SUMMARY_MAGIC ((uint32) 0x4642534d)
-#define FB_SUMMARY_VERSION 6
+/*
+ * v7 invalidates stale v6 summary files generated before the current summary
+ * span builder fixes, forcing a rebuild from WAL.
+ */
+#define FB_SUMMARY_VERSION 7
 #define FB_SUMMARY_LOCATOR_BLOOM_BYTES 64
 #define FB_SUMMARY_RELTAG_BLOOM_BYTES 64
 #define FB_SUMMARY_SECTION_COUNT 6
@@ -456,6 +461,9 @@ static int fb_summary_read_page(XLogReaderState *state, XLogRecPtr target_page_p
 #endif
 	);
 static bool fb_summary_visit_record(XLogReaderState *reader, void *arg);
+static void fb_summary_write_debug_file(const char *path,
+										const char *data,
+										Size len);
 
 static uint64
 fb_summary_hash_bytes(uint64 seed, const void *data, Size len)
@@ -2080,6 +2088,39 @@ fb_summary_visit_record(XLogReaderState *reader, void *arg)
 	return true;
 }
 
+static void
+fb_summary_write_debug_file(const char *path, const char *data, Size len)
+{
+	int fd;
+	ssize_t written;
+
+	if (path == NULL || data == NULL)
+		elog(ERROR, "debug summary write requires a path and buffer");
+
+	fd = OpenTransientFile(path, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open debug summary file \"%s\": %m", path)));
+
+	written = write(fd, data, len);
+	if (written != (ssize_t) len)
+	{
+		int save_errno = errno;
+
+		CloseTransientFile(fd);
+		errno = save_errno;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write debug summary file \"%s\": %m", path)));
+	}
+
+	if (CloseTransientFile(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close debug summary file \"%s\": %m", path)));
+}
+
 static bool
 fb_summary_build_file_for_segment(const FbSummarySegmentEntry *entry,
 								  const FbSummarySegmentEntry *next_entry,
@@ -3469,4 +3510,116 @@ Datum
 fb_summary_meta_stats_debug(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_TEXT_P(cstring_to_text(fb_summary_meta_stats_cstring()));
+}
+
+Datum
+fb_summary_v6_rejected_debug(PG_FUNCTION_ARGS)
+{
+	FbSummaryBuildCandidate *candidates = NULL;
+	FbSummaryBuildCandidate *candidate = NULL;
+	FbSummaryFileHeader header;
+	char summary_path[MAXPGPATH];
+	struct stat st;
+	struct stat summary_st;
+	char *original = NULL;
+	char *mutated = NULL;
+	Size original_len;
+	bool rejected = false;
+	int candidate_count;
+	int i;
+	int fd;
+	ssize_t nread;
+
+	fb_runtime_ensure_initialized();
+
+	candidate_count = fb_summary_collect_build_candidates(&candidates, false);
+	for (i = 0; i < candidate_count; i++)
+	{
+		if (fb_summary_candidate_summary_exists(&candidates[i]))
+		{
+			candidate = &candidates[i];
+			break;
+		}
+	}
+
+	if (candidate == NULL || stat(candidate->path, &st) != 0)
+	{
+		if (candidates != NULL)
+			fb_summary_free_build_candidates(candidates);
+		PG_RETURN_TEXT_P(cstring_to_text("summary_v6_rejected=no-candidate"));
+	}
+
+	if (!fb_summary_file_path_into(summary_path, sizeof(summary_path),
+								   candidate->path, &st))
+	{
+		fb_summary_free_build_candidates(candidates);
+		elog(ERROR, "failed to build debug summary path");
+	}
+
+	fd = OpenTransientFile(summary_path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+	{
+		fb_summary_free_build_candidates(candidates);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open summary file \"%s\": %m", summary_path)));
+	}
+
+	if (stat(summary_path, &summary_st) != 0)
+	{
+		CloseTransientFile(fd);
+		fb_summary_free_build_candidates(candidates);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not stat summary file \"%s\": %m", summary_path)));
+	}
+
+	original_len = (Size) summary_st.st_size;
+	original = palloc(original_len);
+	nread = read(fd, original, original_len);
+	if (nread != (ssize_t) original_len)
+	{
+		int save_errno = errno;
+
+		CloseTransientFile(fd);
+		fb_summary_free_build_candidates(candidates);
+		errno = save_errno;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read summary file \"%s\": %m", summary_path)));
+	}
+	if (CloseTransientFile(fd) != 0)
+	{
+		fb_summary_free_build_candidates(candidates);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close summary file \"%s\": %m", summary_path)));
+	}
+
+	mutated = palloc(original_len);
+	memcpy(mutated, original, original_len);
+	memcpy(&header, mutated, sizeof(header));
+	header.version = 6;
+	memcpy(mutated, &header, sizeof(header));
+
+	PG_TRY();
+	{
+		fb_summary_write_debug_file(summary_path, mutated, original_len);
+		rejected = !fb_summary_candidate_summary_exists(candidate);
+		fb_summary_write_debug_file(summary_path, original, original_len);
+	}
+	PG_CATCH();
+	{
+		if (original != NULL)
+			fb_summary_write_debug_file(summary_path, original, original_len);
+		if (candidates != NULL)
+			fb_summary_free_build_candidates(candidates);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	fb_summary_free_build_candidates(candidates);
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf("summary_v6_rejected=%s",
+											 rejected ? "true" : "false")));
 }

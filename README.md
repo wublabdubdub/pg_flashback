@@ -80,6 +80,13 @@ make PG_CONFIG=/home/18pg/local/bin/pg_config install
 CREATE EXTENSION pg_flashback;
 ```
 
+如果数据库里已经装过旧版本，不要重复执行 `CREATE EXTENSION`。
+当前应执行：
+
+```sql
+ALTER EXTENSION pg_flashback UPDATE TO '0.1.1';
+```
+
 ### 3. 为实例准备 WAL 来源
 
 至少需要让扩展能定位一个可读取的归档目录。

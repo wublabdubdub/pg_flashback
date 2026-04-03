@@ -52,6 +52,8 @@ FROM pg_flashback(
            Output: (fb_custom_scan_mark.target_ts)::text
    ->  Custom Scan (FbApplyScan)
          Flashback Relation: public.fb_custom_scan_target
+         Flashback Full Output Fast Path: false
+         Flashback Output Dispatch: execscan
          ->  Custom Scan (FbReverseSourceScan)
                Output: pg_flashback.id, pg_flashback.payload
                ->  Custom Scan (FbReplayFinalScan)
@@ -62,7 +64,7 @@ FROM pg_flashback(
                                  Output: pg_flashback.id, pg_flashback.payload
                                  ->  Custom Scan (FbWalIndexScan)
                                        Output: pg_flashback.id, pg_flashback.payload
-(17 rows)
+(19 rows)
 
 CREATE TABLE fb_custom_scan_probe (
 	result_count bigint NOT NULL,

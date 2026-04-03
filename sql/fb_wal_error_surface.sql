@@ -20,6 +20,12 @@ BEGIN
 	IF to_regprocedure('fb_recordref_missing_spool_debug(regclass, timestamptz)') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_recordref_missing_spool_debug(regclass, timestamptz)';
 	END IF;
+	IF to_regprocedure('fb_wal_error_surface_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_wal_error_surface_debug()';
+	END IF;
+	IF to_regprocedure('fb_wal_payload_window_contract_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_wal_payload_window_contract_debug()';
+	END IF;
 END;
 $$;
 
@@ -38,6 +44,53 @@ RETURNS text
 AS '$libdir/pg_flashback', 'fb_recordref_missing_spool_debug'
 LANGUAGE C
 STRICT;
+
+CREATE FUNCTION fb_wal_error_surface_debug()
+RETURNS TABLE (
+	message_ok boolean,
+	detail_mentions_first_retained boolean
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+	got_message text;
+	got_detail text;
+	expected_seg text;
+BEGIN
+	SELECT seg_name
+	INTO expected_seg
+	FROM fb_wal_error_surface_fixture
+	ORDER BY segno
+	LIMIT 1;
+
+	BEGIN
+		PERFORM count(*)
+		FROM pg_flashback(
+			NULL::public.fb_wal_error_surface_target,
+			'2000-01-01 00:00:00+00'
+		);
+	EXCEPTION
+		WHEN OTHERS THEN
+			GET STACKED DIAGNOSTICS
+				got_message = MESSAGE_TEXT,
+				got_detail = PG_EXCEPTION_DETAIL;
+
+			message_ok :=
+				got_message = 'WAL not complete: target timestamp predates retained continuous WAL suffix';
+			detail_mentions_first_retained :=
+				position(expected_seg IN coalesce(got_detail, '')) > 0;
+			RETURN NEXT;
+			RETURN;
+	END;
+
+	RAISE EXCEPTION 'expected WAL incomplete error';
+END;
+$$;
+
+CREATE FUNCTION fb_wal_payload_window_contract_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_wal_payload_window_contract_debug'
+LANGUAGE C STRICT;
 
 CREATE TABLE fb_wal_error_surface_target (
 	id integer PRIMARY KEY,
@@ -127,10 +180,9 @@ SELECT fb_progress_debug_set_clock(ARRAY[
 ]::bigint[]);
 
 SELECT *
-FROM pg_flashback(
-	NULL::public.fb_wal_error_surface_target,
-	'2000-01-01 00:00:00+00'
-);
+FROM fb_wal_error_surface_debug();
+
+SELECT fb_wal_payload_window_contract_debug();
 
 SELECT fb_progress_debug_reset_clock();
 

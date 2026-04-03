@@ -27,6 +27,12 @@ BEGIN
 	IF to_regprocedure('fb_summary_service_schedule_debug(integer, integer, integer)') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_summary_service_schedule_debug(integer, integer, integer)';
 	END IF;
+	IF to_regprocedure('fb_summary_service_worker_error_isolation_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_summary_service_worker_error_isolation_debug()';
+	END IF;
+	IF to_regprocedure('fb_summary_service_memory_reset_debug(integer)') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_summary_service_memory_reset_debug(integer)';
+	END IF;
 END;
 $$;
 
@@ -71,6 +77,28 @@ RETURNS TABLE (
 )
 AS '$libdir/pg_flashback', 'fb_summary_service_schedule_debug'
 LANGUAGE C;
+
+CREATE FUNCTION fb_summary_service_worker_error_isolation_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_summary_service_worker_error_isolation_debug'
+LANGUAGE C;
+
+CREATE FUNCTION fb_summary_service_memory_reset_debug(integer)
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_summary_service_memory_reset_debug'
+LANGUAGE C;
+
+SET client_min_messages = error;
+SELECT fb_summary_service_worker_error_isolation_debug() AS worker_error_isolation_contract
+\gset
+RESET client_min_messages;
+
+SELECT :'worker_error_isolation_contract' LIKE '%worker_error_isolated=true%' AS worker_error_isolated;
+
+SELECT fb_summary_service_memory_reset_debug(3) AS worker_memory_reset_contract
+\gset
+
+SELECT :'worker_memory_reset_contract' LIKE '%worker_memory_reset=true%' AS worker_memory_reset;
 
 SELECT pg_switch_wal() IS NOT NULL;
 SELECT pg_switch_wal() IS NOT NULL;
@@ -236,6 +264,22 @@ BEGIN
 	EXECUTE format(
 		'COPY (SELECT '''') TO PROGRAM %L',
 		'rm -f ' || quote_literal(archive_dir || '/' || deleted_name));
+END;
+$$;
+
+DO $$
+DECLARE
+	deadline timestamptz := clock_timestamp() + interval '10 seconds';
+	ready boolean := false;
+BEGIN
+	LOOP
+		SELECT missing_segments = 1
+		INTO ready
+		FROM pg_flashback_summary_progress;
+
+		EXIT WHEN ready OR clock_timestamp() >= deadline;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
 END;
 $$;
 

@@ -1,0 +1,22 @@
+{
+  "random_flashbacks": [
+    "random_flashback_1",
+    "random_flashback_2",
+    "random_flashback_3",
+    "random_flashback_4",
+    "random_flashback_5"
+  ],
+  "dml_flashbacks": [
+    "single_insert_flashback",
+    "single_update_flashback",
+    "single_delete_flashback",
+    "bulk_insert_10k_flashback",
+    "bulk_update_10k_flashback",
+    "bulk_delete_10k_flashback",
+    "mixed_dml_flashback"
+  ],
+  "materialization_flashbacks": [
+    "copy_to_flashback",
+    "ctas_flashback"
+  ]
+}

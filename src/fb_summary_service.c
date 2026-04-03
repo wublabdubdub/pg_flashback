@@ -48,12 +48,16 @@ PG_FUNCTION_INFO_V1(fb_summary_service_debug_internal);
 PG_FUNCTION_INFO_V1(fb_summary_cleanup_plan_debug);
 PG_FUNCTION_INFO_V1(fb_summary_service_plan_debug);
 PG_FUNCTION_INFO_V1(fb_summary_service_schedule_debug);
+PG_FUNCTION_INFO_V1(fb_summary_service_worker_error_isolation_debug);
+PG_FUNCTION_INFO_V1(fb_summary_service_memory_reset_debug);
 
 PGDLLEXPORT Datum fb_summary_progress_internal(PG_FUNCTION_ARGS);
 PGDLLEXPORT Datum fb_summary_service_debug_internal(PG_FUNCTION_ARGS);
 PGDLLEXPORT Datum fb_summary_cleanup_plan_debug(PG_FUNCTION_ARGS);
 PGDLLEXPORT Datum fb_summary_service_plan_debug(PG_FUNCTION_ARGS);
 PGDLLEXPORT Datum fb_summary_service_schedule_debug(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum fb_summary_service_worker_error_isolation_debug(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum fb_summary_service_memory_reset_debug(PG_FUNCTION_ARGS);
 
 typedef enum FbSummaryServiceTaskState
 {
@@ -232,6 +236,7 @@ static void fb_summary_service_run_scan(void);
 static void fb_summary_service_run_cleanup(void);
 static void fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats);
 static void fb_summary_service_compute_eta(FbSummaryServiceProgressStats *stats);
+static bool fb_summary_service_build_candidate_safe(const FbSummaryBuildCandidate *candidate);
 static bool fb_summary_service_candidate_in_snapshot(bool snapshot_valid,
 													 TimeLineID snapshot_timeline_id,
 													 XLogSegNo snapshot_oldest_segno,
@@ -828,6 +833,49 @@ fb_summary_service_run_scan(void)
 	}
 
 	fb_summary_free_build_candidates(candidates);
+}
+
+static bool
+fb_summary_service_build_candidate_safe(const FbSummaryBuildCandidate *candidate)
+{
+	MemoryContext build_mcxt;
+	MemoryContext oldcontext;
+	bool built = false;
+
+	if (candidate == NULL)
+		return false;
+
+	build_mcxt = AllocSetContextCreate(TopMemoryContext,
+									   "fb_summary_service_build_candidate",
+									   ALLOCSET_DEFAULT_SIZES);
+	oldcontext = MemoryContextSwitchTo(build_mcxt);
+	PG_TRY();
+	{
+		built = fb_summary_build_candidate(candidate);
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextDelete(build_mcxt);
+	}
+	PG_CATCH();
+	{
+		ErrorData *edata;
+
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextDelete(build_mcxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		elog(LOG,
+			 "fb_summary_service skipped candidate timeline=%u segno=%llu path=\"%s\": %s",
+			 candidate->timeline_id,
+			 (unsigned long long) candidate->segno,
+			 candidate->path,
+			 (edata != NULL && edata->message != NULL) ? edata->message : "unknown error");
+		if (edata != NULL)
+			FreeErrorData(edata);
+		built = false;
+	}
+	PG_END_TRY();
+
+	return built;
 }
 
 typedef struct FbSummaryCleanupEntry
@@ -1450,7 +1498,7 @@ fb_summary_service_worker_main(Datum main_arg)
 				bool built = false;
 
 				if (!fb_summary_candidate_summary_exists(&candidates[i]))
-					built = fb_summary_build_candidate(&candidates[i]);
+					built = fb_summary_service_build_candidate_safe(&candidates[i]);
 				fb_summary_service_finish_task(slot_indexes[i], built);
 			}
 			continue;
@@ -1735,6 +1783,89 @@ fb_summary_service_plan_debug(PG_FUNCTION_ARGS)
 		ctx->candidates = NULL;
 	}
 	SRF_RETURN_DONE(funcctx);
+}
+
+Datum
+fb_summary_service_worker_error_isolation_debug(PG_FUNCTION_ARGS)
+{
+	FbSummaryBuildCandidate *candidates = NULL;
+	FbSummaryBuildCandidate candidate;
+	char *runtime_dir;
+	char bogus_path[MAXPGPATH];
+	int candidate_count;
+	bool isolated;
+
+	fb_runtime_ensure_initialized();
+	candidate_count = fb_summary_collect_build_candidates(&candidates, false);
+	if (candidate_count <= 0)
+		PG_RETURN_TEXT_P(cstring_to_text("worker_error_isolated=no-candidate"));
+
+	runtime_dir = fb_runtime_runtime_dir();
+	snprintf(bogus_path, sizeof(bogus_path), "%s/summary-worker-bogus-%d.wal",
+			 runtime_dir, MyProcPid);
+	pfree(runtime_dir);
+
+	if (mkdir(bogus_path, S_IRWXU) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create bogus WAL directory \"%s\": %m",
+						bogus_path)));
+
+	MemSet(&candidate, 0, sizeof(candidate));
+	strlcpy(candidate.path, bogus_path, sizeof(candidate.path));
+	candidate.timeline_id = candidates[0].timeline_id;
+	candidate.segno = candidates[0].segno;
+	candidate.bytes = candidates[0].bytes;
+	candidate.wal_seg_size = candidates[0].wal_seg_size;
+	candidate.source_kind = candidates[0].source_kind;
+
+	isolated = !fb_summary_service_build_candidate_safe(&candidate);
+
+	rmdir(bogus_path);
+	fb_summary_free_build_candidates(candidates);
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf("worker_error_isolated=%s",
+											  isolated ? "true" : "false")));
+}
+
+Datum
+fb_summary_service_memory_reset_debug(PG_FUNCTION_ARGS)
+{
+	FbSummaryBuildCandidate *candidates = NULL;
+	int32 repeat_count = PG_GETARG_INT32(0);
+	Size before_bytes;
+	Size after_bytes;
+	bool reset_ok;
+	int candidate_count;
+	int i;
+
+	if (repeat_count <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("repeat count must be positive")));
+
+	fb_runtime_ensure_initialized();
+	candidate_count = fb_summary_collect_build_candidates(&candidates, false);
+	if (candidate_count <= 0)
+		PG_RETURN_TEXT_P(cstring_to_text("worker_memory_reset=no-candidate"));
+
+	before_bytes = MemoryContextMemAllocated(TopMemoryContext, true);
+	for (i = 0; i < repeat_count; i++)
+		(void) fb_summary_service_build_candidate_safe(&candidates[0]);
+	after_bytes = MemoryContextMemAllocated(TopMemoryContext, true);
+
+	/*
+	 * The worker path should not retain candidate-sized memory after the
+	 * per-build context is deleted. Allow a small fixed slack for normal
+	 * backend noise during the helper call.
+	 */
+	reset_ok = after_bytes <= before_bytes + (256 * 1024);
+	fb_summary_free_build_candidates(candidates);
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf("worker_memory_reset=%s before=%zu after=%zu",
+											  reset_ok ? "true" : "false",
+											  before_bytes,
+											  after_bytes)));
 }
 
 Datum

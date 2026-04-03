@@ -1340,15 +1340,18 @@ fb_apply_cleanup_resources(FbApplyContext *ctx)
 
 		for (i = 0; i < ctx->parallel_log_count; i++)
 		{
-			if (ctx->parallel_handles[i] != NULL &&
-				!ctx->parallel_worker_done[i])
-			{
-				TerminateBackgroundWorker(ctx->parallel_handles[i]);
-				WaitForBackgroundWorkerShutdown(ctx->parallel_handles[i]);
-			}
 			if (ctx->parallel_tuple_handles != NULL &&
 				ctx->parallel_tuple_handles[i] != NULL)
+			{
 				shm_mq_detach(ctx->parallel_tuple_handles[i]);
+				ctx->parallel_tuple_handles[i] = NULL;
+			}
+		}
+		for (i = 0; i < ctx->parallel_log_count; i++)
+		{
+			if (ctx->parallel_handles[i] != NULL &&
+				!ctx->parallel_worker_done[i])
+				WaitForBackgroundWorkerShutdown(ctx->parallel_handles[i]);
 		}
 		pfree(ctx->parallel_handles);
 		ctx->parallel_handles = NULL;

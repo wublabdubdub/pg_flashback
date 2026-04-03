@@ -25,6 +25,9 @@ BEGIN
 	IF to_regprocedure('fb_summary_service_schedule_debug(integer, integer, integer)') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_summary_service_schedule_debug(integer, integer, integer)';
 	END IF;
+	IF to_regprocedure('fb_summary_service_worker_error_isolation_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_summary_service_worker_error_isolation_debug()';
+	END IF;
 END;
 $$;
 CREATE FUNCTION fb_summary_service_plan_debug()
@@ -65,6 +68,20 @@ RETURNS TABLE (
 )
 AS '$libdir/pg_flashback', 'fb_summary_service_schedule_debug'
 LANGUAGE C;
+CREATE FUNCTION fb_summary_service_worker_error_isolation_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_summary_service_worker_error_isolation_debug'
+LANGUAGE C;
+SET client_min_messages = error;
+SELECT fb_summary_service_worker_error_isolation_debug() AS worker_error_isolation_contract
+\gset
+RESET client_min_messages;
+SELECT :'worker_error_isolation_contract' LIKE '%worker_error_isolated=true%' AS worker_error_isolated;
+ worker_error_isolated 
+-----------------------
+ t
+(1 row)
+
 SELECT pg_switch_wal() IS NOT NULL;
  ?column? 
 ----------
@@ -279,6 +296,21 @@ BEGIN
 	EXECUTE format(
 		'COPY (SELECT '''') TO PROGRAM %L',
 		'rm -f ' || quote_literal(archive_dir || '/' || deleted_name));
+END;
+$$;
+DO $$
+DECLARE
+	deadline timestamptz := clock_timestamp() + interval '10 seconds';
+	ready boolean := false;
+BEGIN
+	LOOP
+		SELECT missing_segments = 1
+		INTO ready
+		FROM pg_flashback_summary_progress;
+
+		EXIT WHEN ready OR clock_timestamp() >= deadline;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
 END;
 $$;
 SELECT missing_segments = 1 AS tracks_deleted_wal_gap,

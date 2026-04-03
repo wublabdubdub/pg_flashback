@@ -10,3 +10,4 @@
 results/
 regression.diffs
 tmp_check/
+.worktrees/

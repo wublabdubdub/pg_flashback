@@ -12,6 +12,31 @@
 
 ## 本轮已完成
 
+- [x] 修复扩展同版本号接口漂移导致的升级缺口
+  - 根因已确认：
+    - 历史上曾在同一 `extversion = '0.1.0'` 下先后安装过
+      `pg_flashback(text, text, text)` 与 `pg_flashback(anyelement, text)`
+    - 仅执行 `make install` / `CREATE EXTENSION` 不会刷新已存在数据库中的扩展对象
+  - 当前修复已落地：
+    - 前滚 `default_version` 到 `0.1.1`
+    - 恢复历史 `sql/pg_flashback--0.1.0.sql`
+    - 新增 `sql/pg_flashback--0.1.1.sql`
+    - 新增 `sql/pg_flashback--0.1.0--0.1.1.sql`
+    - 新增升级回归 `fb_extension_upgrade`
+  - 当前已验证：
+    - `make ... installcheck REGRESS='fb_extension_upgrade fb_user_surface pg_flashback'`
+      `All 3 tests passed.`
+    - `alldb` 上执行 `ALTER EXTENSION pg_flashback UPDATE TO '0.1.1'` 后，
+      用户两参调用不再报 `function does not exist`
+- [x] 修复 `fb_replay` 回归夹具的幂等性缺口
+  - `sql/fb_replay.sql` 已为
+    `fb_replay_prune_lookahead_snapshot_isolation_debug()` 补齐 `DROP FUNCTION`
+  - 已用最小复现确认：
+    - `pg_regress ... fb_user_surface fb_replay`
+      不再因 `CREATE FUNCTION already exists` 失败
+  - 已同步 `expected/fb_replay.out`
+  - 全量 `installcheck` 当前结果：
+    - `All 36 tests passed.`
 - [x] 修复“较早 prefix gap 误杀较新连续 suffix”的 WAL resolver 问题
   - resolver 不再因旧 prefix 上的不可恢复 gap 在 `2/9` 直接报 `missing segment`
   - 当前改为保留最新端连续 suffix；只有 suffix 自身不连续时才继续报 WAL 不完整
@@ -63,7 +88,19 @@
   - 当前 progress 视图仍只统计 summary 文件缺口，未把真实 WAL 缺口折算进 `missing_segments` / `first_gap_*`
 
 ## 当前待办
-
+- [ ] 建立 `PG14-18` 发布前功能/性能阻断 gate
+  - [x] 新增 `tests/release_gate/` 独立目录与统一入口脚本
+  - [ ] 固化空实例清理与 `alldb` 重建流程
+  - [ ] 对接 `/root/alldbsimulator`，构造 `50 x 100MB` 表
+  - [ ] 固化 `1h` DML 压测流程与随机 seed 记录
+  - [ ] 固定目标表扩容到 `5GB`
+  - [ ] 固化五个随机时间点 truth snapshot 采集
+  - [ ] 覆盖随机闪回、单独 `insert/update/delete`、`10000` 行批量 `insert/update/delete`、混合 DML、`COPY TO`、`CTAS`
+  - [ ] 固化标准化 CSV 导出、`row_count/hash/diff` 正确性判定
+  - [ ] 新增 `PG14-18` golden baseline 文件结构
+  - [ ] 实现“相对比例 + 绝对增量”双阈值性能阻断
+  - [ ] 生成独立 Markdown 报告
+  - [ ] 固化 `/walstorage/{14,15,16,17,18}waldata` 测试前后清理
 - [ ] `full-output pg_flashback(...)` 快路径加速
   - [ ] 保持用户 SQL 形态继续是：
     - `SELECT * FROM pg_flashback(...)`
@@ -110,20 +147,75 @@
   - 当前已确认：
     - `INIT_PAGE` 记录需要无条件重置已有 block state，不能只在“未初始化”时 `PageInit()`
     - 部分 `PRUNE` applicable image 会把当前 block 压回过旧页态，和后续 `INSERT/HOT_UPDATE` 的 slot reuse 发生冲突
-  - 当前最新 live blocker：
-    - `scenario_oa_12t_50000r.documents @ '2026-04-01 22:10:13'`
-    - 已从 `87/6E00D568 / failed to replay heap insert`
-      推进为：
-      - `failed to locate tuple for heap update redo`
+    - `blk 1084485` 的 final replay 连续页态当前已实锤会走到：
+      - `80/D6079340 PRUNE_ON_ACCESS dead=[1,2]`
+      - `83/6674F870 PRUNE_ON_ACCESS dead=[3,4,5] unused=[6]`
+      - `86/30211CD8 PRUNE_VACUUM_CLEANUP FPW`
+      - 然后在 `87/6E031A78 UPDATE old_off=1` 报 `failed to locate tuple for heap update redo`
+    - 最新安装态复现已确认：
+      - `blk 1084485 @ 86/30211CD8` 当前会进入 preserve gate
+      - 但判断结果是 `current_ok=false image_ok=false`
+      - 因而这块当前不是“没走 preserve”，而是 preserve 判定本身认为前后页态都不支持未来 `old_off=1`
+    - 同一轮 live log 已继续推进到新的 first blocker：
+      - `blk 1084494 @ 87/6E098C40 DELETE off=3`
+      - 其更早链路已确认为：
+        - `83/6675CDF8 FPI_FOR_HINT imgmax=4`
+        - `83/6675EC30 PRUNE_ON_ACCESS dead=[1,2,3] unused=[4]`
+        - `86/30212248 PRUNE_VACUUM_CLEANUP FPW`
+        - `87/6E00D568 INSERT off=4`
+        - `87/6E062350 DELETE off=4`
+        - `87/6E098C40 DELETE off=3`
+    - 本轮已完成：
+      - 新增最小 RED `fb_replay_prune_compose_future_constraints_debug()`
+      - 已把 `prune lookahead` 修成按 future record 逆向组合前置页态约束
+      - `fb_replay` 专项回归已通过
+      - 新增最小 RED `fb_replay_prune_lookahead_snapshot_isolation_debug()`
+      - 已把 `prune lookahead` entry 存储从浅拷贝修成深拷贝，避免同块更老 record 污染已存下来的 future 约束
+      - live case `TOAST blk=17079 / off=42` 已被推过
+    - 已验证一个错误方向：
+      - 仅把 final pass 中的 `PRUNE/FPI` 改成“已有页态时只推进 LSN、不覆盖页内容”不能修穿 live case
+  - 当前最新结论：
+    - `87/6E0B1F10 / blk=26273 / off=27` 已确认不是新的 `prune/lookahead` 语义问题
+    - 真因是历史 `summary v6` sidecar 截断了 `87/6D` relation span，
+      漏掉 `87/6DD491C0` / `87/6DD4B110` / `87/6DD4B230`
   - 当前需要继续做：
-    - 为 `PRUNE image` 建立更稳定的覆盖/仅锚点判定
-    - 继续补 `heap_update/heap_hot_update/heap_lock` 与被 prune 槽位复用的安全语义
-    - 最终复跑 live SQL 与同类时间点
+    - 第一优先级先围住 cold-run first blocker：
+      - `87/17F73AB8 / rel=1663/33398/16395737 / blk=38724 / off=1 / failed to locate tuple for heap delete redo`
+    - 解释 `blk 1084485` 上 “连续 `PRUNE/FPI` 后页态全 dead，但后续 WAL 仍要求 `old_off=1` 为正常 tuple” 的真实语义
+    - 继续回到真正尚未解决的 batch B / replay 语义现场
+    - 复跑同类时间点，确认不再被历史坏 summary sidecar 拖回旧 blocker
+- [ ] 修复 summary worker 长生命周期高 RSS 不回落的问题
+  - 当前现场：
+    - `pg_flashback summary worker 2` `PID 1173478` `RSS ~= 7.8GB`
+    - `pg_flashback summary worker 1` `PID 1173479` `RSS ~= 7.4GB`
+  - 当前目标：
+    - 先确认是 MemoryContext / cache / mmap 持有还是实际泄漏
+    - 补最小 RED 或 debug contract，锁住“worker 空闲后内存必须可回落/可复位”
+    - 修复后复核 summary service 正常运行且不回归 `installcheck`
+- [x] 失效旧 `summary v6` sidecar，避免历史坏 summary 持续污染 query-side payload windows
+  - [x] 前滚 `FB_SUMMARY_VERSION` 到 `7`
+  - [x] 补回归 `fb_summary_v6_rejected_debug()`
+  - [x] 复核 `documents @ '2026-04-01 22:10:13'` 已不再停在 `26273`
 - [x] 修复 trailing invalid `pg_wal` tail 误挡 archive/valid suffix 的 resolver 问题
   - [x] 补回归覆盖：
     - trailing invalid `pg_wal` tail 不应阻断 archive suffix
     - archive exact-hit + `pg_wal` 同名 mismatch 时仍必须优先取 archive
   - [x] 复核 live 现场，把假性的 `pg_wal recycled/mismatched` 错误面收敛为真实 retained suffix / 内存类 blocker
+- [x] 修复 payload 窗口首条跨 segment 记录头仍会被裁掉的 residual 问题
+  - 已新增 RED：
+    - `fb_wal_payload_window_contract_debug()`
+    - 锁住 `emit_start=89/F0001908` 时必须把 read window 回补到
+      `89/EF000000`
+  - 已完成修复：
+    - payload read window 会为首窗补读前一连续 segment
+    - payload emit gate 允许 `EndRecPtr = emit_start` 的紧邻前驱记录进入索引
+  - 已复核：
+    - `fb_recordref_block_debug(..., 9990)` 重新看到
+      `89/EFFFF9D8 DELETE ... FPW`
+    - `scenario_oa_12t_50000r.roles @ '2026-04-02 22:10:13'`
+      不再报 `missing FPI for block 9990`
+    - 默认 `1GB` 下当前返回真实 `memory_limit` 报错
+    - `memory_limit = '3GB'` 下返回 `count = 98896`
 
 ### Runtime 安全清理
 
@@ -415,8 +507,9 @@
 - [ ] 将 live case 当前依赖的高默认内存继续回收回真正的 bounded spill / eviction 路径
 - [ ] deep full 的 flashback 并行 `parallel_workers=0/N` 端到端验证继续推进
 - [ ] 按恢复后的代码重新补跑 installcheck / deep / 冷缓存场景验证
-  - 当前与本轮改动直接相关的 `fb_keyed_fast_path` / `fb_flashback_hot_update_fpw` / `fb_custom_scan` 已复跑
-  - 当前剩余的是 `fb_keyed_fast_path.out` 末尾空白尾行格式对齐，不是结果内容差异
+  - [x] `installcheck` 已重跑恢复为 `All 36 tests passed.`
+  - [ ] 补跑 `tests/deep/`
+  - [ ] 补跑冷缓存 / 更长时间窗场景
 
 ## 恢复记录
 

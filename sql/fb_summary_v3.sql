@@ -20,6 +20,9 @@ BEGIN
 	IF to_regprocedure('fb_summary_build_available_debug()') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_summary_build_available_debug()';
 	END IF;
+	IF to_regprocedure('fb_summary_v6_rejected_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_summary_v6_rejected_debug()';
+	END IF;
 	IF to_regprocedure('fb_recordref_debug(regclass, timestamptz)') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_recordref_debug(regclass, timestamptz)';
 	END IF;
@@ -29,6 +32,11 @@ $$;
 CREATE FUNCTION fb_summary_build_available_debug()
 RETURNS integer
 AS '$libdir/pg_flashback', 'fb_summary_build_available_debug'
+LANGUAGE C;
+
+CREATE FUNCTION fb_summary_v6_rejected_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_summary_v6_rejected_debug'
 LANGUAGE C;
 
 CREATE FUNCTION fb_recordref_debug(regclass, timestamptz)
@@ -78,6 +86,11 @@ END;
 $$;
 
 SELECT fb_summary_build_available_debug() > 0 AS built_summary;
+
+SELECT fb_summary_v6_rejected_debug() AS summary_v6_rejected_contract
+\gset
+
+SELECT :'summary_v6_rejected_contract' LIKE '%summary_v6_rejected=true%' AS rejects_v6_summary;
 
 SELECT substring(
 		   fb_recordref_debug(

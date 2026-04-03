@@ -13,6 +13,17 @@ BEGIN
 END;
 $$;
 
+DO $$
+BEGIN
+	IF to_regprocedure('fb_progress_debug_set_clock(bigint[])') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_progress_debug_set_clock(bigint[])';
+	END IF;
+	IF to_regprocedure('fb_progress_debug_reset_clock()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_progress_debug_reset_clock()';
+	END IF;
+END;
+$$;
+
 CREATE FUNCTION fb_progress_debug_set_clock(bigint[])
 RETURNS void
 AS '$libdir/pg_flashback', 'fb_progress_debug_set_clock'

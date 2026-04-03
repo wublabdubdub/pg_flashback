@@ -220,6 +220,32 @@ Custom Scan (FbApplyScan)
 8. apply
 9. emit residual rows
 
+### `tests/release_gate`
+
+文件：
+
+- `tests/release_gate/bin/*.sh`
+- `tests/release_gate/sql/*.sql`
+- `tests/release_gate/config/*.json`
+- `tests/release_gate/golden/*.json`
+- `tests/release_gate/templates/*`
+
+职责：
+
+- 提供独立于 `installcheck` 与 `tests/deep/` 的发布前阻断式验证框架
+- 在空实例口径下重建 `alldb`
+- 检查并清理按 PG 主版本分隔的归档目录：
+  - `/walstorage/14waldata`
+  - `/walstorage/15waldata`
+  - `/walstorage/16waldata`
+  - `/walstorage/17waldata`
+  - `/walstorage/18waldata`
+- 驱动 `/root/alldbsimulator` 进行建数、DML 压测与大表扩容
+- 捕获 truth snapshot，并统一导出标准化 CSV
+- 执行 `pg_flashback(...)`、`COPY TO`、`CTAS` 发布前场景
+- 读取 `PG14-18` golden baseline，并按双阈值给出性能阻断结论
+- 生成单独 Markdown 报告
+
 ### `fb_memory`
 
 文件：

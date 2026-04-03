@@ -1,0 +1,18 @@
+{
+  "default_ratio_threshold": 0.20,
+  "default_absolute_threshold_ms": 30000,
+  "scenarios": {
+    "random_flashback_1": {
+      "ratio_threshold": 0.20,
+      "absolute_threshold_ms": 30000
+    },
+    "copy_to_flashback": {
+      "ratio_threshold": 0.20,
+      "absolute_threshold_ms": 30000
+    },
+    "ctas_flashback": {
+      "ratio_threshold": 0.20,
+      "absolute_threshold_ms": 30000
+    }
+  }
+}
