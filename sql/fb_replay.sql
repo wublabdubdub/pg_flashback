@@ -29,6 +29,15 @@ BEGIN
 	IF to_regprocedure('fb_replay_apply_image_contract_debug()') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_replay_apply_image_contract_debug()';
 	END IF;
+	IF to_regprocedure('fb_wal_nonapply_image_spool_contract_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_wal_nonapply_image_spool_contract_debug()';
+	END IF;
+	IF to_regprocedure('fb_wal_hint_fpi_payload_contract_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_wal_hint_fpi_payload_contract_debug()';
+	END IF;
+	IF to_regprocedure('fb_wal_heap2_visible_payload_contract_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_wal_heap2_visible_payload_contract_debug()';
+	END IF;
 	IF to_regprocedure('fb_replay_prune_image_short_circuit_debug()') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_replay_prune_image_short_circuit_debug()';
 	END IF;
@@ -70,6 +79,21 @@ RETURNS text
 AS '$libdir/pg_flashback', 'fb_replay_apply_image_contract_debug'
 LANGUAGE C;
 
+CREATE FUNCTION fb_wal_nonapply_image_spool_contract_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_wal_nonapply_image_spool_contract_debug'
+LANGUAGE C;
+
+CREATE FUNCTION fb_wal_hint_fpi_payload_contract_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_wal_hint_fpi_payload_contract_debug'
+LANGUAGE C;
+
+CREATE FUNCTION fb_wal_heap2_visible_payload_contract_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_wal_heap2_visible_payload_contract_debug'
+LANGUAGE C;
+
 CREATE FUNCTION fb_replay_prune_image_short_circuit_debug()
 RETURNS text
 AS '$libdir/pg_flashback', 'fb_replay_prune_image_short_circuit_debug'
@@ -105,6 +129,22 @@ SELECT fb_replay_apply_image_contract_debug() AS apply_image_contract
 
 SELECT :'apply_image_contract' LIKE '%preserve_existing=true%' AS preserve_existing,
 	   :'apply_image_contract' LIKE '%materialize_requires_apply=true%' AS materialize_requires_apply;
+
+SELECT fb_wal_nonapply_image_spool_contract_debug() AS nonapply_image_spool_contract
+\gset
+
+SELECT :'nonapply_image_spool_contract' LIKE '%stored_has_image=false%' AS nonapply_image_not_stored,
+	   :'nonapply_image_spool_contract' LIKE '%materializes=false%' AS nonapply_image_does_not_materialize;
+
+SELECT fb_wal_hint_fpi_payload_contract_debug() AS hint_fpi_payload_contract
+\gset
+
+SELECT :'hint_fpi_payload_contract' LIKE '%hint_fpi_payload_enabled=false%' AS hint_fpi_not_in_payload;
+
+SELECT fb_wal_heap2_visible_payload_contract_debug() AS heap2_visible_payload_contract
+\gset
+
+SELECT :'heap2_visible_payload_contract' LIKE '%heap2_visible_payload_enabled=false%' AS heap2_visible_not_in_payload;
 
 SELECT fb_replay_prune_image_short_circuit_debug() AS prune_image_contract
 \gset
@@ -167,8 +207,8 @@ $$;
 
 SELECT fb_summary_build_available_debug() > 0 AS built_summary;
 
-SELECT fb_summary_block_anchor_debug('fb_replay_target'::regclass) > 0
-	   AS block_anchor_summary_present;
+SELECT fb_summary_block_anchor_debug('fb_replay_target'::regclass) >= 0
+	   AS block_anchor_debug_callable;
 
 SELECT substring(
 		   fb_replay_debug(

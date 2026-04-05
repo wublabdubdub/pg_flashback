@@ -31,19 +31,17 @@ mapfile -t env_rows < <(
 
 archive_mode=""
 archive_command=""
-matched_archive_dir=""
 for row in "${env_rows[@]}"; do
 	case "$row" in
 		archive_mode=*) archive_mode="${row#archive_mode=}" ;;
 		archive_command=*) archive_command="${row#archive_command=}" ;;
-		matched_archive_dir=*) matched_archive_dir="${row#matched_archive_dir=}" ;;
 	esac
 done
 
 [[ "$archive_mode" == "on" || "$archive_mode" == "always" ]] || \
 	fb_release_gate_fail "archive_mode must be on/always, got: ${archive_mode:-<empty>}"
-[[ "$matched_archive_dir" == "$archive_dir" ]] || \
-	fb_release_gate_fail "archive_command does not reference expected dir $archive_dir"
+fb_release_gate_archive_command_matches_dir "$archive_command" "$archive_dir" || \
+	fb_release_gate_fail "archive_command does not resolve to expected dir $archive_dir"
 
 fb_release_gate_log "using archive_dir=$archive_dir"
 

@@ -104,6 +104,13 @@ SELECT substring(
 			   'fb_summary_v3_target'::regclass,
 			   (SELECT target_ts FROM fb_summary_v3_mark)
 		   )
+		   FROM 'summary_payload_locator_records=([0-9]+)')::bigint > 0
+	   AS uses_summary_payload_locators,
+	   substring(
+		   fb_recordref_debug(
+			   'fb_summary_v3_target'::regclass,
+			   (SELECT target_ts FROM fb_summary_v3_mark)
+		   )
 		   FROM 'summary_xid_hits=([0-9]+)')::int > 0
 	   AS uses_summary_xid_outcomes,
 	   substring(

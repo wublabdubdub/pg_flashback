@@ -169,8 +169,15 @@ typedef enum FbWalXidStatus
 typedef enum FbWalPayloadScanMode
 {
 	FB_WAL_PAYLOAD_SCAN_WINDOWED = 0,
-	FB_WAL_PAYLOAD_SCAN_SPARSE
+	FB_WAL_PAYLOAD_SCAN_SPARSE,
+	FB_WAL_PAYLOAD_SCAN_LOCATOR
 } FbWalPayloadScanMode;
+
+typedef enum FbWalBuildMode
+{
+	FB_WAL_BUILD_FULL = 0,
+	FB_WAL_BUILD_COUNT_ONLY
+} FbWalBuildMode;
 
 /*
  * FbRecordBlockRef
@@ -267,6 +274,10 @@ typedef struct FbWalRecordIndex
 	uint64 payload_kept_record_count;
 	uint64 payload_sparse_reader_resets;
 	uint64 payload_sparse_reader_reuses;
+	uint64 summary_payload_locator_records;
+	uint32 summary_payload_locator_segments_read;
+	uint64 summary_payload_locator_public_builds;
+	uint32 summary_payload_locator_fallback_segments;
 	bool tail_inline_payload;
 	XLogRecPtr tail_cutover_lsn;
 	HTAB *xid_statuses;
@@ -312,7 +323,8 @@ void fb_wal_scan_relation_window(const FbRelationInfo *info, FbWalScanContext *c
 
 void fb_wal_build_record_index(const FbRelationInfo *info,
 							   FbWalScanContext *ctx,
-							   FbWalRecordIndex *index);
+							   FbWalRecordIndex *index,
+							   FbWalBuildMode build_mode);
 /*
  * fb_wal_lookup_xid_status
  *    WAL API.

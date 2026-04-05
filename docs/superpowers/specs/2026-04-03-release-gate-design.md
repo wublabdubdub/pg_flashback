@@ -97,9 +97,14 @@ gate 启动时必须：
 3. 若归档未开启或未指向正确目录，则直接失败
 4. 在测试前清空当前版本对应的归档子目录
 
-gate 结束时无论成功还是失败，都必须：
+若本次执行从全流程起点开始，且实际跑过实例准备阶段，则 gate 结束时无论成功还是失败，都必须：
 
 - 再次清空当前版本对应的归档子目录
+
+若本次执行是从中间阶段恢复：
+
+- 不得在退出时清理已有归档目录
+- 避免复跑 `run_flashback_checks` / `render_gate_report` 时误删前序阶段生成的 WAL
 
 报告中必须记录：
 
@@ -129,27 +134,7 @@ gate 结束时无论成功还是失败，都必须：
 
 若造数明显不达标，则直接失败，不进入后续阶段。
 
-### 3. 一小时 DML 压测
-
-继续使用 `/root/alldbsimulator` 对 `alldb` 执行持续 `1h` 的 DML 压测，确保生成足够的 WAL。
-
-压测期间至少覆盖：
-
-- 单行 `insert`
-- 单行 `update`
-- 单行 `delete`
-- 批量 `10000` 行 `insert`
-- 批量 `10000` 行 `update`
-- 批量 `10000` 行 `delete`
-- 混合 `insert/update/delete`
-
-必须记录：
-
-- `pressure_start_ts`
-- `pressure_end_ts`
-- 数据集随机种子
-
-### 4. 5GB 目标大表
+### 3. 5GB 目标大表
 
 从已造出的表中固定选定一张目标表，并将其继续插入扩展到 `5GB`。
 
@@ -164,6 +149,36 @@ gate 结束时无论成功还是失败，都必须：
 - 扩容开始时间
 - 扩容结束时间
 - 扩容后 `pg_total_relation_size`
+
+扩容阶段约束：
+
+- 不在该阶段采随机 truth snapshot
+- 不把该阶段生成的时间点纳入 flashback 正确性窗口
+
+### 4. 一小时 DML 压测
+
+继续使用 `/root/alldbsimulator` 对 `alldb` 执行持续 `1h` 的 DML 压测，确保在“目标大表已完成扩容”的固定数据基线上生成足够的 WAL。
+
+压测期间至少覆盖：
+
+- 单行 `insert`
+- 单行 `update`
+- 单行 `delete`
+
+批量与混合场景单独处理：
+
+- 批量 `10000` 行 `insert`
+- 批量 `10000` 行 `update`
+- 批量 `10000` 行 `delete`
+- 混合 `insert/update/delete`
+
+这些场景不并入 `1h` schema 级压测本体，而是在后续定向 snapshot 阶段单独构造。
+
+必须记录：
+
+- `pressure_start_ts`
+- `pressure_end_ts`
+- 数据集随机种子
 
 ## truth snapshot 设计
 
@@ -195,6 +210,18 @@ gate 结束时无论成功还是失败，都必须：
 
 - 5GB 大表
 - 2-3 张代表性 `100MB` 中表
+
+随机 snapshot 采集窗口固定为：
+
+- `grow_target_table` 完成之后
+- `1h` DML 压测运行期间
+
+## 运维可观测性补充
+
+统一 shell 日志输出需要：
+
+- 每条记录带时间戳
+- 保持稳定前缀，便于按阶段和故障时刻做 grep / 关联分析
 
 每个 snapshot 必须记录：
 

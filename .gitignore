@@ -11,3 +11,4 @@ results/
 regression.diffs
 tmp_check/
 .worktrees/
+open_source/

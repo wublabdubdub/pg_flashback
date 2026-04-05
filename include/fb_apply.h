@@ -71,6 +71,9 @@ FbApplyContext *fb_apply_begin(const FbRelationInfo *info,
 							   TupleDesc tupdesc,
 							   const FbReverseOpSource *source,
 							   const FbFastPathSpec *fast_path);
+FbApplyContext *fb_apply_begin_count_only(const FbRelationInfo *info,
+										  TupleDesc tupdesc,
+										  uint64 row_count);
 bool fb_apply_parallel_candidate(const FbRelationInfo *info,
 								 const FbFastPathSpec *fast_path,
 								 Oid relid);

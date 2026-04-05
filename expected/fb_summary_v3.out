@@ -97,6 +97,13 @@ SELECT substring(
 			   'fb_summary_v3_target'::regclass,
 			   (SELECT target_ts FROM fb_summary_v3_mark)
 		   )
+		   FROM 'summary_payload_locator_records=([0-9]+)')::bigint > 0
+	   AS uses_summary_payload_locators,
+	   substring(
+		   fb_recordref_debug(
+			   'fb_summary_v3_target'::regclass,
+			   (SELECT target_ts FROM fb_summary_v3_mark)
+		   )
 		   FROM 'summary_xid_hits=([0-9]+)')::int > 0
 	   AS uses_summary_xid_outcomes,
 	   substring(
@@ -120,9 +127,9 @@ SELECT substring(
 		   )
 		   FROM 'metadata_fallback_windows=([0-9]+)') IS NOT NULL
 	   AS tracks_metadata_fallback_counter;
- uses_summary_spans | uses_summary_xid_outcomes | tracks_summary_xid_segments | avoids_xid_refill | tracks_metadata_fallback_counter 
---------------------+---------------------------+-----------------------------+-------------------+----------------------------------
- t                  | t                         | t                           | t                 | t
+ uses_summary_spans | uses_summary_payload_locators | uses_summary_xid_outcomes | tracks_summary_xid_segments | avoids_xid_refill | tracks_metadata_fallback_counter 
+--------------------+-------------------------------+---------------------------+-----------------------------+-------------------+----------------------------------
+ t                  | t                             | t                         | t                           | t                 | t
 (1 row)
 
 SELECT *

@@ -153,6 +153,10 @@ struct FbApplyContext
 	int parallel_log_index;
 	MemoryContext parallel_rowctx;
 	void *mode_state;
+	bool count_only_mode;
+	bool count_only_slot_ready;
+	uint64 count_only_total;
+	uint64 count_only_emitted;
 };
 
 PGDLLEXPORT void fb_apply_parallel_worker_main(Datum main_arg);
@@ -190,6 +194,8 @@ static bool fb_apply_parallel_materialize(FbApplyContext *ctx,
 static void fb_apply_reset_buffered_emit(FbApplyBufferedEmit *buffer);
 static void fb_apply_take_buffered_emit(FbApplyBufferedEmit *buffer,
 										FbApplyEmit *emit);
+static bool fb_apply_next_count_only_emit(FbApplyContext *ctx,
+										  FbApplyEmit *emit);
 
 static FbApplyParallelTask *
 fb_apply_parallel_tasks(FbApplyParallelShared *shared)
@@ -241,6 +247,45 @@ fb_apply_take_buffered_emit(FbApplyBufferedEmit *buffer, FbApplyEmit *emit)
 	buffer->emit.tuple = NULL;
 	buffer->emit.owned_tuple = false;
 	buffer->residual_item = NULL;
+}
+
+static bool
+fb_apply_next_count_only_emit(FbApplyContext *ctx, FbApplyEmit *emit)
+{
+	if (ctx == NULL || emit == NULL || ctx->slot == NULL)
+		return false;
+
+	if (ctx->count_only_emitted >= ctx->count_only_total)
+	{
+		ctx->phase = FB_APPLY_PHASE_DONE;
+		fb_progress_update_percent(FB_PROGRESS_STAGE_APPLY, 100, NULL);
+		fb_progress_enter_stage(FB_PROGRESS_STAGE_MATERIALIZE, NULL);
+		fb_progress_update_percent(FB_PROGRESS_STAGE_MATERIALIZE, 100, NULL);
+		return false;
+	}
+
+	if (!ctx->count_only_slot_ready)
+	{
+		int natts = ctx->slot->tts_tupleDescriptor->natts;
+
+		ExecClearTuple(ctx->slot);
+		memset(ctx->slot->tts_values, 0, sizeof(Datum) * natts);
+		memset(ctx->slot->tts_isnull, true, sizeof(bool) * natts);
+		ExecStoreVirtualTuple(ctx->slot);
+		ctx->slot->tts_tableOid = ctx->info->relid;
+		ctx->count_only_slot_ready = true;
+	}
+
+	memset(emit, 0, sizeof(*emit));
+	emit->kind = FB_APPLY_EMIT_SLOT;
+	emit->slot = ctx->slot;
+	ctx->count_only_emitted++;
+	if (ctx->count_only_total > 0)
+		fb_progress_update_fraction(FB_PROGRESS_STAGE_APPLY,
+									ctx->count_only_emitted,
+									ctx->count_only_total,
+									NULL);
+	return true;
 }
 
 static void
@@ -1954,6 +1999,9 @@ fb_apply_next_emit(FbApplyContext *ctx, FbApplyEmit *emit)
 	if (ctx == NULL || emit == NULL)
 		return false;
 
+	if (ctx->count_only_mode)
+		return fb_apply_next_count_only_emit(ctx, emit);
+
 	if (fb_apply_fast_path_enabled(ctx))
 		return fb_apply_next_fast_emit(ctx, emit);
 
@@ -2092,6 +2140,30 @@ fb_apply_begin(const FbRelationInfo *info,
 	ctx->scan = table_beginscan_strat(ctx->rel, snapshot, 0, NULL, true, false);
 	ctx->slot = table_slot_create(ctx->rel, NULL);
 	fb_apply_fast_path_init(ctx);
+	return ctx;
+}
+
+FbApplyContext *
+fb_apply_begin_count_only(const FbRelationInfo *info,
+						  TupleDesc tupdesc,
+						  uint64 row_count)
+{
+	FbApplyContext *ctx;
+
+	ctx = palloc0(sizeof(*ctx));
+	ctx->info = info;
+	ctx->tupdesc = tupdesc;
+	ctx->phase = FB_APPLY_PHASE_SCAN;
+	ctx->count_only_mode = true;
+	ctx->count_only_total = row_count;
+	fb_progress_enter_stage(FB_PROGRESS_STAGE_APPLY, NULL);
+	if (row_count == 0)
+	{
+		fb_progress_update_percent(FB_PROGRESS_STAGE_APPLY, 100, NULL);
+		fb_progress_enter_stage(FB_PROGRESS_STAGE_MATERIALIZE, NULL);
+		fb_progress_update_percent(FB_PROGRESS_STAGE_MATERIALIZE, 100, NULL);
+		ctx->phase = FB_APPLY_PHASE_DONE;
+	}
 	return ctx;
 }
 

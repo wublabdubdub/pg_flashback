@@ -513,7 +513,7 @@ fb_build_flashback_reverse_ops(TimestampTz target_ts,
 
 	fb_progress_enter_stage(FB_PROGRESS_STAGE_PREPARE_WAL, NULL);
 	fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
-	fb_wal_build_record_index(info, &scan_ctx, &index);
+	fb_wal_build_record_index(info, &scan_ctx, &index, FB_WAL_BUILD_FULL);
 	if (index.unsafe)
 	{
 		char *detail = fb_build_unsafe_detail(info, &index);
@@ -865,11 +865,11 @@ fb_recordref_debug(PG_FUNCTION_ARGS)
 	{
 		spool = fb_spool_session_create();
 		fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
-		fb_wal_build_record_index(&info, &scan_ctx, &index);
+		fb_wal_build_record_index(&info, &scan_ctx, &index, FB_WAL_BUILD_FULL);
 
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
-						 "anchor=%s unsafe=%s reason=%s meta_refs=%llu payload_refs=%u kept=%llu target_dml=%llu commits=%llu aborts=%llu tail_inline=%s head_gap_refs=%u tail_refs=%u parallel=%s prefilter=%s visited_segments=%u/%u payload_windows=%u payload_scan_mode=%s payload_parallel_workers=%u payload_covered_segments=%u payload_scanned_records=%llu payload_kept_records=%llu payload_sparse_reader_resets=%llu payload_sparse_reader_reuses=%llu summary_span_windows=%u summary_xid_hits=%u summary_xid_fallback=%u summary_xid_segments_read=%u summary_unsafe_hits=%u metadata_fallback_windows=%u anchor_redo=%X/%08X",
+						 "anchor=%s unsafe=%s reason=%s meta_refs=%llu payload_refs=%u kept=%llu target_dml=%llu commits=%llu aborts=%llu tail_inline=%s head_gap_refs=%u tail_refs=%u parallel=%s prefilter=%s visited_segments=%u/%u payload_windows=%u payload_scan_mode=%s payload_parallel_workers=%u payload_covered_segments=%u payload_scanned_records=%llu payload_kept_records=%llu payload_sparse_reader_resets=%llu payload_sparse_reader_reuses=%llu summary_payload_locator_records=%llu summary_payload_locator_segments_read=%u summary_payload_locator_public_builds=%llu summary_payload_locator_fallback_segments=%u summary_span_windows=%u summary_xid_hits=%u summary_xid_fallback=%u summary_xid_segments_read=%u summary_unsafe_hits=%u metadata_fallback_windows=%u anchor_redo=%X/%08X",
 						 index.anchor_found ? "true" : "false",
 						 index.unsafe ? "true" : "false",
 						 fb_wal_unsafe_reason_name(index.unsafe_reason),
@@ -894,6 +894,10 @@ fb_recordref_debug(PG_FUNCTION_ARGS)
 						 (unsigned long long) index.payload_kept_record_count,
 						 (unsigned long long) index.payload_sparse_reader_resets,
 						 (unsigned long long) index.payload_sparse_reader_reuses,
+						 (unsigned long long) index.summary_payload_locator_records,
+						 index.summary_payload_locator_segments_read,
+						 (unsigned long long) index.summary_payload_locator_public_builds,
+						 index.summary_payload_locator_fallback_segments,
 						 scan_ctx.summary_span_windows,
 						 scan_ctx.summary_xid_hits,
 						 scan_ctx.summary_xid_fallback,
@@ -930,7 +934,7 @@ fb_recordref_missing_spool_debug(PG_FUNCTION_ARGS)
 	fb_require_archive_dir();
 	fb_catalog_load_relation_info(relid, &info);
 	fb_wal_prepare_scan_context(target_ts, NULL, &scan_ctx);
-	fb_wal_build_record_index(&info, &scan_ctx, &index);
+	fb_wal_build_record_index(&info, &scan_ctx, &index, FB_WAL_BUILD_FULL);
 
 	PG_RETURN_TEXT_P(cstring_to_text("unexpected success"));
 }
@@ -961,7 +965,7 @@ fb_recordref_block_debug(PG_FUNCTION_ARGS)
 
 		spool = fb_spool_session_create();
 		fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
-		fb_wal_build_record_index(&info, &scan_ctx, &index);
+		fb_wal_build_record_index(&info, &scan_ctx, &index, FB_WAL_BUILD_FULL);
 
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
@@ -1068,7 +1072,7 @@ fb_replay_debug(PG_FUNCTION_ARGS)
 	{
 		spool = fb_spool_session_create();
 		fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
-		fb_wal_build_record_index(&info, &scan_ctx, &index);
+		fb_wal_build_record_index(&info, &scan_ctx, &index, FB_WAL_BUILD_FULL);
 		fb_replay_execute(&info, &index, &replay_result);
 
 		initStringInfo(&buf);
@@ -1530,7 +1534,7 @@ fb_export_undo(PG_FUNCTION_ARGS)
 	fb_require_supported_target_relation(relid, &info);
 	spool = fb_spool_session_create();
 	fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
-	fb_wal_build_record_index(&info, &scan_ctx, &index);
+	fb_wal_build_record_index(&info, &scan_ctx, &index, FB_WAL_BUILD_FULL);
 	if (index.unsafe)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

@@ -64,6 +64,31 @@
   - `pg_flashback.parallel_workers` 默认值当前已调整为 `8`
 - 当前 `pg_flashback()` 进度显示固定为 9 段：
   - stage `9` 已改为 residual 历史行发射
+- 当前仓库发布结构补充固定为：
+  - 根仓库继续保留内部研发资料
+  - 新增 `open_source/pg_flashback/` 作为长期维护的开源镜像目录
+  - 当前术语约定固定为：
+    - 用户提到“开源项目”时，默认就是指 `open_source/` 目录中的内容
+    - 用户提到“开源版本”/“GitHub 版本”时，也按同一口径理解
+  - 开源镜像不作为首改目录
+  - 统一通过 `scripts/sync_open_source.sh` 按白名单刷新
+  - 开源镜像首版仅保留：
+    - `Makefile`
+    - `README.md`
+    - `pg_flashback.control`
+    - `include/`
+    - `src/`
+    - `sql/`
+    - `expected/`
+    - 精简后的公开文档
+  - 明确不进入开源镜像：
+    - `STATUS.md` / `TODO.md` / `PROJECT.md`
+    - `docs/reports/` / `docs/superpowers/`
+    - `tests/deep/` / `tests/release_gate/`
+    - 日志、性能采样、构建产物与其他临时输出
+  - `open_source/` 目录当前也不纳入本仓库 Git 跟踪：
+    - 作为本地开源镜像导出目录保留
+    - 由 `scripts/sync_open_source.sh` 按需重建
 - 当前 `summary` 主线补充：
   - 已拍板启动 `block-anchor summary v1`
   - 首版目标不是全量 block span/row-image sidecar
@@ -73,6 +98,10 @@
   - 首版不承诺直接优化 `8/9 applying reverse ops`
   - 首版保持现有 relation/xid summary section 与 WAL fallback 语义不变
   - `pg_flashback_summary_progress` 还需补“最近一次实际查询是否发生 summary 降级”观测，避免把文件覆盖率 `100%` 误读成“最近查询必然走到 summary-first 索引”
+  - `summary service` 需要对 `meta/summary` 做源 WAL 探活：
+    - 若归档目录 / `pg_wal` / `recovered_wal` 中对应 segment 已不存在
+    - 则对应 summary 索引文件也必须删除
+    - 不能继续保留为“历史已构建但当前无源文件”的僵尸 summary
 - 开发期调试约定补充：
   - 手工导出 / 保留 core dump、gdb 临时 core 文件时，统一使用 `/isoTest/tmp`
   - 不再使用 `/tmp` 作为本项目的临时 core 落盘路径
@@ -85,6 +114,141 @@
     - 仍必须继续修到 `84/AE079278 / blk=216125 / failed to replay heap insert` 的真实根因为止
 
 ## 当前进行中
+
+- 已确认并开始修复 `documents @ 2026-04-04 23:40:13` 的 `3/9` 新 blocker：
+  - 当前 `summary payload locator-first` 方案方向本身成立：
+    - 已明显压低 payload 阶段的无关 WAL decode
+  - 但 live case 新热点已经从 “payload decode” 转移成
+    “payload locator 查询期规划”
+  - 现场证据已经确认：
+    - `select count(*) from pg_flashback(NULL::scenario_oa_50t_50000r.documents, '2026-04-04 23:40:13')`
+      在 `3/9` 停留期间，backend `gdb/perf` 热点几乎全部落在：
+      - `fb_build_summary_payload_locator_plan`
+      - `fb_summary_segment_lookup_payload_locators_cached`
+      - `pg_qsort`
+    - 当场栈顶已抓到：
+      - `pg_qsort_swapn`
+      - `fb_summary_segment_lookup_payload_locators_cached`
+      - `fb_build_summary_payload_locator_plan`
+    - 同次现场 `fb_build_summary_payload_locator_plan` 参数已确认：
+      - `base_window_count = 164536`
+      - 单 segment lookup 现场一次就在排 `6315` 条 locator
+  - 当前根因已确认不是“locator-first 方案无效”，而是查询期实现存在复杂度放大：
+    - payload plan 仍按高碎片 `payload_base_windows` 逐窗口逐段调用 locator lookup
+    - 同一 segment 会被重复 lookup
+    - query cache 当前只缓存 summary 文件，不缓存 relation-scoped public locator slice
+    - `fb_summary_segment_lookup_payload_locators_cached()` 每次 lookup 仍重新拷贝并 `qsort`
+  - 当前已拍板的新修复方向：
+    - 保持“一段 WAL 一个 summary sidecar”模型不变
+    - 把 payload locator 从“查询时现拼现排”推进为：
+      - summary build 期按 relation 预排序 / 去重的 stable slice
+      - query cache 期复用 relation-scoped public locator slice
+      - payload plan 期按 segment 去重，不再由碎片 windows 重复驱动 lookup
+    - 目标不是只优化 `approval_comments` 一类轻 case，而是先把
+      `documents @ 2026-04-04 23:40:13` 从 `3/9` 新热点里拉出来
+  - 第一轮 locator 规划收敛已完成后，live case 新热点继续右移到
+    `payload materialize / record spool`：
+    - 现场复核：
+      - `select count(*) from pg_flashback(NULL::scenario_oa_50t_50000r.documents, '2026-04-04 23:40:13')`
+        当前已能通过 `3/9 70% payload` 前的 locator 规划，不再卡在
+        `pg_qsort`
+      - 但 `3/9 100% payload` 仍单独耗时约 `178.360s`
+      - 紧接着 preflight 直接报：
+        - `estimated=8455177953 bytes`
+        - `limit=1073741824 bytes`
+    - 新一轮 `gdb` 栈顶已确认热点不再是 locator plan，而是：
+      - `fb_wal_visit_payload_locators`
+      - `fb_copy_xlog_fpi_record_ref`
+      - `fb_index_append_record`
+      - `fb_spool_log_append`
+      - `pwrite64`
+    - 当前判断：
+      - locator-first 已把“无关 WAL decode”压下去
+      - 但 payload 物化阶段仍把大量 page-image 记录完整写入 record spool
+      - 当前要继续压的是“对 replay 无贡献或不需要保留完整 image 的 payload 体积”，
+        先把 `3/9 payload` 与 preflight working set 一起打下来
+  - 针对用户现场固定 SQL
+    `select count(*) from pg_flashback(NULL::scenario_oa_50t_50000r.documents, '2026-04-04 23:40:13')`
+    已继续落地 `count(*)` 专用快路径：
+    - planner `UPPERREL_GROUP_AGG` 现会把纯 `count(*)` 识别成
+      `Custom Scan (FbCountAggScan)`，不再走 PostgreSQL `Aggregate -> FbApplyScan`
+    - `FbCountAggScan` 内部固定走 `FB_WAL_BUILD_COUNT_ONLY`：
+      - 不再捕获 payload record spool
+      - 不再构造 reverse/apply
+      - metadata 阶段按 xid 累加主表 `insert/delete/update` 计数，
+        `xact-status` 结束后直接汇总历史行数
+    - 2026-04-05 本机 `alldb` 复核：
+      - `3/9 30% metadata` 约 `2.263s`
+      - `3/9 55% xact-status` 约 `17.134s`
+      - `3/9 100% payload` 约 `0.002s`
+      - `3/9` 整段累计约 `19.6s`，已压到 `< 20s`
+      - 同次整条 SQL 总耗时约 `22.132s`
+    - 当前新尾巴已经从 `3/9 payload` 转移到整体总耗时与
+      `SELECT *` 非聚合路径，不再是本次用户要求的 blocker
+
+- 已完成 `summary payload locator` 架构升级主链，summary 现已从
+  “relation spans 缩窗”推进到“payload 精确 record 入口”：
+  - 保持模型不变：
+    - 仍是“一段 WAL 一个 summary sidecar”
+    - 仍是 query-side 可回退的可再生缓存
+    - 不引入跨 segment 全局索引
+  - 当前实现：
+    - `summary v8` 新增 relation-scoped `payload locator` section
+    - locator 记录目标 relation payload record 的精确 `record_start_lsn`
+    - query-side payload 改为 locator-first：
+      - 优先按 locator 定点读取 record
+      - 仅对 locator 缺失 / summary 缺失 / recent tail 未覆盖 segment
+        回退现有 window 路径
+    - `fb_recordref_debug()` 已新增：
+      - `summary_payload_locator_records`
+      - `summary_payload_locator_fallback_segments`
+      - `payload_scan_mode=locator`
+  - 当前验证：
+    - 定向回归 `fb_recordref` / `fb_summary_v3` / `fb_payload_scan_mode` /
+      `fb_wal_parallel_payload` 已通过
+    - live case `scenario_oa_50t_50000r.approval_comments`：
+      - `fb_recordref_debug(..., '2026-04-04 23:40:13')` 当前返回：
+        - `payload_scan_mode=locator`
+        - `summary_payload_locator_records=171185`
+        - `summary_payload_locator_fallback_segments=0`
+        - `payload_scanned_records=171185`
+      - 对比升级前：
+        - `payload_scanned_records` 从 `8198479` 降到 `171185`
+        - `3/9 payload` 从约 `10.3s` 降到约 `5.6s`
+      - `... '2026-04-04 22:40:13'` 同样收敛到：
+        - `payload_scanned_records=171185`
+        - `3/9 payload` 从约 `7.5s` 降到约 `5.6s`
+  - 当前结论：
+    - `3/9 payload` 已不再由 span 内海量无关 decode 主导
+    - 热点已转移到 metadata / xact-status / replay final 等后续阶段
+
+- 已完成 `summary progress` / `meta/summary` 失活索引清理收敛：
+  - `summary service` cleanup 当前会按当前可见 WAL 源集合探活删除 orphan summary
+  - 为避免打掉刚构建、尚未消费的 summary，orphan cleanup 继续受 `recent protect` 短窗口保护
+  - 已补严格文件名匹配：
+    - 只清理正式 `summary-<hash>.meta`
+    - 不再把 `.tmp.<pid>` 构建临时文件误判成正式 summary
+  - 当前回归补齐：
+    - `fb_summary_service` 新增“删除 WAL 后删除对应 summary 文件”断言
+  - 当前定点验证：
+    - `make ... installcheck REGRESS=fb_summary_service` 通过
+    - `make ... installcheck REGRESS=fb_summary_prefilter` 通过
+    - `make ... installcheck REGRESS=fb_summary_v3` 通过
+
+- 已完成开源镜像目录设计与实施拆解，当前进入落地与首轮整理：
+  - 规格文件：
+    - `docs/superpowers/specs/2026-04-04-open-source-mirror-design.md`
+  - 计划文件：
+    - `docs/superpowers/plans/2026-04-04-open-source-mirror-plan.md`
+  - 当前已拍板：
+    - 根仓库是唯一权威研发源
+    - `open_source/pg_flashback/` 是公开镜像目录
+    - 统一使用白名单同步脚本刷新，不做手工长期维护
+  - 当前实施目标：
+    - 新增 `open_source/README.md` / `open_source/manifest.txt`
+    - 新增 `scripts/sync_open_source.sh`
+    - 首轮生成并检查 `open_source/pg_flashback/`
+    - 将 `open_source/` 加入根仓库 `.gitignore`
 
 - 已完成一份新的发布前 gate 设计规格，准备进入实现拆解：
   - 规格文件：
@@ -107,19 +271,132 @@
     - `PG17 -> /walstorage/17waldata`
     - `PG18 -> /walstorage/18waldata`
     - 每轮测试前后都必须清理当前版本对应目录
-  - 当前首批骨架已落地：
+  - 当前实现已推进到可执行骨架：
     - `tests/release_gate/bin/common.sh`
     - `tests/release_gate/bin/run_release_gate.sh`
     - `tests/release_gate/bin/prepare_empty_instance.sh`
+    - `tests/release_gate/bin/load_alldb_seed.sh`
+    - `tests/release_gate/bin/run_alldb_dml_pressure.sh`
+    - `tests/release_gate/bin/grow_flashback_target.sh`
+    - `tests/release_gate/bin/capture_truth_snapshots.sh`
+    - `tests/release_gate/bin/run_flashback_matrix.sh`
+    - `tests/release_gate/bin/evaluate_gate.sh`
+    - `tests/release_gate/bin/render_report.sh`
     - `tests/release_gate/bin/selftest.sh`
     - `tests/release_gate/sql/check_environment.sql`
     - `tests/release_gate/sql/list_large_databases.sql`
+    - `tests/release_gate/sql/recreate_alldb.sql`
+    - `tests/release_gate/sql/table_size_summary.sql`
+    - `tests/release_gate/sql/export_table_csv.sql`
+    - `tests/release_gate/sql/export_flashback_csv.sql`
+    - `tests/release_gate/sql/create_flashback_ctas.sql`
+    - `tests/release_gate/sql/drop_flashback_ctas.sql`
     - `tests/release_gate/config/release_gate.conf`
     - `tests/release_gate/config/scenario_matrix.json`
     - `tests/release_gate/config/thresholds.json`
+    - `tests/release_gate/golden/pg14.json`
+    - `tests/release_gate/golden/pg15.json`
+    - `tests/release_gate/golden/pg16.json`
+    - `tests/release_gate/golden/pg17.json`
+    - `tests/release_gate/golden/pg18.json`
     - `tests/release_gate/templates/report.md.tpl`
   - 当前已验证：
     - `bash tests/release_gate/bin/selftest.sh`：`PASS`
+    - `bash tests/release_gate/bin/run_alldb_dml_pressure.sh --dry-run --start-only`
+    - `bash tests/release_gate/bin/capture_truth_snapshots.sh --dry-run --mode random`
+    - `bash tests/release_gate/bin/capture_truth_snapshots.sh --dry-run --mode dml`
+    - `bash tests/release_gate/bin/run_flashback_matrix.sh --dry-run`
+    - `bash tests/release_gate/bin/evaluate_gate.sh`
+    - `bash tests/release_gate/bin/render_report.sh`
+  - 当前已锁定的环境 blocker：
+    - 本机 PG18 现有 `archive_command = cp %p /home/18pg/wal_arch/%f`
+    - 与 spec 要求的 `/walstorage/18waldata` 不一致
+    - 因此 `bash tests/release_gate/bin/run_release_gate.sh --dry-run`
+      当前会被环境 gate 正常拦住，不进入 real flow
+  - 2026-04-04 当前补充实现口径已拍板：
+    - `tests/release_gate/bin/run_release_gate.sh` 需支持阶段级编排：
+      - `--list-stages`
+      - `--from <stage>`
+      - `--to <stage>`
+      - `--only <stage>`
+    - 阶段名改为面向用户直观可读：
+      - `prepare_instance`
+      - `start_alldbsimulator`
+      - `load_seed_data`
+      - `grow_target_table`
+      - `start_dml_pressure`
+      - `capture_random_truth_snapshots`
+      - `wait_dml_pressure_finish`
+      - `capture_dml_truth_snapshots`
+      - `run_flashback_checks`
+      - `evaluate_gate`
+      - `render_gate_report`
+    - 从中间阶段启动时不自动补前置产物，缺依赖文件时继续直接报错
+    - `cleanup` 仍只由总入口 `trap` 负责，不作为用户可选阶段
+    - 只有本次执行实际跑过 `prepare_instance` 时，总入口退出才允许清理当前版本归档目录
+      - 避免从 `run_flashback_checks` 等中间阶段起跑时误删上一阶段已生成 WAL
+    - release gate 所有统一日志输出都补齐时间戳
+    - `1h` DML 压测当前真实口径继续固定为：
+      - 只在 `load_seed_data + grow_target_table` 完成后启动
+      - schema 级目标
+      - `insert/update/delete` 等权重混合
+      - 每个事务只执行 `1` 个 DML
+      - 默认总限速从 `200 ops/s` 上调到 `2000 ops/s`
+      - `bulk 10k` / `mixed dml` 仍在后续定向快照阶段单独构造，不并入这 `1h`
+    - `grow_target_table` 期间不采随机 truth snapshot，也不作为 flashback 场景时间窗
+  - 2026-04-04 本轮已完成：
+    - `tests/release_gate/bin/run_release_gate.sh` 已支持：
+      - `--list-stages`
+      - `--from <stage>`
+      - `--to <stage>`
+      - `--only <stage>`
+    - 用户可见阶段名已统一改为直观动作语义：
+      - `prepare_instance`
+      - `start_alldbsimulator`
+      - `load_seed_data`
+      - `grow_target_table`
+      - `start_dml_pressure`
+      - `capture_random_truth_snapshots`
+      - `wait_dml_pressure_finish`
+      - `capture_dml_truth_snapshots`
+      - `run_flashback_checks`
+      - `evaluate_gate`
+      - `render_gate_report`
+    - `tests/release_gate/README.md` 已重写为完整操作手册：
+      - 覆盖环境要求
+      - 覆盖总入口和单脚本入口
+      - 覆盖每个阶段的作用、依赖和产物
+      - 明确 `1h` DML 压测真实执行规则
+    - release gate 默认 DML 总限速已上调到 `2000 ops/s`
+  - 2026-04-04 本轮继续完成：
+    - release gate 阶段顺序已调整为：
+      - `prepare_instance`
+      - `start_alldbsimulator`
+      - `load_seed_data`
+      - `grow_target_table`
+      - `start_dml_pressure`
+      - `capture_random_truth_snapshots`
+      - `wait_dml_pressure_finish`
+      - `capture_dml_truth_snapshots`
+      - `run_flashback_checks`
+      - `evaluate_gate`
+      - `render_gate_report`
+    - 当前固定口径已明确：
+      - 目标大表先扩容到 `5GB`
+      - 所有扩容插入完成后才启动 `1h` DML 压测
+      - 扩容阶段不采随机 truth snapshot，也不纳入 flashback 时间窗
+    - `fb_release_gate_log()` / `fb_release_gate_fail()` 已统一补齐时间戳前缀
+    - 已修复总入口 `cleanup` 误删已有 WAL：
+      - 当前只在本次执行实际跑过 `prepare_instance` 且非 `dry-run` 时清理归档目录
+      - 从 `run_flashback_checks` / `render_gate_report` 等中间阶段起跑，不再清掉前序 real run 生成的 WAL
+    - `tests/release_gate/bin/selftest.sh` 已补新约束：
+      - 锁住 `grow_target_table` 必须先于 `start_dml_pressure`
+      - 锁住统一日志必须带时间戳
+      - 锁住中间阶段起跑不得删除已有 archive 文件
+  - 2026-04-04 本轮已验证：
+    - `bash -n tests/release_gate/bin/common.sh tests/release_gate/bin/run_release_gate.sh tests/release_gate/bin/selftest.sh`
+    - `bash tests/release_gate/bin/selftest.sh`：`PASS`
+    - `bash tests/release_gate/bin/run_release_gate.sh --list-stages`
 - 当前已补齐一个用户面安装/升级缺口：
   - 历史上曾在同一 `extversion = '0.1.0'` 下先后安装过
     `pg_flashback(text, text, text)` 与 `pg_flashback(anyelement, text)`
@@ -300,6 +577,18 @@
       不能把 `summary v6` 失效修复误当成整条主线已收尾
 
 ## 本轮完成
+
+- 已完成开源镜像文档双语化与 README 用户手册重写：
+  - 影响目录：
+    - `open_source/pg_flashback/README.md`
+    - `open_source/pg_flashback/docs/**/*.md`
+    - `open_source/pg_flashback/tests/README.md`
+  - 当前结果：
+    - 开源镜像内全部 Markdown 已统一为“单文件中英双语”
+    - 每份文档顶部都提供 `中文` / `English` 跳转按钮
+    - `README.md` 已改写为当前开源版本实际可用的用户手册
+    - README 只描述已公开安装的接口、配置、查询方式、`CTAS` / `COPY` 承接方式、结果语义、错误边界和基本原理
+    - 未对外安装或未完成的能力当前只作为边界说明保留
 
 - 已完成 `fb_replay` 回归夹具幂等性修复：
   - 现象：
@@ -679,6 +968,49 @@
       结果：`All 2 tests passed.`
     - `make PG_CONFIG=/home/18pg/local/bin/pg_config PGPORT=5832 PGUSER=18pg installcheck REGRESS='fb_summary_v3 fb_summary_overlap_toast fb_replay'`
       结果：`All 3 tests passed.`
+  - 2026-04-05 新增 live 现场：
+    - `scenario_oa_50t_50000r.approval_comments @ '2026-04-04 23:40:13'`
+    - 用户查询表面停在：
+      - `3/9 70% payload`
+    - 当前 root cause 已定位为新的 scan-mode 误判，不是 replay/apply 卡死：
+      - gdb 栈稳定停在 `fb_wal_build_record_index() -> fb_wal_visit_sparse_windows() -> WALRead/pread64`
+      - 当前现场变量已抓到：
+        - `summary_span_windows=38666`
+        - `payload_base_window_count=38666`
+        - `payload_sparse_count=32184`
+        - `payload_windowed_count=383`
+        - `payload_parallel_count=383`
+        - `payload_scan_mode=sparse`
+        - `payload_covered_segments=407`
+        - `summary_span_fallback_segments=0`
+        - `metadata_fallback_windows=0`
+      - 这说明当前不是 summary 缺失导致的 fallback 全扫，而是：
+        - summary relation spans 本身极碎
+        - query-side heuristic 仍选择 `sparse`
+        - sparse path 对每个 emit window 都把 decode 起点拉回同一 segment slice 的段首
+        - 同一批 covered segments 被重复 `XLogFindNextRecord()/XLogReadRecord()`，形成新的 `WalRead` 放大
+  - 当前修复口径：
+    - 不改 replay 语义，不重新扩大 payload decode 覆盖面
+    - 第一优先级先修 query-side payload scan-mode 选择：
+      - 对“`payload_sparse_count` 远大于 `payload_windowed_count`，且 `windowed` 已收敛到少量 covered slices”的 case，不再误选 `sparse`
+      - 先优先回到 `windowed` 顺扫同一 covered slice
+    - 同步补一条最小 RED，锁住这类碎 summary-span 现场不再回归为 `payload_scan_mode=sparse`
+  - 当前已完成：
+    - query-side heuristic 当前已改为同时参考 `payload_sparse_count`、`effective windowed window count` 与 `payload_covered_segments`
+    - 对 `covered_segments <= 512` 且 `sparse_window_count < covered_segments * 128` 的场景，不再误选 `sparse`
+    - 新增回归：
+      - `fb_payload_scan_mode`
+      - 锁住“碎 summary-span synthetic case 仍使用 summary spans，但最终必须选择 `payload_scan_mode=windowed`”
+    - 当前定向验证：
+      - `make PG_CONFIG=/home/18pg/local/bin/pg_config PGPORT=5832 PGUSER=18pg installcheck REGRESS='fb_payload_scan_mode fb_wal_parallel_payload fb_recordref fb_summary_v3'`
+      - 结果：`All 4 tests passed.`
+    - 当前 live spot-check：
+      - `scenario_oa_50t_50000r.approval_comments @ '2026-04-04 23:40:13'`
+      - `fb_recordref_debug(...)` 当前返回：
+        - `payload_windows=383`
+        - `payload_scan_mode=windowed`
+        - `payload_covered_segments=407`
+        - `summary_span_windows=38666`
 
 - 已补 `pg_flashback_summary_progress` 的“最近查询 summary 降级”观测：
   - root cause：
@@ -879,6 +1211,7 @@
 
 ## 下一步
 
+- 将开源镜像双语文档模板收口到 `scripts/sync_open_source.sh` 的长期同步流程中，避免后续刷新时回退到旧单语文档
 - 将 `docs/superpowers/specs/2026-04-03-release-gate-design.md` 细化为正式实现计划
 - 为 `tests/release_gate/` 建立独立脚本与配置骨架
 - 固化 `PG14-18` golden baseline 文件结构、双阈值阻断规则与 Markdown 报告模板
@@ -1250,6 +1583,21 @@
       - `xact-status`
       - `payload`
     - 再继续收窄 build-index 尾段 payload work，避免用户被旧进度面误导
+  - `2026-04-05` 当前新增现场结论：
+    - `scenario_oa_50t_50000r.documents @ '2026-04-04 23:40:13'` 复测显示：
+      - `3/9 xact-status` 约 `16.7s`
+      - `3/9 payload` 约 `43.3s`
+      - 总耗时约 `62.9s`
+    - 当前已新增一轮 query-local summary xid outcome 零拷贝收口：
+      - `fb_summary` 现已在 query cache 内保留 `xid outcomes` public slice
+      - `xact-status` 不再为每个命中 segment 额外复制整段 outcome 数组
+      - 现阶段 live case 上 `xact-status` 已从约 `19s` 档位压到约 `16-17s`
+    - 已验证一条错误方向：
+      - 直接按“xid 已知 before-target / aborted”裁掉 payload spool 会破坏 replay 正确性
+      - 这说明部分此类 record 仍承担页状态/块初始化约束，不能按事务语义直接删除
+    - 当前稳定结论：
+      - `xact-status` 还能继续往 summary 侧压，但必须建立新的 per-segment xid presence/index，不能再只靠 query 期语义剪枝
+      - 当前 live case 的头号热点仍然是 payload materialize/spool，而不是 `xact-status`
 
 - runtime 自动清理口径已重新拍板：
   - 恢复“查询结束触发的 runtime 安全 sweep”

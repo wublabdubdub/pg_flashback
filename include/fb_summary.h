@@ -66,6 +66,13 @@ typedef struct FbSummaryBlockAnchor
 	uint16 flags;
 } FbSummaryBlockAnchor;
 
+typedef struct FbSummaryPayloadLocator
+{
+	XLogRecPtr record_start_lsn;
+	uint8 kind;
+	uint8 flags;
+} FbSummaryPayloadLocator;
+
 FbSummaryQueryCache *fb_summary_query_cache_create(MemoryContext mcxt);
 bool fb_summary_segment_lookup_spans_cached(const char *path,
 											off_t bytes,
@@ -86,6 +93,25 @@ bool fb_summary_segment_lookup_xid_outcomes_cached(const char *path,
 												   FbSummaryQueryCache *cache,
 												   FbSummaryXidOutcome **outcomes_out,
 												   uint32 *outcome_count_out);
+bool fb_summary_segment_lookup_xid_outcome_for_xid_cached(const char *path,
+														  off_t bytes,
+														  TimeLineID timeline_id,
+														  XLogSegNo segno,
+														  int wal_seg_size,
+														  int source_kind,
+														  TransactionId xid,
+														  FbSummaryQueryCache *cache,
+														  FbSummaryXidOutcome *outcome_out,
+														  bool *found_out);
+bool fb_summary_segment_lookup_xid_outcome_slice_cached(const char *path,
+														off_t bytes,
+														TimeLineID timeline_id,
+														XLogSegNo segno,
+														int wal_seg_size,
+														int source_kind,
+														FbSummaryQueryCache *cache,
+														const FbSummaryXidOutcome **outcomes_out,
+														uint32 *outcome_count_out);
 bool fb_summary_segment_lookup_touched_xids_cached(const char *path,
 												   off_t bytes,
 												   TimeLineID timeline_id,
@@ -116,6 +142,17 @@ bool fb_summary_segment_lookup_block_anchors_cached(const char *path,
 													FbSummaryQueryCache *cache,
 													FbSummaryBlockAnchor **anchors_out,
 													uint32 *anchor_count_out);
+bool fb_summary_segment_lookup_payload_locators_cached(const char *path,
+													   off_t bytes,
+													   TimeLineID timeline_id,
+													   XLogSegNo segno,
+													   int wal_seg_size,
+													   int source_kind,
+													   const FbRelationInfo *info,
+													   FbSummaryQueryCache *cache,
+													   FbSummaryPayloadLocator **locators_out,
+													   uint32 *locator_count_out);
+uint64 fb_summary_query_cache_payload_locator_public_builds(FbSummaryQueryCache *cache);
 
 bool fb_summary_segment_matches(const char *path,
 								off_t bytes,

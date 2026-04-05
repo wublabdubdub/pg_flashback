@@ -24,11 +24,17 @@ BEGIN
 	IF to_regprocedure('fb_summary_build_available_debug()') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_summary_build_available_debug()';
 	END IF;
+	IF to_regprocedure('fb_summary_path_debug(text)') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_summary_path_debug(text)';
+	END IF;
 	IF to_regprocedure('fb_summary_service_schedule_debug(integer, integer, integer)') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_summary_service_schedule_debug(integer, integer, integer)';
 	END IF;
 	IF to_regprocedure('fb_summary_service_worker_error_isolation_debug()') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_summary_service_worker_error_isolation_debug()';
+	END IF;
+	IF to_regprocedure('fb_summary_service_cleanup_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_summary_service_cleanup_debug()';
 	END IF;
 	IF to_regprocedure('fb_summary_service_memory_reset_debug(integer)') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_summary_service_memory_reset_debug(integer)';
@@ -66,6 +72,11 @@ RETURNS integer
 AS '$libdir/pg_flashback', 'fb_summary_build_available_debug'
 LANGUAGE C;
 
+CREATE FUNCTION fb_summary_path_debug(text)
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_summary_path_debug'
+LANGUAGE C;
+
 CREATE FUNCTION fb_summary_service_schedule_debug(integer, integer, integer)
 RETURNS TABLE (
 	candidate_no integer,
@@ -81,6 +92,11 @@ LANGUAGE C;
 CREATE FUNCTION fb_summary_service_worker_error_isolation_debug()
 RETURNS text
 AS '$libdir/pg_flashback', 'fb_summary_service_worker_error_isolation_debug'
+LANGUAGE C;
+
+CREATE FUNCTION fb_summary_service_cleanup_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_summary_service_cleanup_debug'
 LANGUAGE C;
 
 CREATE FUNCTION fb_summary_service_memory_reset_debug(integer)
@@ -164,7 +180,8 @@ FROM pg_flashback_summary_progress;
 
 CREATE TEMP TABLE fb_summary_gap_fixture (
 	seg_name text NOT NULL,
-	segno bigint NOT NULL
+	segno bigint NOT NULL,
+	summary_path text
 );
 
 DO $$
@@ -244,6 +261,12 @@ FROM fb_summary_gap_fixture;
 
 SELECT fb_summary_build_available_debug() > 0 AS built_gap_fixture_summary;
 
+UPDATE fb_summary_gap_fixture
+SET summary_path = fb_summary_path_debug('/tmp/fb_summary_progress_gap_archive/' || seg_name);
+
+SELECT count(*) FILTER (WHERE summary_path IS NOT NULL) = 3 AS gap_fixture_summary_paths_ready
+FROM fb_summary_gap_fixture;
+
 SELECT missing_segments = 0 AS fixture_starts_without_gap,
 	   first_gap_from_newest_segno IS NULL AS fixture_has_no_newest_gap,
 	   first_gap_from_oldest_segno IS NULL AS fixture_has_no_oldest_gap
@@ -290,6 +313,40 @@ SELECT missing_segments = 1 AS tracks_deleted_wal_gap,
 	   AS oldest_gap_matches_deleted,
 	   progress_pct < 100.0 AS progress_pct_drops
 FROM pg_flashback_summary_progress;
+
+DO $$
+DECLARE
+	deadline timestamptz := clock_timestamp() + interval '10 seconds';
+	cleaned boolean := false;
+BEGIN
+	LOOP
+		PERFORM fb_summary_service_cleanup_debug();
+		SELECT pg_stat_file(
+				   (SELECT summary_path
+					FROM fb_summary_gap_fixture
+					ORDER BY segno
+					OFFSET 1
+					LIMIT 1),
+				   true
+			   ) IS NULL
+		INTO cleaned;
+
+		EXIT WHEN cleaned OR clock_timestamp() >= deadline;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END;
+$$;
+
+SELECT fb_summary_service_cleanup_debug() LIKE '%summary_cleanup_ran=true%' AS summary_cleanup_ran;
+
+SELECT pg_stat_file(
+		   (SELECT summary_path
+			FROM fb_summary_gap_fixture
+			ORDER BY segno
+			OFFSET 1
+			LIMIT 1),
+		   true
+	   ) IS NULL AS prunes_summary_for_deleted_wal;
 
 SELECT count(*) FILTER (WHERE queue_kind = 'cold') > 0 AS prepared_backlog_fixture
 FROM fb_summary_service_schedule_debug(64, 32, 40);

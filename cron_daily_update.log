@@ -186,3 +186,32 @@ To github.com:wublabdubdub/pg_flashback.git
 To github.com:wublabdubdub/pg_flashback.git
    6828879..1578d77  main -> main
 [2026-04-03 01:00:06 CST] auto update finished
+[2026-04-04 01:00:01 CST] committing changes to origin/main
+[main 382bd4d] update
+ 47 files changed, 4968 insertions(+), 383 deletions(-)
+ create mode 100644 docs/superpowers/plans/2026-04-03-release-gate-implementation.md
+ create mode 100644 docs/superpowers/specs/2026-04-03-release-gate-design.md
+ create mode 100644 expected/fb_extension_upgrade.out
+ create mode 100644 sql/fb_extension_upgrade.sql
+ create mode 100644 sql/pg_flashback--0.1.0--0.1.1.sql
+ rewrite sql/pg_flashback--0.1.0.sql (84%)
+ copy sql/{pg_flashback--0.1.0.sql => pg_flashback--0.1.1.sql} (100%)
+ create mode 100644 tests/release_gate/README.md
+ create mode 100755 tests/release_gate/bin/common.sh
+ create mode 100755 tests/release_gate/bin/prepare_empty_instance.sh
+ create mode 100755 tests/release_gate/bin/run_release_gate.sh
+ create mode 100755 tests/release_gate/bin/selftest.sh
+ create mode 100644 tests/release_gate/bin/start_alldbsim.sh
+ create mode 100644 tests/release_gate/config/release_gate.conf
+ create mode 100644 tests/release_gate/config/scenario_matrix.json
+ create mode 100644 tests/release_gate/config/thresholds.json
+ create mode 100644 tests/release_gate/output/.gitkeep
+ create mode 100644 tests/release_gate/output/README.md
+ create mode 100644 tests/release_gate/output/latest/logs/alldbsim.log
+ create mode 100644 tests/release_gate/sql/check_environment.sql
+ create mode 100644 tests/release_gate/sql/list_large_databases.sql
+ create mode 100644 tests/release_gate/templates/report.md.tpl
+[2026-04-04 01:00:02 CST] pushing to origin/main
+To github.com:wublabdubdub/pg_flashback.git
+   1578d77..382bd4d  main -> main
+[2026-04-04 01:00:11 CST] auto update finished

@@ -43,28 +43,16 @@ FROM pg_flashback(
 	NULL::public.fb_custom_scan_target,
 	(SELECT target_ts::text FROM fb_custom_scan_mark)
 );
-                                     QUERY PLAN                                      
--------------------------------------------------------------------------------------
- Aggregate
-   Output: count(*)
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Custom Scan (FbCountAggScan)
+   Output: (count(*))
+   Flashback Relation: public.fb_custom_scan_target
+   Flashback Count Aggregate Pushdown: true
    InitPlan 1
      ->  Seq Scan on public.fb_custom_scan_mark
            Output: (fb_custom_scan_mark.target_ts)::text
-   ->  Custom Scan (FbApplyScan)
-         Flashback Relation: public.fb_custom_scan_target
-         Flashback Full Output Fast Path: false
-         Flashback Output Dispatch: execscan
-         ->  Custom Scan (FbReverseSourceScan)
-               Output: pg_flashback.id, pg_flashback.payload
-               ->  Custom Scan (FbReplayFinalScan)
-                     Output: pg_flashback.id, pg_flashback.payload
-                     ->  Custom Scan (FbReplayWarmScan)
-                           Output: pg_flashback.id, pg_flashback.payload
-                           ->  Custom Scan (FbReplayDiscoverScan)
-                                 Output: pg_flashback.id, pg_flashback.payload
-                                 ->  Custom Scan (FbWalIndexScan)
-                                       Output: pg_flashback.id, pg_flashback.payload
-(19 rows)
+(7 rows)
 
 CREATE TABLE fb_custom_scan_probe (
 	result_count bigint NOT NULL,
@@ -156,4 +144,3 @@ FROM fb_custom_scan_probe;
 -------------------------
  t
 (1 row)
-

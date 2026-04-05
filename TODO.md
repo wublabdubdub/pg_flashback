@@ -86,21 +86,79 @@
 - [x] 登记 `pg_flashback_summary_progress` 的 WAL 连续性观测缺口：
   - 清理部分较老归档后，query-side 已会因中间 segment 缺口报 `WAL not complete`
   - 当前 progress 视图仍只统计 summary 文件缺口，未把真实 WAL 缺口折算进 `missing_segments` / `first_gap_*`
+- [x] 修复 `summary service` 未随源 WAL 删除而清理失活 summary 索引的问题
+  - 已完成：
+    - `summary service` cleanup 现会按当前可见 WAL 源集合探活
+    - 超出 recent protect 窗口后，失活 segment 对应的 summary 文件会自动删除
+    - cleanup 只接受严格匹配 `summary-<hash>.meta` 的正式文件名，不再误删构建中的 `.tmp.*`
+  - 已验证：
+    - `fb_summary_service` 回归新增“删除 WAL 后删除对应 summary 文件”断言并通过
 
 ## 当前待办
+- [ ] 将 summary payload locator 从“查询时现拼现排”升级成“build/cache 期稳定 slice”
+  - [ ] 为 payload locator 新增一份架构决策文档，明确 stable slice / query cache / segment 去重契约
+  - [ ] 更新 `STATUS.md` / `docs/architecture/overview.md` / spec / plan 到当前口径
+  - [ ] 先补最小 RED，锁住新的 payload locator 调试观测：
+    - [ ] `summary_payload_locator_segments_read`
+    - [ ] `summary_payload_locator_public_builds`
+  - [ ] 在 summary build 阶段按 relation 对 payload locators 做排序与去重
+  - [ ] 在 query cache 阶段缓存 relation-scoped public locator slice，禁止每次 lookup 重新 `qsort`
+  - [ ] 在 payload locator plan 阶段按 segment 去重，避免碎片 `payload_base_windows` 重复驱动 lookup
+  - [ ] 用 live case 复核：
+    - [ ] `scenario_oa_50t_50000r.documents @ '2026-04-04 23:40:13'`
+          不再卡在 `3/9` 的 payload locator 规划
+
+- [ ] 继续压 `documents @ '2026-04-04 23:40:13'` 的 payload materialize / spool 体积
+  - [x] 已确认 locator 规划热点已移除，当前 `3/9` 新主耗时不再是 `pg_qsort`
+  - [ ] 先补最小 RED，锁住 `apply_image=false` 的 block image 不再进入 record spool
+  - [ ] 让 payload capture 对“不可应用 image”只保留 replay 必需元数据，不再写入 `BLCKSZ` image
+  - [ ] 复跑回归与 live case，观察：
+    - [ ] `3/9 payload` 显著低于当前约 `178s`
+    - [ ] preflight `estimated working set` 显著低于当前约 `8.45GB`
+
+- [x] 将 summary 推进到 payload locator-first，而不是只停留在 relation spans
+  - [x] 保持“一段 WAL 一个 summary sidecar”模型不变
+  - [x] 新增 relation-scoped payload locator section
+  - [x] 查询期 payload 优先按 locator 精确读取 record
+  - [x] locator 缺失 / recent tail 未覆盖时继续安全回退现有 window 路径
+  - [x] 为 locator section 控制 build 成本与文件体积
+  - [x] 如必要，引入轻量压缩 / delta 编码而不改变 summary 模型
+  - [x] 为 `fb_recordref_debug()` 增加 summary payload locator counters
+  - [x] 用 `approval_comments @ '2026-04-04 23:40:13'` 复核 `3/9 payload`
+        不再成为主瓶颈
+
+- [x] 将 `open_source/pg_flashback` 全部 Markdown 改为统一中英双语文档
+  - [x] 所有 Markdown 顶部增加 `中文` / `English` 跳转按钮
+  - [x] README 改写为当前开源版本实际可用的用户手册
+  - [x] `docs/README.md` / `tests/README.md` 与架构文档统一模板
 - [ ] 建立 `PG14-18` 发布前功能/性能阻断 gate
   - [x] 新增 `tests/release_gate/` 独立目录与统一入口脚本
-  - [ ] 固化空实例清理与 `alldb` 重建流程
-  - [ ] 对接 `/root/alldbsimulator`，构造 `50 x 100MB` 表
-  - [ ] 固化 `1h` DML 压测流程与随机 seed 记录
-  - [ ] 固定目标表扩容到 `5GB`
-  - [ ] 固化五个随机时间点 truth snapshot 采集
-  - [ ] 覆盖随机闪回、单独 `insert/update/delete`、`10000` 行批量 `insert/update/delete`、混合 DML、`COPY TO`、`CTAS`
-  - [ ] 固化标准化 CSV 导出、`row_count/hash/diff` 正确性判定
-  - [ ] 新增 `PG14-18` golden baseline 文件结构
-  - [ ] 实现“相对比例 + 绝对增量”双阈值性能阻断
-  - [ ] 生成独立 Markdown 报告
-  - [ ] 固化 `/walstorage/{14,15,16,17,18}waldata` 测试前后清理
+  - [x] 固化空实例清理与 `alldb` 重建流程
+  - [x] 对接 `/root/alldbsimulator`，构造 `50 x 100MB` 表
+  - [x] 固化 `1h` DML 压测流程与随机 seed 记录
+  - [x] 固定目标表扩容到 `5GB`
+  - [x] 固化五个随机时间点 truth snapshot 采集
+  - [x] 覆盖随机闪回、单独 `insert/update/delete`、`10000` 行批量 `insert/update/delete`、混合 DML、`COPY TO`、`CTAS`
+  - [x] 固化标准化 CSV 导出、`row_count/hash/diff` 正确性判定
+  - [x] 新增 `PG14-18` golden baseline 文件结构
+  - [x] 实现“相对比例 + 绝对增量”双阈值性能阻断
+  - [x] 生成独立 Markdown 报告
+  - [x] 固化 `/walstorage/{14,15,16,17,18}waldata` 测试前后清理
+  - [x] 为总入口补齐阶段控制：
+    - [x] `--list-stages`
+    - [x] `--from <stage>`
+    - [x] `--to <stage>`
+    - [x] `--only <stage>`
+    - [x] 阶段名改成用户可直接理解的动作语义
+  - [x] 将 release gate README 改写为完整操作手册
+    - [x] 说明每个阶段的作用、输入产物、输出产物
+    - [x] 明确 `1h` DML 压测真实执行规则
+    - [x] 记录默认总限速已调整为 `2000 ops/s`
+  - [x] 按最新发布口径收敛编排与运维细节
+    - [x] 将 `grow_target_table` 前移到 `1h` DML 压测之前
+    - [x] 明确扩容阶段不采随机 truth snapshot
+    - [x] release gate 统一日志输出补齐时间戳
+    - [x] 修复从中间阶段启动时 `cleanup` 误删已有 WAL
 - [ ] `full-output pg_flashback(...)` 快路径加速
   - [ ] 保持用户 SQL 形态继续是：
     - `SELECT * FROM pg_flashback(...)`
@@ -120,6 +178,15 @@
     - 普通查询
     - `CTAS`
     - `COPY (query) TO`
+
+- [x] 为纯 `count(*) FROM pg_flashback(...)` 增加聚合下推快路径
+  - [x] planner `UPPERREL_GROUP_AGG` 识别纯 `count(*)` 并改走 `FbCountAggScan`
+  - [x] `FbCountAggScan` 固定走 `FB_WAL_BUILD_COUNT_ONLY`
+  - [x] count-only 不再捕获 payload spool / reverse ops / apply
+  - [x] metadata 阶段按 xid 累加主表 `insert/delete/update` 计数，`xact-status` 后直接汇总
+  - [x] live case 复核：
+    - [x] `scenario_oa_50t_50000r.documents @ '2026-04-04 23:40:13'`
+          `3/9` 累计约 `19.6s`，达到 `< 20s`
 
 - [ ] 破坏性删除 `pg_flashback_to(regclass, text)`
   - [ ] 从公开安装面移除
@@ -216,6 +283,29 @@
       不再报 `missing FPI for block 9990`
     - 默认 `1GB` 下当前返回真实 `memory_limit` 报错
     - `memory_limit = '3GB'` 下返回 `count = 98896`
+- [x] 建立仓库内开源镜像目录与白名单同步机制
+  - 已固定 `open_source/pg_flashback/` 为长期维护的开源镜像目录
+  - 已固定根仓库继续保留内部研发资料
+  - 已新增：
+    - `open_source/README.md`
+    - `open_source/manifest.txt`
+    - `scripts/sync_open_source.sh`
+  - 已明确开源镜像首版排除：
+    - `STATUS.md` / `TODO.md` / `PROJECT.md`
+    - `docs/reports/` / `docs/superpowers/`
+    - `tests/deep/` / `tests/release_gate/`
+    - 日志、构建产物、性能采样和其他临时输出
+
+- [ ] 每次对外同步 GitHub 前执行并复核开源镜像刷新
+  - 统一执行 `bash scripts/sync_open_source.sh`
+  - 复核 `open_source/pg_flashback/` 中未混入内部资料或构建产物
+- [x] 将 `open_source/` 排除出当前仓库 Git 跟踪
+  - 根仓库 `.gitignore` 已加入 `open_source/`
+  - 开源镜像目录继续作为本地导出目录按需重建
+- [x] 固定“开源项目”术语指向 `open_source/`
+  - 已在 `AGENTS.md` 登记：
+    - “开源项目” 默认指 `open_source/` 目录中的内容
+    - “开源版本” / “GitHub 版本” 也按同一口径理解
 
 ### Runtime 安全清理
 
@@ -406,6 +496,34 @@
       - [ ] 为 reader-reuse 补稳定回归：
         - 当前 synthetic sparse fixture 还不能稳定命中 `payload_scan_mode=sparse`
         - 本轮先保留 `payload_sparse_reader_resets/reuses` 已进入 debug 输出的回归
+    - [ ] 继续压 `xact-status` 的 summary 成本：
+      - [x] 先去掉 query 期对每个命中 segment 的 xid outcome 整段复制
+        - 当前改成复用 query-local summary cache 内的 public slice
+        - live case 上 `xact-status` 已从约 `19s` 档位压到约 `16-17s`
+      - [ ] 若继续往下压，需要新的 per-segment xid presence/index
+        - 当前仅靠 relation-scoped touched xid 或事务语义剪枝都不安全
+        - 已验证“按 before-target/aborted xid 直接裁 payload”会破坏 replay 正确性，不能走这条捷径
+      - [x] 修复碎 summary-span 场景下的 payload scan-mode 误判：
+        - 当前 live 现场：
+          - `scenario_oa_50t_50000r.approval_comments @ '2026-04-04 23:40:13'`
+          - `summary_span_windows=38666`
+          - `payload_sparse_count=32184`
+          - `payload_windowed_count=383`
+          - 但 query-side 仍选 `payload_scan_mode=sparse`
+        - 当前 root cause：
+          - summary spans 已齐，不是 fallback 全扫
+          - 真正问题是 scan-mode heuristic 没有识别“windowed 已足够收敛、sparse 只会放大同 slice 重复 decode”
+        - 最小 RED：
+          - 补稳定回归，锁住碎 summary-span synthetic case 选择 `windowed`
+          - 同时锁住相关 debug 输出仍保留 `payload_windows/payload_scan_mode`
+        - 修复目标：
+          - 不改 replay 语义
+          - 不重新扩大 payload 覆盖面
+          - 仅避免这类 case 误选 `sparse`
+        - 已完成：
+          - query-side heuristic 已接入 `payload_covered_segments`
+          - 新增回归 `fb_payload_scan_mode`
+          - live spot-check 已确认该现场切回 `payload_scan_mode=windowed`
       - [x] `fb_recordref_debug()` 增加 `anchor_redo`
       - [ ] 将 `fb_recordref_block_debug()` 收口成正式调试出口或等价观测，而不是仅手工 `CREATE FUNCTION`
     - [ ] 用 `scenario_oa_12t_50000r.documents @ '2026-04-01 01:40:13'` 持续复测，直到 `3/9` 不再是主要慢点

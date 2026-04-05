@@ -6,20 +6,65 @@ COMMON_SH="$REPO_ROOT/tests/release_gate/bin/common.sh"
 RUN_SH="$REPO_ROOT/tests/release_gate/bin/run_release_gate.sh"
 PREPARE_SH="$REPO_ROOT/tests/release_gate/bin/prepare_empty_instance.sh"
 SIM_SH="$REPO_ROOT/tests/release_gate/bin/start_alldbsim.sh"
+LOAD_SH="$REPO_ROOT/tests/release_gate/bin/load_alldb_seed.sh"
+PRESSURE_SH="$REPO_ROOT/tests/release_gate/bin/run_alldb_dml_pressure.sh"
+GROW_SH="$REPO_ROOT/tests/release_gate/bin/grow_flashback_target.sh"
+SNAPSHOT_SH="$REPO_ROOT/tests/release_gate/bin/capture_truth_snapshots.sh"
+MATRIX_SH="$REPO_ROOT/tests/release_gate/bin/run_flashback_matrix.sh"
+EVAL_SH="$REPO_ROOT/tests/release_gate/bin/evaluate_gate.sh"
+REPORT_SH="$REPO_ROOT/tests/release_gate/bin/render_report.sh"
 CONFIG_DIR="$REPO_ROOT/tests/release_gate/config"
 TEMPLATE_DIR="$REPO_ROOT/tests/release_gate/templates"
+GOLDEN_DIR="$REPO_ROOT/tests/release_gate/golden"
+SQL_DIR="$REPO_ROOT/tests/release_gate/sql"
 
 fail() {
 	echo "[release_gate:selftest] $*" >&2
 	exit 1
 }
 
+assert_file_contains() {
+	local file="$1"
+	local pattern="$2"
+
+	if ! grep -Fq "$pattern" "$file"; then
+		fail "expected pattern '$pattern' in $file"
+	fi
+}
+
+assert_file_matches() {
+	local file="$1"
+	local pattern="$2"
+
+	if ! grep -Eq "$pattern" "$file"; then
+		fail "expected regex '$pattern' in $file"
+	fi
+}
+
 [[ -f "$COMMON_SH" ]] || fail "missing common helper: $COMMON_SH"
 [[ -f "$RUN_SH" ]] || fail "missing runner: $RUN_SH"
 [[ -f "$PREPARE_SH" ]] || fail "missing prepare script: $PREPARE_SH"
 [[ -f "$SIM_SH" ]] || fail "missing simulator wrapper: $SIM_SH"
+[[ -f "$LOAD_SH" ]] || fail "missing seed loader: $LOAD_SH"
+[[ -f "$PRESSURE_SH" ]] || fail "missing pressure runner: $PRESSURE_SH"
+[[ -f "$GROW_SH" ]] || fail "missing grow-target runner: $GROW_SH"
+[[ -f "$SNAPSHOT_SH" ]] || fail "missing snapshot runner: $SNAPSHOT_SH"
+[[ -f "$MATRIX_SH" ]] || fail "missing flashback matrix runner: $MATRIX_SH"
+[[ -f "$EVAL_SH" ]] || fail "missing gate evaluator: $EVAL_SH"
+[[ -f "$REPORT_SH" ]] || fail "missing report renderer: $REPORT_SH"
+[[ -x "$RUN_SH" ]] || fail "runner is not executable: $RUN_SH"
+[[ -x "$PREPARE_SH" ]] || fail "prepare script is not executable: $PREPARE_SH"
+[[ -x "$SIM_SH" ]] || fail "simulator wrapper is not executable: $SIM_SH"
+[[ -x "$LOAD_SH" ]] || fail "seed loader is not executable: $LOAD_SH"
+[[ -x "$PRESSURE_SH" ]] || fail "pressure runner is not executable: $PRESSURE_SH"
+[[ -x "$GROW_SH" ]] || fail "grow-target runner is not executable: $GROW_SH"
+[[ -x "$SNAPSHOT_SH" ]] || fail "snapshot runner is not executable: $SNAPSHOT_SH"
+[[ -x "$MATRIX_SH" ]] || fail "flashback matrix runner is not executable: $MATRIX_SH"
+[[ -x "$EVAL_SH" ]] || fail "gate evaluator is not executable: $EVAL_SH"
+[[ -x "$REPORT_SH" ]] || fail "report renderer is not executable: $REPORT_SH"
 
-bash -n "$COMMON_SH" "$RUN_SH" "$PREPARE_SH" "$SIM_SH"
+bash -n "$COMMON_SH" "$RUN_SH" "$PREPARE_SH" "$SIM_SH" "$LOAD_SH" "$PRESSURE_SH" "$GROW_SH" \
+	"$SNAPSHOT_SH" "$MATRIX_SH" "$EVAL_SH" "$REPORT_SH"
 
 # shellcheck disable=SC1090
 source "$COMMON_SH"
@@ -30,13 +75,106 @@ for major in 14 15 16 17 18; do
 	[[ "$actual" == "$expected" ]] || fail "archive dir mismatch for PG${major}: $actual"
 done
 
+archive_cmd='cp %p /home/18pg/wal_arch/%f'
+fb_release_gate_archive_command_matches_dir "$archive_cmd" "/walstorage/18waldata" || \
+	fail "symlink-equivalent archive_command should match /walstorage/18waldata"
+
+archive_cmd='cp %p /tmp/not-release-gate/%f'
+if fb_release_gate_archive_command_matches_dir "$archive_cmd" "/walstorage/18waldata"; then
+	fail "wrong archive target should not match /walstorage/18waldata"
+fi
+
 [[ -f "$CONFIG_DIR/release_gate.conf" ]] || fail "missing release_gate.conf"
 [[ -f "$CONFIG_DIR/scenario_matrix.json" ]] || fail "missing scenario_matrix.json"
 [[ -f "$CONFIG_DIR/thresholds.json" ]] || fail "missing thresholds.json"
 [[ -f "$TEMPLATE_DIR/report.md.tpl" ]] || fail "missing report template"
+[[ -f "$SQL_DIR/recreate_alldb.sql" ]] || fail "missing recreate_alldb.sql"
+[[ -f "$SQL_DIR/table_size_summary.sql" ]] || fail "missing table_size_summary.sql"
+[[ -f "$SQL_DIR/export_table_csv.sql" ]] || fail "missing export_table_csv.sql"
+[[ -f "$SQL_DIR/export_flashback_csv.sql" ]] || fail "missing export_flashback_csv.sql"
+[[ -f "$SQL_DIR/create_flashback_ctas.sql" ]] || fail "missing create_flashback_ctas.sql"
+[[ -f "$SQL_DIR/drop_flashback_ctas.sql" ]] || fail "missing drop_flashback_ctas.sql"
 
 jq empty \
 	"$CONFIG_DIR/scenario_matrix.json" \
-	"$CONFIG_DIR/thresholds.json" >/dev/null
+	"$CONFIG_DIR/thresholds.json" \
+	"$GOLDEN_DIR/pg14.json" \
+	"$GOLDEN_DIR/pg15.json" \
+	"$GOLDEN_DIR/pg16.json" \
+	"$GOLDEN_DIR/pg17.json" \
+	"$GOLDEN_DIR/pg18.json" >/dev/null
+
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+
+render_output_dir="$tmp_dir/output"
+mkdir -p "$render_output_dir/json" "$render_output_dir/reports"
+
+cat > "$render_output_dir/json/gate_evaluation.json" <<'EOF'
+{
+  "pg_major": "18",
+  "verdict": "PASS",
+  "golden_file": "/tmp/fake-golden.json",
+  "summary": {
+    "total": 0,
+    "correctness_failures": 0,
+    "performance_failures": 0
+  },
+  "results": []
+}
+EOF
+
+cat > "$render_output_dir/json/environment.json" <<'EOF'
+{
+  "archive_dir": "/walstorage/18waldata",
+  "archive_mode": "on",
+  "archive_command": "cp %p /walstorage/18waldata/%f"
+}
+EOF
+
+list_log="$tmp_dir/list_stages.log"
+FB_RELEASE_GATE_OUTPUT_DIR="$render_output_dir" \
+FB_RELEASE_GATE_PSQL="/bin/true" \
+bash "$RUN_SH" --list-stages >"$list_log" 2>&1 || fail "--list-stages should succeed"
+assert_file_contains "$list_log" "prepare_instance"
+assert_file_contains "$list_log" "render_gate_report"
+grow_line="$(grep -n '^grow_target_table' "$list_log" | cut -d: -f1)"
+pressure_line="$(grep -n '^start_dml_pressure' "$list_log" | cut -d: -f1)"
+[[ -n "$grow_line" && -n "$pressure_line" ]] || fail "missing grow_target_table/start_dml_pressure in stage list"
+(( grow_line < pressure_line )) || fail "grow_target_table should appear before start_dml_pressure"
+
+only_log="$tmp_dir/only_render.log"
+FB_RELEASE_GATE_OUTPUT_DIR="$render_output_dir" \
+FB_RELEASE_GATE_PSQL="/bin/true" \
+bash "$RUN_SH" --only render_gate_report >"$only_log" 2>&1 || fail "--only render_gate_report should succeed"
+[[ -f "$render_output_dir/reports/release_gate_report.md" ]] || fail "missing rendered report for --only render_gate_report"
+assert_file_contains "$only_log" "render_gate_report"
+assert_file_matches "$only_log" '^\[release_gate\]\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}( [+-][0-9]{4})?\]'
+
+from_to_log="$tmp_dir/from_to_render.log"
+rm -f "$render_output_dir/reports/release_gate_report.md"
+FB_RELEASE_GATE_OUTPUT_DIR="$render_output_dir" \
+FB_RELEASE_GATE_PSQL="/bin/true" \
+bash "$RUN_SH" --from render_gate_report --to render_gate_report >"$from_to_log" 2>&1 || fail "--from/--to render_gate_report should succeed"
+[[ -f "$render_output_dir/reports/release_gate_report.md" ]] || fail "missing rendered report for --from/--to render_gate_report"
+assert_file_contains "$from_to_log" "render_gate_report"
+
+fake_bin_dir="$tmp_dir/fakebin"
+fake_archive_root="$tmp_dir/walstorage"
+fake_archive_dir="$fake_archive_root/18waldata"
+mkdir -p "$fake_bin_dir" "$fake_archive_dir"
+cat > "$fake_bin_dir/psql" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 180000
+EOF
+chmod +x "$fake_bin_dir/psql"
+touch "$fake_archive_dir/keep.seg"
+
+mid_stage_log="$tmp_dir/mid_stage_render.log"
+FB_RELEASE_GATE_OUTPUT_DIR="$render_output_dir" \
+FB_RELEASE_GATE_ARCHIVE_ROOT="$fake_archive_root" \
+FB_RELEASE_GATE_PSQL="$fake_bin_dir/psql" \
+bash "$RUN_SH" --only render_gate_report >"$mid_stage_log" 2>&1 || fail "mid-stage render_gate_report should succeed"
+[[ -f "$fake_archive_dir/keep.seg" ]] || fail "mid-stage run should not delete existing archive files"
 
 echo "[release_gate:selftest] PASS"

@@ -49,6 +49,18 @@ Custom Scan (FbApplyScan)
           -> Custom Scan (FbWalIndexScan)
 ```
 
+对纯 `count(*) FROM pg_flashback(...)`，planner 还会额外在
+`UPPERREL_GROUP_AGG` 下推成单节点：
+
+```text
+Custom Scan (FbCountAggScan)
+  -> COUNT_ONLY wal index build
+  -> current row count baseline
+  -> direct bigint result
+```
+
+这条路径不再走 PostgreSQL 默认 `Aggregate -> FbApplyScan`，也不再发射整批历史行给上层聚合器。
+
 如果要再补一句当前大窗口实现特点，就是：
 
 ```text
@@ -162,10 +174,19 @@ Custom Scan (FbApplyScan)
 - 定义 segment 通用 summary / segment index 文件格式
 - 在 `meta/summary` 中读写 summary
 - 提供 locator / relid bloom probe
-- 提供 relation spans / xid outcomes / relation-scoped touched xids / 紧凑 unsafe facts 的读取接口
-- 正在扩展为提供 relation-scoped block anchor facts：
-  - 每段内按 relation / block 记录可用 `FPI/INIT_PAGE` 锚点
-  - 先服务 `replay discover/warm` 的 missing-block anchor 解析
+- 提供 relation spans / xid outcomes / relation-scoped touched xids /
+  紧凑 unsafe facts / block anchors / payload locators 的读取接口
+- 当前 summary v8 已额外提供：
+  - relation-scoped block anchors：
+    - 每段内按 relation / block 记录可用 `FPI/INIT_PAGE` 锚点
+    - 服务 `replay discover/warm` 的 missing-block anchor 解析
+  - relation-scoped payload locators：
+    - 每段内按 relation 记录 payload 需要 decode 的精确 record start LSN
+    - 服务 query-side payload locator-first 物化，减少 span 内无关 WAL decode
+- 当前正在把 payload locator 进一步收敛为：
+  - summary build 期写成 relation-scoped stable locator slice
+  - query cache 期直接复用 public locator slice
+  - payload plan 期按 segment 去重，不再由碎片 span/base windows 重复驱动同一 segment lookup
 - 提供查询期 backend-local summary section cache，避免同一查询重复读取相同 summary 文件
 - 供 query prefilter 和后台预建服务共用
 
@@ -188,6 +209,9 @@ Custom Scan (FbApplyScan)
 - 周期扫描 archive / `pg_wal` / `recovered_wal`
 - 让 worker 读取 WAL segment 并预建 summary
 - 对 `meta/summary` 执行 summary 专属自动清理
+  - 包括按源 WAL 探活删除失活 summary 文件：
+    - 若对应 segment 已不在 archive / `pg_wal` / `recovered_wal` 的当前可见集合中
+    - 则清理对应 `meta/summary` 文件，不保留僵尸索引
 - 提供 summary 预建进度的 SQL 可观测面：
   - 用户主视图为 `pg_flashback_summary_progress`
     - 当前同时暴露 backlog 的 best-effort `estimated_completion_at`
@@ -241,10 +265,40 @@ Custom Scan (FbApplyScan)
   - `/walstorage/17waldata`
   - `/walstorage/18waldata`
 - 驱动 `/root/alldbsimulator` 进行建数、DML 压测与大表扩容
+- 通过总入口脚本提供阶段级编排与续跑控制：
+  - `--list-stages`
+  - `--from <stage>`
+  - `--to <stage>`
+  - `--only <stage>`
+- `1h` DML 压测当前固定为 schema 级 `insert/update/delete` 等权重混合；
+  `bulk 10k` / `mixed dml` 由后续定向快照阶段单独构造
 - 捕获 truth snapshot，并统一导出标准化 CSV
 - 执行 `pg_flashback(...)`、`COPY TO`、`CTAS` 发布前场景
 - 读取 `PG14-18` golden baseline，并按双阈值给出性能阻断结论
 - 生成单独 Markdown 报告
+
+### `open_source` mirror
+
+文件：
+
+- `open_source/README.md`
+- `open_source/manifest.txt`
+- `scripts/sync_open_source.sh`
+- `open_source/pg_flashback/`
+
+职责：
+
+- 保留仓库内的长期维护开源镜像目录
+- 明确根仓库与公开镜像之间的边界：
+  - 根仓库是研发权威源
+  - `open_source/pg_flashback/` 是对白名单执行同步后的公开镜像
+- 通过白名单刷新公开目录，只保留：
+  - 插件源码
+  - 安装 SQL
+  - PGXS 基础回归资产
+  - 精简公开文档
+- 明确排除内部研发状态文档、实验报告、deep/release-gate 资产、日志与构建产物
+- 为后续同步 GitHub 提供固定入口，不依赖手工挑文件
 
 ### `fb_memory`
 

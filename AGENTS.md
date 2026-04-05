@@ -24,6 +24,9 @@ psql postgres
 
 ## 项目已拍板约束
 
+- 当前项目内术语约定补充：
+  - 若用户提到“开源项目”，默认就是指 `open_source/` 目录中的内容
+  - 若用户提到“开源版本”或“GitHub 版本”，也按同一口径理解
 - 路线固定为 `reverse op stream`，不走物理页回放主路径。
 - 当前已修正为：
   - `reverse op stream` 仍然是最终查询/导出的逻辑层
@@ -83,6 +86,14 @@ psql postgres
   - `STATUS.md`
   - `TODO.md`
   - 必要时同步 `PROJECT.md` / 架构文档
+- 任何对源码和 SQL 回归资产的修改，都要同步到开源项目：
+  - 适用范围至少包括：
+    - `src/`
+    - `include/`
+    - `sql/`
+    - `expected/`
+  - 若这些目录中的文件发生变更，结束当前工作前必须同步刷新 `open_source/pg_flashback/` 中对应内容
+  - 不允许根仓库已改而开源镜像未同步
 - 任何架构变更，先更新：
   - `STATUS.md`
   - `TODO.md`

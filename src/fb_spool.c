@@ -20,6 +20,7 @@
 #include "fb_spool.h"
 
 #define FB_SPOOL_ANCHOR_STRIDE 1024
+#define FB_SPOOL_WRITE_BUFFER_SIZE (1 << 20)
 
 typedef struct FbSpoolAnchor
 {
@@ -32,10 +33,14 @@ struct FbSpoolLog
 	char *path;
 	File file;
 	off_t size;
+	off_t flushed_size;
 	uint32 item_count;
 	FbSpoolAnchor *anchors;
 	uint32 anchor_count;
 	uint32 anchor_capacity;
+	char *write_buffer;
+	Size write_buffer_len;
+	Size write_buffer_capacity;
 	struct FbSpoolLog *next;
 };
 
@@ -145,6 +150,47 @@ fb_spool_write_exact(FbSpoolLog *log, const void *data, size_t len, off_t offset
 }
 
 static void
+fb_spool_writev_exact(FbSpoolLog *log,
+					  const struct iovec *iov,
+					  int iovcnt,
+					  size_t total_len,
+					  off_t offset)
+{
+	if (log == NULL || iov == NULL || iovcnt <= 0 || total_len == 0)
+		return;
+
+	if (FileWriteV(log->file, iov, iovcnt, offset, WAIT_EVENT_BUFFILE_WRITE) !=
+		(int) total_len)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write fb spill file"),
+				 errdetail("path=%s: %m", log->path)));
+}
+
+static void
+fb_spool_init_write_buffer(FbSpoolLog *log)
+{
+	if (log == NULL || log->write_buffer != NULL)
+		return;
+
+	log->write_buffer_capacity = FB_SPOOL_WRITE_BUFFER_SIZE;
+	log->write_buffer = palloc(log->write_buffer_capacity);
+	log->write_buffer_len = 0;
+}
+
+static void
+fb_spool_flush_write_buffer(FbSpoolLog *log)
+{
+	if (log == NULL || log->write_buffer == NULL || log->write_buffer_len == 0)
+		return;
+
+	fb_spool_write_exact(log, log->write_buffer, log->write_buffer_len,
+						 log->flushed_size);
+	log->flushed_size += (off_t) log->write_buffer_len;
+	log->write_buffer_len = 0;
+}
+
+static void
 fb_spool_read_exact(FbSpoolLog *log, void *data, size_t len, off_t offset)
 {
 	if (log == NULL || len == 0)
@@ -163,7 +209,9 @@ fb_spool_append_raw_bytes(FbSpoolLog *log, const void *data, size_t len)
 	if (log == NULL || data == NULL || len == 0)
 		return;
 
-	fb_spool_write_exact(log, data, len, log->size);
+	fb_spool_flush_write_buffer(log);
+	fb_spool_write_exact(log, data, len, log->flushed_size);
+	log->flushed_size += (off_t) len;
 	log->size += (off_t) len;
 }
 
@@ -200,15 +248,6 @@ fb_spool_session_destroy(FbSpoolSession *session)
 
 	if (session == NULL)
 		return;
-
-	for (log = session->logs; log != NULL; log = log->next)
-	{
-		if (log->file >= 0)
-		{
-			FileClose(log->file);
-			log->file = -1;
-		}
-	}
 
 	for (log = session->logs; log != NULL; log = next)
 	{
@@ -252,6 +291,7 @@ fb_spool_log_create(FbSpoolSession *session, const char *label)
 				(errcode_for_file_access(),
 				 errmsg("could not create fb spill file"),
 				 errdetail("path=%s: %m", log->path)));
+	fb_spool_init_write_buffer(log);
 
 	log->next = session->logs;
 	session->logs = log;
@@ -276,6 +316,7 @@ fb_spool_log_create_path(const char *path)
 				(errcode_for_file_access(),
 				 errmsg("could not create fb spill file"),
 				 errdetail("path=%s: %m", log->path)));
+	fb_spool_init_write_buffer(log);
 
 	return log;
 }
@@ -317,10 +358,14 @@ fb_spool_log_close(FbSpoolLog *log)
 		return;
 
 	if (log->file >= 0)
+		fb_spool_flush_write_buffer(log);
+	if (log->file >= 0)
 	{
 		FileClose(log->file);
 		log->file = -1;
 	}
+	if (log->write_buffer != NULL)
+		pfree(log->write_buffer);
 	if (log->path != NULL)
 		pfree(log->path);
 	if (log->anchors != NULL)
@@ -338,17 +383,52 @@ void
 fb_spool_log_append(FbSpoolLog *log, const void *data, uint32 len)
 {
 	uint32 trailer = len;
+	size_t total_len = sizeof(len) + sizeof(trailer) + (size_t) len;
+	char *dest;
 
 	if (log == NULL)
 		return;
 
 	fb_spool_append_anchor(log);
-	fb_spool_write_exact(log, &len, sizeof(len), log->size);
+	if (total_len > log->write_buffer_capacity)
+	{
+		struct iovec iov[3];
+		int iovcnt = 0;
+
+		fb_spool_flush_write_buffer(log);
+		iov[iovcnt].iov_base = (void *) &len;
+		iov[iovcnt].iov_len = sizeof(len);
+		iovcnt++;
+		if (len > 0)
+		{
+			iov[iovcnt].iov_base = (void *) data;
+			iov[iovcnt].iov_len = len;
+			iovcnt++;
+		}
+		iov[iovcnt].iov_base = (void *) &trailer;
+		iov[iovcnt].iov_len = sizeof(trailer);
+		iovcnt++;
+		fb_spool_writev_exact(log, iov, iovcnt, total_len, log->flushed_size);
+		log->flushed_size += (off_t) total_len;
+		log->size += (off_t) total_len;
+		log->item_count++;
+		return;
+	}
+
+	if (log->write_buffer_len + total_len > log->write_buffer_capacity)
+		fb_spool_flush_write_buffer(log);
+
+	dest = log->write_buffer + log->write_buffer_len;
+	memcpy(dest, &len, sizeof(len));
+	dest += sizeof(len);
 	if (len > 0)
-		fb_spool_write_exact(log, data, len, log->size + sizeof(len));
-	fb_spool_write_exact(log, &trailer, sizeof(trailer),
-						 log->size + sizeof(len) + len);
-	log->size += (off_t) sizeof(len) + (off_t) len + (off_t) sizeof(trailer);
+	{
+		memcpy(dest, data, len);
+		dest += len;
+	}
+	memcpy(dest, &trailer, sizeof(trailer));
+	log->write_buffer_len += total_len;
+	log->size += (off_t) total_len;
 	log->item_count++;
 }
 
@@ -412,6 +492,8 @@ fb_spool_log_rebuild_anchors(FbSpoolLog *log)
 	if (log == NULL || log->item_count == 0)
 		return;
 
+	fb_spool_flush_write_buffer(log);
+
 	if (log->anchors != NULL)
 	{
 		pfree(log->anchors);
@@ -473,6 +555,8 @@ fb_spool_cursor_open(FbSpoolLog *log, FbSpoolDirection direction)
 
 	if (log == NULL)
 		return NULL;
+
+	fb_spool_flush_write_buffer(log);
 
 	cursor = palloc0(sizeof(*cursor));
 	cursor->log = log;

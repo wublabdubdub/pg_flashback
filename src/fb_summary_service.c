@@ -49,6 +49,7 @@ PG_FUNCTION_INFO_V1(fb_summary_cleanup_plan_debug);
 PG_FUNCTION_INFO_V1(fb_summary_service_plan_debug);
 PG_FUNCTION_INFO_V1(fb_summary_service_schedule_debug);
 PG_FUNCTION_INFO_V1(fb_summary_service_worker_error_isolation_debug);
+PG_FUNCTION_INFO_V1(fb_summary_service_cleanup_debug);
 PG_FUNCTION_INFO_V1(fb_summary_service_memory_reset_debug);
 
 PGDLLEXPORT Datum fb_summary_progress_internal(PG_FUNCTION_ARGS);
@@ -57,6 +58,7 @@ PGDLLEXPORT Datum fb_summary_cleanup_plan_debug(PG_FUNCTION_ARGS);
 PGDLLEXPORT Datum fb_summary_service_plan_debug(PG_FUNCTION_ARGS);
 PGDLLEXPORT Datum fb_summary_service_schedule_debug(PG_FUNCTION_ARGS);
 PGDLLEXPORT Datum fb_summary_service_worker_error_isolation_debug(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum fb_summary_service_cleanup_debug(PG_FUNCTION_ARGS);
 PGDLLEXPORT Datum fb_summary_service_memory_reset_debug(PG_FUNCTION_ARGS);
 
 typedef enum FbSummaryServiceTaskState
@@ -242,9 +244,17 @@ static bool fb_summary_service_candidate_in_snapshot(bool snapshot_valid,
 													 XLogSegNo snapshot_oldest_segno,
 													 XLogSegNo snapshot_newest_segno,
 													 const FbSummaryBuildCandidate *candidate);
+static void fb_summary_service_collect_candidate_hashes(const FbSummaryBuildCandidate *candidates,
+														 int candidate_count,
+														 uint64 **hashes_out,
+														 int *count_out);
 static bool fb_summary_service_hash_in_list(const uint64 *hashes,
 											 int hash_count,
 											 uint64 target_hash);
+static bool fb_summary_service_parse_summary_filename(const char *name,
+													   uint64 *hash_out);
+static void fb_summary_service_prune_missing_pending_tasks_locked(const uint64 *live_hashes,
+																   int live_count);
 static void fb_summary_service_collect_protected_hashes(uint64 **hashes_out,
 														 int *count_out,
 														 bool include_snapshot);
@@ -777,6 +787,8 @@ static void
 fb_summary_service_run_scan(void)
 {
 	FbSummaryBuildCandidate *candidates = NULL;
+	uint64 *live_hashes = NULL;
+	int live_hash_count = 0;
 	int candidate_count;
 	int hot_window;
 	int i;
@@ -785,9 +797,15 @@ fb_summary_service_run_scan(void)
 		return;
 
 	candidate_count = fb_summary_collect_build_candidates(&candidates, false);
+	fb_summary_service_collect_candidate_hashes(candidates,
+												 candidate_count,
+												 &live_hashes,
+												 &live_hash_count);
 	hot_window = fb_summary_service_hot_window();
 	LWLockAcquire(fb_summary_service_lock, LW_EXCLUSIVE);
 	fb_summary_service_recover_stale_tasks_locked();
+	fb_summary_service_prune_missing_pending_tasks_locked(live_hashes,
+														 live_hash_count);
 	fb_summary_service->scan_count++;
 	fb_summary_service->last_scan_at = GetCurrentTimestamp();
 	if (candidate_count > 0)
@@ -833,6 +851,8 @@ fb_summary_service_run_scan(void)
 	}
 
 	fb_summary_free_build_candidates(candidates);
+	if (live_hashes != NULL)
+		pfree(live_hashes);
 }
 
 static bool
@@ -914,7 +934,10 @@ fb_summary_service_run_cleanup(void)
 	char *summary_dir;
 	DIR *dir;
 	struct dirent *de;
+	FbSummaryBuildCandidate *candidates = NULL;
 	FbSummaryCleanupEntry *entries = NULL;
+	uint64 *live_hashes = NULL;
+	int live_hash_count = 0;
 	int entry_count = 0;
 	int entry_capacity = 0;
 	uint64 total_bytes;
@@ -923,10 +946,14 @@ fb_summary_service_run_cleanup(void)
 	int i;
 	uint64 *protected_hashes = NULL;
 	int protected_count = 0;
+	int candidate_count;
 
 	total_bytes = fb_summary_meta_summary_size_bytes(NULL);
-	if (total_bytes <= fb_summary_service_meta_limit_bytes())
-		return;
+	candidate_count = fb_summary_collect_build_candidates(&candidates, false);
+	fb_summary_service_collect_candidate_hashes(candidates,
+												 candidate_count,
+												 &live_hashes,
+												 &live_hash_count);
 
 	low_bytes = (fb_summary_service_meta_limit_bytes() *
 				 (uint64) fb_summary_service_meta_low_watermark_percent()) / 100;
@@ -936,6 +963,9 @@ fb_summary_service_run_cleanup(void)
 	dir = AllocateDir(summary_dir);
 	if (dir == NULL)
 	{
+		fb_summary_free_build_candidates(candidates);
+		if (live_hashes != NULL)
+			pfree(live_hashes);
 		if (protected_hashes != NULL)
 			pfree(protected_hashes);
 		pfree(summary_dir);
@@ -946,19 +976,32 @@ fb_summary_service_run_cleanup(void)
 	{
 		char path[MAXPGPATH];
 		struct stat st;
-		unsigned long long parsed_hash = 0;
+		uint64 parsed_hash = 0;
 		bool protected = false;
 
-		if (sscanf(de->d_name, "summary-%llx.meta", &parsed_hash) != 1)
+		if (!fb_summary_service_parse_summary_filename(de->d_name, &parsed_hash))
 			continue;
 		snprintf(path, sizeof(path), "%s/%s", summary_dir, de->d_name);
 		if (stat(path, &st) != 0)
 			continue;
 		if ((now_sec - st.st_mtime) < FB_SUMMARY_SERVICE_RECENT_PROTECT_SECS)
 			continue;
+		if (!fb_summary_service_hash_in_list(live_hashes,
+											 live_hash_count,
+											 (uint64) parsed_hash))
+		{
+			if (unlink(path) == 0)
+			{
+				total_bytes -= Min(total_bytes, (uint64) st.st_size);
+				LWLockAcquire(fb_summary_service_lock, LW_EXCLUSIVE);
+				fb_summary_service->cleanup_count++;
+				LWLockRelease(fb_summary_service_lock);
+			}
+			continue;
+		}
 		protected = fb_summary_service_hash_in_list(protected_hashes,
 													 protected_count,
-													 (uint64) parsed_hash);
+													 parsed_hash);
 		if (protected)
 			continue;
 
@@ -972,7 +1015,7 @@ fb_summary_service_run_cleanup(void)
 		}
 
 		strlcpy(entries[entry_count].path, path, sizeof(entries[entry_count].path));
-		entries[entry_count].file_identity_hash = (uint64) parsed_hash;
+		entries[entry_count].file_identity_hash = parsed_hash;
 		entries[entry_count].size_bytes = (uint64) st.st_size;
 		entries[entry_count].mtime_sec = st.st_mtime;
 #if defined(__APPLE__)
@@ -984,6 +1027,18 @@ fb_summary_service_run_cleanup(void)
 	}
 	FreeDir(dir);
 	pfree(summary_dir);
+	fb_summary_free_build_candidates(candidates);
+	if (live_hashes != NULL)
+		pfree(live_hashes);
+
+	if (total_bytes <= fb_summary_service_meta_limit_bytes())
+	{
+		if (entries != NULL)
+			pfree(entries);
+		if (protected_hashes != NULL)
+			pfree(protected_hashes);
+		return;
+	}
 
 	if (entry_count == 0)
 	{
@@ -1335,6 +1390,91 @@ fb_summary_service_hash_in_list(const uint64 *hashes, int hash_count, uint64 tar
 			return true;
 	}
 	return false;
+}
+
+static bool
+fb_summary_service_parse_summary_filename(const char *name, uint64 *hash_out)
+{
+	unsigned long long parsed_hash = 0;
+	int consumed = 0;
+
+	if (hash_out != NULL)
+		*hash_out = 0;
+	if (name == NULL)
+		return false;
+	if (sscanf(name, "summary-%16llx.meta%n", &parsed_hash, &consumed) != 1)
+		return false;
+	if (consumed <= 0 || name[consumed] != '\0')
+		return false;
+	if (hash_out != NULL)
+		*hash_out = (uint64) parsed_hash;
+	return true;
+}
+
+static void
+fb_summary_service_collect_candidate_hashes(const FbSummaryBuildCandidate *candidates,
+											 int candidate_count,
+											 uint64 **hashes_out,
+											 int *count_out)
+{
+	uint64 *hashes = NULL;
+	int hash_count = 0;
+	int hash_capacity = 0;
+	int i;
+
+	if (hashes_out != NULL)
+		*hashes_out = NULL;
+	if (count_out != NULL)
+		*count_out = 0;
+
+	for (i = 0; i < candidate_count; i++)
+	{
+		uint64 hash = fb_summary_candidate_identity_hash(&candidates[i]);
+
+		if (hash == 0)
+			continue;
+		if (fb_summary_service_hash_in_list(hashes, hash_count, hash))
+			continue;
+		if (hash_count >= hash_capacity)
+		{
+			hash_capacity = (hash_capacity == 0) ? 128 : (hash_capacity * 2);
+			hashes = (hashes == NULL) ?
+				palloc(sizeof(uint64) * hash_capacity) :
+				repalloc(hashes, sizeof(uint64) * hash_capacity);
+		}
+		hashes[hash_count++] = hash;
+	}
+
+	if (hashes_out != NULL)
+		*hashes_out = hashes;
+	else if (hashes != NULL)
+		pfree(hashes);
+	if (count_out != NULL)
+		*count_out = hash_count;
+}
+
+static void
+fb_summary_service_prune_missing_pending_tasks_locked(const uint64 *live_hashes,
+														 int live_count)
+{
+	int i;
+
+	if (fb_summary_service == NULL)
+		return;
+
+	for (i = 0; i < fb_summary_service->queue_capacity; i++)
+	{
+		FbSummaryServiceTask *task = &fb_summary_service->tasks[i];
+
+		if (task->state != FB_SUMMARY_SERVICE_TASK_PENDING ||
+			task->file_identity_hash == 0)
+			continue;
+		if (fb_summary_service_hash_in_list(live_hashes,
+											 live_count,
+											 task->file_identity_hash))
+			continue;
+		MemSet(task, 0, sizeof(*task));
+	}
 }
 
 static void
@@ -1866,6 +2006,14 @@ fb_summary_service_memory_reset_debug(PG_FUNCTION_ARGS)
 											  reset_ok ? "true" : "false",
 											  before_bytes,
 											  after_bytes)));
+}
+
+Datum
+fb_summary_service_cleanup_debug(PG_FUNCTION_ARGS)
+{
+	fb_runtime_ensure_initialized();
+	fb_summary_service_run_cleanup();
+	PG_RETURN_TEXT_P(cstring_to_text("summary_cleanup_ran=true"));
 }
 
 Datum

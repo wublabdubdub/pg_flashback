@@ -10,6 +10,7 @@
 #include "access/stratnum.h"
 #include "access/tableam.h"
 #include "access/tupdesc.h"
+#include "catalog/pg_aggregate.h"
 #include "catalog/pg_am_d.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
@@ -24,6 +25,7 @@
 #include "nodes/parsenodes.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/planner.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
@@ -55,7 +57,8 @@ typedef enum FbCustomNodeKind
 	FB_CUSTOM_NODE_REPLAY_WARM,
 	FB_CUSTOM_NODE_REPLAY_FINAL,
 	FB_CUSTOM_NODE_REVERSE_SOURCE,
-	FB_CUSTOM_NODE_APPLY
+	FB_CUSTOM_NODE_APPLY,
+	FB_CUSTOM_NODE_COUNT_AGG
 } FbCustomNodeKind;
 
 typedef struct FbFlashbackCustomScanState
@@ -82,6 +85,7 @@ typedef struct FbFlashbackCustomScanState
 	FbReverseOpSource *reverse;
 	FbApplyContext *apply;
 	bool		full_output_fast_path;
+	bool		count_only_fast_path;
 } FbFlashbackCustomScanState;
 
 typedef struct FbPlannerFastPathSpec
@@ -103,6 +107,7 @@ typedef struct FbPlannerFastPathSpec
 } FbPlannerFastPathSpec;
 
 static set_rel_pathlist_hook_type fb_prev_set_rel_pathlist_hook = NULL;
+static create_upper_paths_hook_type fb_prev_create_upper_paths_hook = NULL;
 
 static const CustomExecMethods *fb_custom_exec_methods(FbCustomNodeKind kind);
 static const CustomScanMethods *fb_custom_scan_methods(FbCustomNodeKind kind);
@@ -127,6 +132,11 @@ static void fb_flashback_set_rel_pathlist(PlannerInfo *root,
 										  RelOptInfo *rel,
 										  Index rti,
 										  RangeTblEntry *rte);
+static void fb_flashback_create_upper_paths(PlannerInfo *root,
+											UpperRelationKind stage,
+											RelOptInfo *input_rel,
+											RelOptInfo *output_rel,
+											void *extra);
 static CustomPath *fb_flashback_make_custom_path(PlannerInfo *root,
 												 RelOptInfo *rel,
 												 Oid source_relid,
@@ -143,10 +153,15 @@ static bool fb_flashback_build_planner_fast_path(PlannerInfo *root,
 												 Oid source_relid,
 												 List *clauses,
 												 FbPlannerFastPathSpec *spec);
+static bool fb_flashback_is_count_star_query(Query *parse);
+static FuncExpr *fb_flashback_find_count_star_function(PlannerInfo *root,
+													   Oid *source_relid_out);
 static List *fb_flashback_serialize_fast_path(const FbPlannerFastPathSpec *spec);
 static void fb_flashback_deserialize_fast_path(List *custom_private,
 											   FbFlashbackCustomScanState *state);
 static bool fb_flashback_private_full_output_fast_path(List *custom_private);
+static bool fb_flashback_private_count_only_fast_path(List *custom_private);
+static uint64 fb_flashback_count_current_rows(Oid relid);
 
 static char *
 fb_flashback_relation_label(Oid relid)
@@ -238,6 +253,15 @@ static const CustomExecMethods fb_apply_exec_methods = {
 	.ExplainCustomScan = fb_flashback_explain_custom_scan,
 };
 
+static const CustomExecMethods fb_count_agg_exec_methods = {
+	.CustomName = "FbCountAggScan",
+	.BeginCustomScan = fb_flashback_begin_custom_scan,
+	.ExecCustomScan = fb_flashback_exec_custom_scan,
+	.EndCustomScan = fb_flashback_end_custom_scan,
+	.ReScanCustomScan = fb_flashback_rescan_custom_scan,
+	.ExplainCustomScan = fb_flashback_explain_custom_scan,
+};
+
 static const CustomScanMethods fb_wal_index_scan_methods = {
 	.CustomName = "FbWalIndexScan",
 	.CreateCustomScanState = fb_flashback_create_custom_scan_state,
@@ -265,6 +289,11 @@ static const CustomScanMethods fb_reverse_source_scan_methods = {
 
 static const CustomScanMethods fb_apply_scan_methods = {
 	.CustomName = "FbApplyScan",
+	.CreateCustomScanState = fb_flashback_create_custom_scan_state,
+};
+
+static const CustomScanMethods fb_count_agg_scan_methods = {
+	.CustomName = "FbCountAggScan",
 	.CreateCustomScanState = fb_flashback_create_custom_scan_state,
 };
 
@@ -298,6 +327,11 @@ static const CustomPathMethods fb_apply_path_methods = {
 	.PlanCustomPath = fb_flashback_plan_custom_path,
 };
 
+static const CustomPathMethods fb_count_agg_path_methods = {
+	.CustomName = "FbCountAggScan",
+	.PlanCustomPath = fb_flashback_plan_custom_path,
+};
+
 static const CustomExecMethods *
 fb_custom_exec_methods(FbCustomNodeKind kind)
 {
@@ -315,6 +349,8 @@ fb_custom_exec_methods(FbCustomNodeKind kind)
 			return &fb_reverse_source_exec_methods;
 		case FB_CUSTOM_NODE_APPLY:
 			return &fb_apply_exec_methods;
+		case FB_CUSTOM_NODE_COUNT_AGG:
+			return &fb_count_agg_exec_methods;
 	}
 
 	elog(ERROR, "invalid fb custom node kind: %d", (int) kind);
@@ -338,6 +374,8 @@ fb_custom_scan_methods(FbCustomNodeKind kind)
 			return &fb_reverse_source_scan_methods;
 		case FB_CUSTOM_NODE_APPLY:
 			return &fb_apply_scan_methods;
+		case FB_CUSTOM_NODE_COUNT_AGG:
+			return &fb_count_agg_scan_methods;
 	}
 
 	elog(ERROR, "invalid fb custom node kind: %d", (int) kind);
@@ -361,6 +399,8 @@ fb_custom_path_methods(FbCustomNodeKind kind)
 			return &fb_reverse_source_path_methods;
 		case FB_CUSTOM_NODE_APPLY:
 			return &fb_apply_path_methods;
+		case FB_CUSTOM_NODE_COUNT_AGG:
+			return &fb_count_agg_path_methods;
 	}
 
 	elog(ERROR, "invalid fb custom node kind: %d", (int) kind);
@@ -1086,6 +1126,91 @@ fb_flashback_build_planner_fast_path(PlannerInfo *root,
 	return spec->mode != FB_FAST_PATH_NONE;
 }
 
+static bool
+fb_flashback_is_count_star_query(Query *parse)
+{
+	ListCell   *lc;
+	TargetEntry *target = NULL;
+	Aggref	   *aggref;
+	char	   *aggname;
+
+	if (parse == NULL ||
+		!parse->hasAggs ||
+		parse->groupClause != NIL ||
+		parse->groupingSets != NIL ||
+		parse->havingQual != NULL ||
+		parse->distinctClause != NIL ||
+		parse->sortClause != NIL ||
+		parse->limitOffset != NULL ||
+		parse->limitCount != NULL ||
+		parse->windowClause != NIL)
+		return false;
+
+	foreach(lc, parse->targetList)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		if (tle->resjunk)
+			continue;
+		if (target != NULL)
+			return false;
+		target = tle;
+	}
+
+	if (target == NULL)
+		return false;
+
+	{
+		Node *expr = strip_implicit_coercions((Node *) target->expr);
+
+		if (expr == NULL || !IsA(expr, Aggref))
+			return false;
+		aggref = castNode(Aggref, expr);
+	}
+	if (aggref == NULL)
+		return false;
+	if (aggref->aggkind != AGGKIND_NORMAL ||
+		aggref->aggfilter != NULL ||
+		aggref->aggdistinct != NIL ||
+		aggref->aggorder != NIL ||
+		aggref->aggdirectargs != NIL ||
+		aggref->args != NIL ||
+		!aggref->aggstar ||
+		aggref->agglevelsup != 0)
+		return false;
+
+	aggname = get_func_name(aggref->aggfnoid);
+	return (aggname != NULL && strcmp(aggname, "count") == 0);
+}
+
+static FuncExpr *
+fb_flashback_find_count_star_function(PlannerInfo *root, Oid *source_relid_out)
+{
+	int rti;
+	RangeTblEntry *rte;
+
+	if (source_relid_out != NULL)
+		*source_relid_out = InvalidOid;
+	if (root == NULL || !fb_flashback_is_count_star_query(root->parse))
+		return NULL;
+
+	for (rti = 1; rti < list_length(root->parse->rtable) + 1; rti++)
+	{
+		FuncExpr *func;
+		Oid source_relid = InvalidOid;
+
+		rte = planner_rt_fetch(rti, root);
+		func = fb_flashback_match_rte_function(rte, &source_relid);
+		if (func == NULL)
+			continue;
+		if (source_relid_out != NULL)
+			*source_relid_out = source_relid;
+		return func;
+	}
+
+	return NULL;
+}
+
 static List *
 fb_flashback_serialize_fast_path(const FbPlannerFastPathSpec *spec)
 {
@@ -1297,7 +1422,8 @@ static List *
 fb_flashback_make_private(FbCustomNodeKind kind,
 						  Oid source_relid,
 						  const FbPlannerFastPathSpec *fast_path,
-						  bool full_output_fast_path)
+						  bool full_output_fast_path,
+						  bool count_only_fast_path)
 {
 	List *private;
 
@@ -1319,6 +1445,10 @@ fb_flashback_make_private(FbCustomNodeKind kind,
 						  makeConst(BOOLOID, -1, InvalidOid, sizeof(bool),
 									BoolGetDatum(full_output_fast_path),
 									false, true));
+		private = lappend(private,
+						  makeConst(BOOLOID, -1, InvalidOid, sizeof(bool),
+									BoolGetDatum(count_only_fast_path),
+									false, true));
 	}
 
 	return private;
@@ -1329,7 +1459,22 @@ fb_flashback_private_full_output_fast_path(List *custom_private)
 {
 	Node	   *node;
 
-	if (custom_private == NIL || list_length(custom_private) < 4)
+	if (custom_private == NIL || list_length(custom_private) < 5)
+		return false;
+
+	node = list_nth(custom_private, list_length(custom_private) - 2);
+	if (node == NULL || !IsA(node, Const) || exprType(node) != BOOLOID)
+		return false;
+
+	return DatumGetBool(castNode(Const, node)->constvalue);
+}
+
+static bool
+fb_flashback_private_count_only_fast_path(List *custom_private)
+{
+	Node	   *node;
+
+	if (custom_private == NIL || list_length(custom_private) < 5)
 		return false;
 
 	node = llast(custom_private);
@@ -1337,6 +1482,32 @@ fb_flashback_private_full_output_fast_path(List *custom_private)
 		return false;
 
 	return DatumGetBool(castNode(Const, node)->constvalue);
+}
+
+static uint64
+fb_flashback_count_current_rows(Oid relid)
+{
+	Relation	rel;
+	Snapshot	snapshot;
+	TableScanDesc scan;
+	TupleTableSlot *slot;
+	uint64		row_count = 0;
+
+	rel = relation_open(relid, AccessShareLock);
+	snapshot = GetActiveSnapshot();
+	if (snapshot == NULL)
+		elog(ERROR, "fb flashback count-only fast path requires an active snapshot");
+	scan = table_beginscan_strat(rel, snapshot, 0, NULL, true, false);
+	slot = table_slot_create(rel, NULL);
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		row_count++;
+		ExecClearTuple(slot);
+	}
+	ExecDropSingleTupleTableSlot(slot);
+	table_endscan(scan);
+	relation_close(rel, AccessShareLock);
+	return row_count;
 }
 
 static FbFlashbackCustomScanState *
@@ -1780,6 +1951,40 @@ fb_flashback_set_rel_pathlist(PlannerInfo *root,
 	fb_flashback_add_custom_path(root, rel, rte);
 }
 
+static void
+fb_flashback_create_upper_paths(PlannerInfo *root,
+								UpperRelationKind stage,
+								RelOptInfo *input_rel,
+								RelOptInfo *output_rel,
+								void *extra)
+{
+	Oid source_relid = InvalidOid;
+	FuncExpr *func;
+	CustomPath *count_path;
+
+	if (fb_prev_create_upper_paths_hook != NULL)
+		fb_prev_create_upper_paths_hook(root, stage, input_rel, output_rel, extra);
+
+	if (stage != UPPERREL_GROUP_AGG || input_rel == NULL || output_rel == NULL)
+		return;
+
+	func = fb_flashback_find_count_star_function(root, &source_relid);
+	if (func == NULL || !OidIsValid(source_relid))
+		return;
+
+	count_path = fb_flashback_make_custom_path(root,
+											   output_rel,
+											   source_relid,
+											   FB_CUSTOM_NODE_COUNT_AGG,
+											   NULL,
+											   false,
+											   NULL);
+	count_path->path.rows = 1;
+	count_path->path.startup_cost = 0;
+	count_path->path.total_cost = 1;
+	add_path(output_rel, &count_path->path);
+}
+
 static CustomPath *
 fb_flashback_make_custom_path(PlannerInfo *root,
 							 RelOptInfo *rel,
@@ -1812,6 +2017,12 @@ fb_flashback_make_custom_path(PlannerInfo *root,
 		if (cpath->path.total_cost >= cpath->path.startup_cost + 1.0)
 			cpath->path.total_cost -= 1.0;
 	}
+	else if (kind == FB_CUSTOM_NODE_COUNT_AGG)
+	{
+		cpath->path.rows = 1;
+		cpath->path.startup_cost = 0;
+		cpath->path.total_cost = 1;
+	}
 	else
 	{
 		cpath->path.rows = 0;
@@ -1824,6 +2035,7 @@ fb_flashback_make_custom_path(PlannerInfo *root,
 	cpath->custom_private = fb_flashback_make_private(kind,
 													 source_relid,
 													 fast_path,
+													 false,
 													 false);
 	cpath->methods = fb_custom_path_methods(kind);
 	return cpath;
@@ -1847,16 +2059,26 @@ fb_flashback_plan_custom_path(PlannerInfo *root,
 	FbPlannerFastPathSpec fast_path;
 	bool has_fast_path;
 	bool full_output_fast_path = false;
+	bool count_only_fast_path = false;
 	List	   *private;
-
-	rte = planner_rt_fetch(rel->relid, root);
-	func = fb_flashback_match_rte_function(rte, NULL);
-	if (func == NULL)
-		elog(ERROR, "fb flashback custom path lost pg_flashback function expression");
 
 	kind = fb_flashback_node_kind(best_path->custom_private);
 	source_relid = fb_flashback_private_source_relid(best_path->custom_private);
-	scan_tlist = fb_flashback_build_scan_tlist(rel->relid, source_relid);
+	if (kind == FB_CUSTOM_NODE_COUNT_AGG)
+	{
+		func = fb_flashback_find_count_star_function(root, NULL);
+		if (func == NULL)
+			elog(ERROR, "fb flashback count aggregate path lost pg_flashback function expression");
+		scan_tlist = tlist;
+	}
+	else
+	{
+		rte = planner_rt_fetch(rel->relid, root);
+		func = fb_flashback_match_rte_function(rte, NULL);
+		if (func == NULL)
+			elog(ERROR, "fb flashback custom path lost pg_flashback function expression");
+		scan_tlist = fb_flashback_build_scan_tlist(rel->relid, source_relid);
+	}
 	has_fast_path = false;
 	if (kind == FB_CUSTOM_NODE_APPLY)
 	{
@@ -1872,17 +2094,25 @@ fb_flashback_plan_custom_path(PlannerInfo *root,
 			fb_flashback_is_full_output_targetlist(tlist,
 												   rel->relid,
 												   source_relid);
+		count_only_fast_path =
+			!has_fast_path &&
+			!full_output_fast_path &&
+			clauses == NIL &&
+			fb_flashback_is_count_star_query(root->parse);
 	}
 	private = fb_flashback_make_private(kind,
 										source_relid,
 										(kind == FB_CUSTOM_NODE_APPLY && has_fast_path) ?
 										&fast_path : NULL,
-										full_output_fast_path);
-	if (kind == FB_CUSTOM_NODE_WAL_INDEX)
+										full_output_fast_path,
+										count_only_fast_path);
+	if (kind == FB_CUSTOM_NODE_WAL_INDEX || kind == FB_CUSTOM_NODE_COUNT_AGG)
 		target_ts_expr = copyObject(lsecond(func->args));
 
 	cscan = makeNode(CustomScan);
-	cscan->scan.plan.targetlist = (kind == FB_CUSTOM_NODE_APPLY) ? tlist : scan_tlist;
+	cscan->scan.plan.targetlist =
+		(kind == FB_CUSTOM_NODE_APPLY || kind == FB_CUSTOM_NODE_COUNT_AGG) ?
+		tlist : scan_tlist;
 	cscan->scan.plan.qual = (kind == FB_CUSTOM_NODE_APPLY && !has_fast_path) ?
 		extract_actual_clauses(clauses, false) : NIL;
 	cscan->scan.scanrelid = 0;
@@ -1931,7 +2161,13 @@ fb_flashback_ensure_wal_index_ready(FbFlashbackCustomScanState *state)
 	state->spool = fb_spool_session_create();
 	fb_progress_enter_stage(FB_PROGRESS_STAGE_PREPARE_WAL, NULL);
 	fb_wal_prepare_scan_context(state->target_ts, state->spool, &state->scan_ctx);
-	fb_wal_build_record_index(&state->info, &state->scan_ctx, &state->index);
+	fb_wal_build_record_index(&state->info,
+							  &state->scan_ctx,
+							  &state->index,
+							  (state->count_only_fast_path ||
+							   state->kind == FB_CUSTOM_NODE_COUNT_AGG) ?
+							  FB_WAL_BUILD_COUNT_ONLY :
+							  FB_WAL_BUILD_FULL);
 	if (state->index.unsafe)
 	{
 		char *detail = fb_flashback_build_unsafe_detail(&state->info, &state->index);
@@ -1967,19 +2203,40 @@ fb_flashback_apply_next(ScanState *scanstate)
 	if (state->apply == NULL)
 	{
 		child = fb_flashback_child_state(state);
-		if (child != NULL)
+		if (child != NULL && !state->count_only_fast_path)
 			ExecProcNode(&child->css.ss.ps);
 
 		wal_state = fb_flashback_find_state(state, FB_CUSTOM_NODE_WAL_INDEX);
-		reverse_state = fb_flashback_find_state(state, FB_CUSTOM_NODE_REVERSE_SOURCE);
-		if (wal_state == NULL || reverse_state == NULL || reverse_state->reverse == NULL)
-			elog(ERROR, "fb custom apply node missing prerequisite state");
+		if (state->count_only_fast_path)
+		{
+			uint64 current_rows;
+			uint64 final_rows;
 
-		state->apply = fb_apply_begin(&wal_state->info,
-									  wal_state->tupdesc,
-									  reverse_state->reverse,
-									  (state->fast_path.mode == FB_FAST_PATH_NONE) ?
-									  NULL : &state->fast_path);
+			if (wal_state == NULL)
+				elog(ERROR, "fb custom apply node missing wal state");
+			fb_flashback_ensure_wal_index_ready(wal_state);
+			current_rows = fb_flashback_count_current_rows(wal_state->source_relid);
+			final_rows = current_rows + wal_state->index.target_delete_count;
+			if (final_rows < wal_state->index.target_insert_count)
+				final_rows = 0;
+			else
+				final_rows -= wal_state->index.target_insert_count;
+			state->apply = fb_apply_begin_count_only(&wal_state->info,
+													wal_state->tupdesc,
+													final_rows);
+		}
+		else
+		{
+			reverse_state = fb_flashback_find_state(state, FB_CUSTOM_NODE_REVERSE_SOURCE);
+			if (wal_state == NULL || reverse_state == NULL || reverse_state->reverse == NULL)
+				elog(ERROR, "fb custom apply node missing prerequisite state");
+
+			state->apply = fb_apply_begin(&wal_state->info,
+										  wal_state->tupdesc,
+										  reverse_state->reverse,
+										  (state->fast_path.mode == FB_FAST_PATH_NONE) ?
+										  NULL : &state->fast_path);
+		}
 		fb_apply_bind_output_slot(state->apply, scanstate->ss_ScanTupleSlot);
 		state->stage_ready = true;
 	}
@@ -2034,6 +2291,8 @@ fb_flashback_begin_custom_scan(CustomScanState *node,
 	fb_flashback_deserialize_fast_path(cscan->custom_private, state);
 	state->full_output_fast_path =
 		fb_flashback_private_full_output_fast_path(cscan->custom_private);
+	state->count_only_fast_path =
+		fb_flashback_private_count_only_fast_path(cscan->custom_private);
 
 	if (state->kind == FB_CUSTOM_NODE_APPLY && OidIsValid(state->source_relid))
 	{
@@ -2050,6 +2309,16 @@ fb_flashback_begin_custom_scan(CustomScanState *node,
 		else
 			ExecAssignScanProjectionInfo(&state->css.ss);
 		relation_close(rel, AccessShareLock);
+	}
+	else if (state->kind == FB_CUSTOM_NODE_COUNT_AGG)
+	{
+		TupleDesc tupdesc = ExecTypeFromTL(cscan->scan.plan.targetlist);
+
+		ExecInitScanTupleSlot(estate,
+							  &state->css.ss,
+							  tupdesc,
+							  &TTSOpsVirtual);
+		ExecAssignScanProjectionInfo(&state->css.ss);
 	}
 
 	foreach(lc, cscan->custom_plans)
@@ -2068,11 +2337,48 @@ fb_flashback_exec_custom_scan(CustomScanState *node)
 	FbFlashbackCustomScanState *state = fb_flashback_custom_state(node);
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 
+	if (state->kind == FB_CUSTOM_NODE_COUNT_AGG)
+	{
+		if (state->query_done)
+			return ExecClearTuple(slot);
+
+		if (!state->progress_started)
+		{
+			fb_progress_begin();
+			state->progress_started = true;
+		}
+
+		if (!state->stage_ready)
+		{
+			uint64 current_rows;
+			uint64 final_rows;
+
+			fb_flashback_ensure_wal_index_ready(state);
+			current_rows = fb_flashback_count_current_rows(state->source_relid);
+			final_rows = current_rows + state->index.target_delete_count;
+			if (final_rows < state->index.target_insert_count)
+				final_rows = 0;
+			else
+				final_rows -= state->index.target_insert_count;
+
+			ExecClearTuple(slot);
+			slot->tts_values[0] = Int64GetDatum((int64) final_rows);
+			slot->tts_isnull[0] = false;
+			ExecStoreVirtualTuple(slot);
+			state->stage_ready = true;
+			state->query_done = true;
+			fb_flashback_finish_progress(state);
+			return slot;
+		}
+
+		return ExecClearTuple(slot);
+	}
+
 	if (state->kind == FB_CUSTOM_NODE_APPLY)
 	{
 		PG_TRY();
 		{
-			if (state->full_output_fast_path)
+			if (state->full_output_fast_path || state->count_only_fast_path)
 				return fb_flashback_apply_next(&state->css.ss);
 			return ExecScan(&state->css.ss,
 							fb_flashback_apply_next,
@@ -2175,6 +2481,7 @@ fb_flashback_exec_custom_scan(CustomScanState *node)
 				break;
 			case FB_CUSTOM_NODE_WAL_INDEX:
 			case FB_CUSTOM_NODE_APPLY:
+			case FB_CUSTOM_NODE_COUNT_AGG:
 				break;
 		}
 	}
@@ -2188,7 +2495,8 @@ fb_flashback_end_custom_scan(CustomScanState *node)
 {
 	FbFlashbackCustomScanState *state = fb_flashback_custom_state(node);
 
-	if (state->kind == FB_CUSTOM_NODE_APPLY)
+	if (state->kind == FB_CUSTOM_NODE_APPLY ||
+		state->kind == FB_CUSTOM_NODE_COUNT_AGG)
 	{
 		if (state->query_done)
 			fb_flashback_finish_progress(state);
@@ -2197,7 +2505,8 @@ fb_flashback_end_custom_scan(CustomScanState *node)
 	}
 
 	fb_flashback_cleanup_state(state);
-	if (state->kind == FB_CUSTOM_NODE_APPLY)
+	if (state->kind == FB_CUSTOM_NODE_APPLY ||
+		state->kind == FB_CUSTOM_NODE_COUNT_AGG)
 		fb_runtime_cleanup_stale();
 
 	while (node->custom_ps != NIL)
@@ -2215,7 +2524,8 @@ fb_flashback_rescan_custom_scan(CustomScanState *node)
 	FbFlashbackCustomScanState *state = fb_flashback_custom_state(node);
 	FbFlashbackCustomScanState *child;
 
-	if (state->kind == FB_CUSTOM_NODE_APPLY)
+	if (state->kind == FB_CUSTOM_NODE_APPLY ||
+		state->kind == FB_CUSTOM_NODE_COUNT_AGG)
 	{
 		if (state->query_done)
 			fb_flashback_finish_progress(state);
@@ -2230,7 +2540,8 @@ fb_flashback_rescan_custom_scan(CustomScanState *node)
 	child = fb_flashback_child_state(state);
 	if (child != NULL)
 		ExecReScan(&child->css.ss.ps);
-	if (state->kind == FB_CUSTOM_NODE_APPLY)
+	if (state->kind == FB_CUSTOM_NODE_APPLY ||
+		state->kind == FB_CUSTOM_NODE_COUNT_AGG)
 		ExecScanReScan(&state->css.ss);
 }
 
@@ -2244,16 +2555,27 @@ fb_flashback_explain_custom_scan(CustomScanState *node,
 	char	   *attname = NULL;
 
 	(void) ancestors;
-	if (state->kind != FB_CUSTOM_NODE_APPLY)
+	if (state->kind != FB_CUSTOM_NODE_APPLY &&
+		state->kind != FB_CUSTOM_NODE_COUNT_AGG)
 		return;
 
 	rel_label = fb_flashback_relation_label(state->source_relid);
 	ExplainPropertyText("Flashback Relation", rel_label, es);
+	if (state->kind == FB_CUSTOM_NODE_COUNT_AGG)
+	{
+		ExplainPropertyBool("Flashback Count Aggregate Pushdown", true, es);
+		pfree(rel_label);
+		return;
+	}
 	ExplainPropertyBool("Flashback Full Output Fast Path",
 						state->full_output_fast_path,
 						es);
+	ExplainPropertyBool("Flashback Count Fast Path",
+						state->count_only_fast_path,
+						es);
 	ExplainPropertyText("Flashback Output Dispatch",
-						state->full_output_fast_path ? "direct" : "execscan",
+						state->count_only_fast_path ? "count-only" :
+						(state->full_output_fast_path ? "direct" : "execscan"),
 						es);
 	if (state->fast_path.mode != FB_FAST_PATH_NONE)
 	{
@@ -2284,7 +2606,10 @@ fb_custom_scan_init(void)
 	RegisterCustomScanMethods(&fb_replay_final_scan_methods);
 	RegisterCustomScanMethods(&fb_reverse_source_scan_methods);
 	RegisterCustomScanMethods(&fb_apply_scan_methods);
+	RegisterCustomScanMethods(&fb_count_agg_scan_methods);
 	fb_prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = fb_flashback_set_rel_pathlist;
+	fb_prev_create_upper_paths_hook = create_upper_paths_hook;
+	create_upper_paths_hook = fb_flashback_create_upper_paths;
 	initialized = true;
 }
