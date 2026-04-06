@@ -131,6 +131,8 @@ typedef struct FbWalScanContext
 	uint32 summary_xid_hits;
 	uint32 summary_xid_fallback;
 	uint32 summary_xid_segments_read;
+	uint32 xact_fallback_windows;
+	uint32 xact_fallback_covered_segments;
 	uint32 summary_unsafe_hits;
 	uint32 metadata_fallback_windows;
 	uint64 payload_sparse_reader_resets;
@@ -235,6 +237,12 @@ fb_record_block_has_applicable_image(const FbRecordBlockRef *block_ref)
 		block_ref->apply_image;
 }
 
+static inline bool
+fb_record_block_has_materializing_image(const FbRecordBlockRef *block_ref)
+{
+	return block_ref != NULL && block_ref->has_image;
+}
+
 /*
  * FbWalRecordIndex
  *    WAL structure.
@@ -274,6 +282,10 @@ typedef struct FbWalRecordIndex
 	uint64 payload_kept_record_count;
 	uint64 payload_sparse_reader_resets;
 	uint64 payload_sparse_reader_reuses;
+	uint64 record_materializer_resets;
+	uint64 record_materializer_reuses;
+	uint64 locator_stub_materializations;
+	uint64 deferred_payload_materializations;
 	uint64 summary_payload_locator_records;
 	uint32 summary_payload_locator_segments_read;
 	uint64 summary_payload_locator_public_builds;
@@ -286,6 +298,9 @@ typedef struct FbWalRecordIndex
 	FbSpoolLog *record_tail_log;
 	HTAB *precomputed_missing_blocks;
 	uint32 precomputed_missing_block_count;
+	RelFileLocator target_locator;
+	RelFileLocator toast_locator;
+	bool has_toast_locator;
 	const FbWalResolvedSegment *resolved_segments;
 	uint32 resolved_segment_count;
 	int wal_seg_size;
@@ -340,6 +355,9 @@ bool fb_wal_record_cursor_seek(FbWalRecordCursor *cursor, uint32 record_index);
 bool fb_wal_record_cursor_read(FbWalRecordCursor *cursor,
 							   FbRecordRef *record,
 							   uint32 *record_index);
+bool fb_wal_record_cursor_read_skeleton(FbWalRecordCursor *cursor,
+										FbRecordRef *record,
+										uint32 *record_index);
 void fb_wal_record_cursor_close(FbWalRecordCursor *cursor);
 bool fb_wal_record_load(const FbWalRecordIndex *index,
 						 uint32 record_index,

@@ -115,6 +115,132 @@
 
 ## 当前进行中
 
+- 已完成 `count(*) FROM pg_flashback(...)` 错误计数的止血修复，并将后续工作收口为“重设计 count-only 优化”：
+  - 2026-04-06 本机 PG18 / `alldb` 现场先用实际 `pg_waldump` 复核：
+    - `scenario_oa_50t_50000r.documents`
+      在 `2026-04-04 23:20:13 -> 23:40:13` 期间真实净变化不是 `0`
+    - `scenario_oa_50t_50000r.approval_comments`
+      在 `2026-04-04 23:00:13 -> 23:40:13` 期间真实净变化也不是 `0`
+    - 旧实现却返回一串相同计数，确认问题在扩展内部 `count(*)` 专用执行链路
+  - 已补最小 RED：
+    - `fb_custom_scan` 新增 “summary 已命中 + target 后同时存在 INSERT/DELETE” 计数回归
+    - 旧实现下该回归会出现：
+      - `fast_count = current_count`
+      - 与 materialize 出来的真值计数不一致
+  - 当前已采取的修复策略：
+    - 暂时禁用 `FbCountAggScan` 聚合下推
+    - 暂时禁用 `FbApplyScan` 的 `count_only_fast_path`
+    - `count(*) FROM pg_flashback(...)` 统一回到已验证正确的常规 flashback 执行链
+  - 修复后 live 复核：
+    - `documents`
+      - `2026-04-04 23:40:13` -> `1949853`
+      - `2026-04-04 23:39:13` -> `1949853`
+      - `2026-04-04 23:30:13` -> `1949855`
+      - `2026-04-04 23:20:13` -> `1949887`
+    - `approval_comments`
+      - `2026-04-04 23:40:13` -> `199826`
+      - `2026-04-04 23:20:13` -> `199823`
+      - `2026-04-04 23:00:13` -> `199920`
+  - 当前遗留：
+    - `FB_WAL_BUILD_COUNT_ONLY` / `FbCountAggScan` 的真正 root cause 还没有完成内核级修复
+    - 后续要在 correctness 已锁住的前提下，单独重设计并重新开放 count-only 优化
+
+- 已完成 `documents @ 2026-04-04 23:40:13` 的通用 WAL 物化优化收敛：
+  - live 现场 `gdb` 已确认：
+    - `record_count = 4530229`
+    - `summary_payload_locator_records = 4530229`
+    - `precomputed_missing_block_count = 0`
+    - `payload_scan_mode = LOCATOR`
+    - `discover round = 1`
+  - `perf` 已确认当前不是卡在 summary anchor lookup，而是卡在
+    locator-only stub 的逐条真实物化：
+    - `fb_wal_record_cursor_read`
+    - `fb_wal_load_record_by_lsn`
+    - `fb_wal_open_segment`
+    - `fb_open_file_at_path`
+    - `posix_fadvise`
+  - 当前根因已确认：
+    - `3/9` 的 locator-only payload stub 把 payload body 延后后，
+      `4/9` discover 仍顺着整个 `record_log` 消费 stub
+    - stub 当前只有 `record_start_lsn`
+    - cursor 命中 stub 后会逐条新建 `XLogReader`
+    - 并逐条重新 `open/fadvise/close` segment
+    - 同类浪费也存在于 deferred payload materialize
+    - locator-only 路径还会把 `precomputed_missing_blocks` 清零，
+      使 discover shortcut 失效
+  - 当前通用修复已落地：
+    - 新增 reusable WAL record materializer
+    - locator-only / deferred payload / replay discover 共用同一物化层
+    - 区分顺扫窗口与稀疏按 LSN 物化的 open hint
+    - locator-only 路径恢复 `precomputed_missing_blocks` 预计算
+    - query-local WAL bgworker 改为先按实例 worker budget 限流，避免反复 register/kill 不可能启动的 worker
+  - 2026-04-06 本机 PG18 live 复核：
+    - SQL：
+      `select * from pg_flashback(NULL::scenario_oa_50t_50000r.documents, '2026-04-04 23:40:13') limit 100`
+    - 结果：
+      - `3/9 30% metadata` `+1211.347 ms`
+      - `3/9 55% xact-status` `+0.362 ms`
+      - `3/9 100% payload` `+7.348 ms`
+      - `4/9 replay discover precomputed` 进入 `< 1 ms`
+      - `/usr/bin/time` 总时长 `1.39s`
+  - 当前结论：
+    - 本轮目标 `< 50s` 已达成
+    - `4/9` 不再是 blocker
+    - live case 当前主耗时已转移到 `3/9 metadata`
+
+- 已完成 `documents @ 2026-04-04 23:40:13` 的 `SELECT * ... LIMIT 100` live case
+  `3/9` 压降：
+  - 当前在 `summary payload locator` 已覆盖且 `parallel_workers > 1` 的路径上，
+    `3/9` 新增 `locator-only payload stub` fast path：
+    - `3/9` 不再为 locator-first 路径全量物化 payload body
+    - build 期仅把 `record_start_lsn` 级 stub 落到 record spool
+    - cursor / replay 侧按需按 LSN 回填真实 record
+  - 2026-04-06 本机 PG18 live 复核：
+    - SQL：
+      `select * from pg_flashback(NULL::scenario_oa_50t_50000r.documents, '2026-04-04 23:40:13') limit 100`
+    - 一轮复核：
+      - `3/9 30% metadata` `+1303.071 ms`
+      - `3/9 55% xact-status` `+15658.182 ms`
+      - `3/9 100% payload` `+950.091 ms`
+      - `3/9` 累计约 `17.97s`
+    - 前一轮热缓存复核：
+      - `3/9 30% metadata` `+1318.998 ms`
+      - `3/9 55% xact-status` `+15039.466 ms`
+      - `3/9 100% payload` `+1061.092 ms`
+      - `3/9` 累计约 `17.47s`
+  - 当前确认：
+    - `100% payload` 已从此前三十秒级压到约 `1s`
+    - `3/9` 当前主瓶颈重新收敛为 `xact-status`
+  - 当前残留：
+    - `PGHOST=/tmp PGPORT=5832 make installcheck REGRESS='fb_recordref fb_replay'`
+      中 `fb_recordref` 已通过
+    - `fb_replay` 仍有一处旧契约差异：
+      - `skips_discover_rounds` 期望 `t`，现场结果为 `f`
+      - 说明 `precomputed_missing_blocks` / discover-round shortcut
+        与新 fast path 仍有一处交互待继续收敛
+
+- 已完成修复 `runtime/` 目录 stale `fbspill-*` 在失败查询后不清理的问题：
+  - 现场复现已锁定：
+    - `Custom Scan (FbWalIndexScan)` / `FbCountAggScan` 在建 WAL index 期间若因
+      `storage_change` 等错误提前 `ERROR`
+    - 当前 backend 自己创建的 `runtime/fbspill-<pid>-*` 会残留为空目录
+  - 当前根因已确认：
+    - 失败路径缺少对当前 backend runtime 产物的兜底清扫
+    - 单靠正常 `spool` 生命周期释放不足以覆盖这类 abort 路径
+  - 当前修复已落地：
+    - 为 `fb_runtime` 新增 `fb_runtime_cleanup_current_backend()`
+    - `fb_custom_scan.c` 在异常清理时补 current-backend runtime sweep
+    - `fb_entry.c` 的 SRF abort callback 也补同一兜底清扫
+    - `fb_runtime_cleanup` 新增 RED：
+      - 故意触发 `storage_change` 错误后，断言当前 backend `runtime` 残留为 `0`
+  - 当前验证已完成：
+    - `make ... installcheck REGRESS='fb_runtime_cleanup fb_custom_scan fb_value_per_call'`
+      `All 3 tests passed.`
+    - 本机手工复现：
+      - `count(*) FROM pg_flashback(...)` 捕获 `storage_change` 错误后
+      - 同 backend 立即检查 `pg_flashback/runtime`
+      - `runtime_entries = 0`
+
 - 已确认并开始修复 `documents @ 2026-04-04 23:40:13` 的 `3/9` 新 blocker：
   - 当前 `summary payload locator-first` 方案方向本身成立：
     - 已明显压低 payload 阶段的无关 WAL decode
@@ -185,6 +311,67 @@
       - 同次整条 SQL 总耗时约 `22.132s`
     - 当前新尾巴已经从 `3/9 payload` 转移到整体总耗时与
       `SELECT *` 非聚合路径，不再是本次用户要求的 blocker
+  - 在 `SELECT *`
+    `scenario_oa_50t_50000r.documents @ '2026-04-04 23:40:13'`
+    的 live case 上，新一轮现场已确认 `3/9` 热点继续右移：
+    - `xact-status` 的全窗口回退已收窄为 unresolved-only fallback
+    - 但当前 payload locator-first 仍保留“逐条 locator 重新 `XLogBeginRead`”
+      的访问模式
+    - `gdb` / `pg_stat_activity` 现场已确认热点落在：
+      - `fb_wal_visit_payload_locators`
+      - `XLogReadRecord`
+      - `WALRead`
+    - 同次现场参数已确认：
+      - `locator_count = 4530229`
+      - 两条 live backend 都持续停在 payload locator 逐条读 WAL
+  - 当前已拍板的新修复方向：
+    - 不改变 summary payload locator-first 的 correctness 语义
+    - 不允许因为批量顺扫而把不在 locator 集中的 relation record 错误发射进 payload
+    - 在此前提下，把 payload locator 物化改成：
+      - 高密度 locator case 下按 covered segment run 批量顺扫 WAL
+      - 访问期使用精确 locator 迭代器过滤，只在 `record_start_lsn` 命中时才发射 payload
+      - 稀疏 locator case 继续保留 direct read，避免把 decode 范围无谓放大
+    - 目标是先把用户固定 SQL 的 `3/9` 明确压到 `< 20s`
+  - 2026-04-06 本机继续复核：
+    - `select * from pg_flashback(NULL::scenario_oa_50t_50000r.documents, '2026-04-04 23:40:13') limit 100`
+      当前 `3/9` 已降到：
+      - `0% prefilter` `+49.683 ms`
+      - `10% summary-span` `+24.843 ms`
+      - `30% metadata` `+1196.110 ms`
+      - `55% xact-status` `+14716.162 ms`
+      - `70% payload` `+0.103 ms`
+    - `3/9` 累计约 `15.99s`，已经压到 `< 20s`
+  - 本轮真正生效的不是单点微调，而是两刀一起落地：
+    - payload locator 改成“批量顺扫 + 精确 locator 命中过滤”
+      - live case 不再卡在逐条 `XLogBeginRead`
+    - xact fallback 保持 unresolved-only，但进一步补了：
+      - 只对 unresolved 集计数
+      - unresolved 全部补齐后立即早停
+      - fallback windows 改成从最新 run 往前扫，先吃掉更接近 commit/abort 的区间
+
+- 已修复 `fb_custom_scan` / `fb_replay_debug` 的
+  `failed to replay heap insert` 新现场：
+  - 现场症状：
+    - `fb_custom_scan.sql` 的 cursor `MOVE`
+      会在 `failed to replay heap insert` 上失败
+    - `fb_replay_debug('fb_custom_scan_target', target_ts)` 也可独立复现
+  - 根因已确认：
+    - final replay 的 record cursor 仍会收到“相邻两条 start LSN 完全相同”的重复 WAL record
+    - 同一条 `heap insert` 被 replay 第二次后，目标 offset 已占用，于是报
+      `will not overwrite a used ItemId`
+    - 当前 root cause 不在 `apply_image=false` 页基线，而在 payload/record cursor
+      仍可能把同一条 WAL record 喂入 final replay 两次
+  - 当前修复：
+    - `fb_replay_run_pass()` 对“相邻重复 `record.lsn`”做硬去重
+    - 依据是 WAL record start LSN 全局唯一，exact duplicate start 可安全跳过
+  - 2026-04-06 本机复核：
+    - `sql/fb_custom_scan.sql` 直跑通过
+    - `make ... installcheck REGRESS='fb_custom_scan' ...` 通过
+    - `fb_replay_debug` no-count 场景恢复：
+      - `errors=0`
+      - `precomputed_missing_blocks=0`
+      - `discover_skipped=1`
+    - 同 session `count(*) -> full replay` 实际结果集行数仍为 `20000`
 
 - 已完成 `summary payload locator` 架构升级主链，summary 现已从
   “relation spans 缩窗”推进到“payload 精确 record 入口”：
@@ -1211,6 +1398,7 @@
 
 ## 下一步
 
+- 在 correctness 已锁住的前提下，继续定位 `FB_WAL_BUILD_COUNT_ONLY` / `FbCountAggScan` 的真实 root cause，并准备重新开放 count-only 优化
 - 将开源镜像双语文档模板收口到 `scripts/sync_open_source.sh` 的长期同步流程中，避免后续刷新时回退到旧单语文档
 - 将 `docs/superpowers/specs/2026-04-03-release-gate-design.md` 细化为正式实现计划
 - 为 `tests/release_gate/` 建立独立脚本与配置骨架
@@ -1552,6 +1740,45 @@
     - `docs/decisions/ADR-0023-summary-first-record-index.md`
 
 ## 当前进行中
+
+- 已确认并开始修复 `3/9 xact-status` 的全量回退放大问题：
+  - 当前 live case 现场已确认：
+    - `scenario_oa_50t_50000r.documents @ '2026-04-04 23:40:13'`
+      的主要长尾已不再是 `payload locator / pg_qsort`
+    - backend 当前热点落在：
+      - `fb_wal_fill_xact_statuses_serial`
+      - `fb_wal_visit_window`
+      - `WALRead`
+    - 同次 `gdb` 现场已确认：
+      - `window_count = 97705`
+      - 当前 `3/9 30% metadata` 后长时间空白实际属于
+        `xact-status`，不是 metadata 主循环本身
+  - 当前根因已确认有两层：
+    - `fb_summary_fill_xact_statuses()` 当前仍是
+      “all-or-nothing” 语义：
+      - 只要还有任意 `touched/unsafe xid` 未由 summary outcome 解出
+      - 就返回 `false`
+      - 调用方随即回退到旧的串行 WAL xact 扫描
+    - 当前串行回退仍直接复用高碎片 relation/span windows：
+      - 即使 summary 已经解出大部分 xid
+      - 也会按整批碎窗口重扫 `RM_XACT_ID`
+      - 还会重复触达已由 summary 命中的 xid
+  - 当前已拍板的新修复口径：
+    - 保持 correctness 优先，不接受“少量 unresolved 直接忽略”
+    - 但把 fallback 从“整批 touched/unsafe xid + 整批碎窗口”
+      收敛为：
+      - summary 先写入已命中的 xid status
+      - 仅为 unresolved xid 构建 fallback 集
+      - xact fallback 使用专用 coalesced windows，不再逐个 relation span
+        细碎读取 WAL
+    - 同时补 query/debug 观测，至少暴露：
+      - xact fallback unresolved xid 数
+      - xact fallback windows / covered segments
+  - 当前验收目标固定为：
+    - 用户现场 SQL
+      `select * from pg_flashback(NULL::scenario_oa_50t_50000r.documents, '2026-04-04 23:40:13') limit 100`
+      的 `3/9` 阶段耗时压到 `< 20s`
+    - 同时不能破坏现有 summary-first / WAL fallback 正确性
 
 - summary 预建服务第一版已落地：
   - 查询侧已切到 summary-first prefilter：

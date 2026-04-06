@@ -187,8 +187,32 @@ Custom Scan (FbCountAggScan)
   - summary build 期写成 relation-scoped stable locator slice
   - query cache 期直接复用 public locator slice
   - payload plan 期按 segment 去重，不再由碎片 span/base windows 重复驱动同一 segment lookup
+  - payload visit 期按 case 分流：
+    - 高密度 locator case 允许把 locator 归并为 covered segment runs 顺扫 WAL
+    - 发射期仍必须按精确 `record_start_lsn` 命中过滤，不能把 run 内其他 relation record 混入 payload
+    - 稀疏 locator case 保留 direct read，避免 decode 范围被批量 run 放大
 - 提供查询期 backend-local summary section cache，避免同一查询重复读取相同 summary 文件
 - 供 query prefilter 和后台预建服务共用
+
+### `fb_wal` / record materializer
+
+文件：
+
+- `src/fb_wal.c`
+- `include/fb_wal.h`
+
+职责补充：
+
+- `fb_wal_build_record_index()` 仍负责顺扫构建 `RecordRef` 索引
+- `FbWalRecordCursor` 负责从 spool 中恢复记录并向 replay 发射
+- 当前已拍板把 locator-only / deferred payload 的按需回填，
+  收敛到 WAL 层内部统一的 reusable record materializer：
+  - 复用 `XLogReaderState`
+  - 复用当前打开 segment
+  - 区分顺扫窗口与稀疏按 LSN 物化的 open hint
+  - 服务 `4/9 replay discover`、anchor fallback、warm/final replay、
+    deferred payload materialize
+- 该层优化属于通用 WAL 物化内核，不依赖执行器 fast path
 
 ### `fb_summary_service`
 

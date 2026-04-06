@@ -37,6 +37,20 @@
   - 已同步 `expected/fb_replay.out`
   - 全量 `installcheck` 当前结果：
     - `All 36 tests passed.`
+- [x] 修复 `fb_custom_scan` / `fb_replay_debug` 的重复 replay `heap insert` 问题
+  - 根因已确认：
+    - final replay 的 record cursor 仍可能把相邻重复 `record.lsn`
+      的 WAL record 喂入一次以上
+    - 同一条 `heap insert` 第二次回放时，目标 offset 已占用，
+      于是报 `failed to replay heap insert`
+  - 当前修复已落地：
+    - `fb_replay_run_pass()` 对 exact duplicate `record.lsn` 做跳过
+  - 当前已验证：
+    - `sql/fb_custom_scan.sql` 直跑通过
+    - `make ... installcheck REGRESS='fb_custom_scan' ...`
+      `All 1 tests passed.`
+    - `fb_replay_debug` no-count 场景恢复 `errors=0`
+    - 同 session `count(*) -> full replay` 的实际结果集行数仍为 `20000`
 - [x] 修复“较早 prefix gap 误杀较新连续 suffix”的 WAL resolver 问题
   - resolver 不再因旧 prefix 上的不可恢复 gap 在 `2/9` 直接报 `missing segment`
   - 当前改为保留最新端连续 suffix；只有 suffix 自身不连续时才继续报 WAL 不完整
@@ -95,6 +109,52 @@
     - `fb_summary_service` 回归新增“删除 WAL 后删除对应 summary 文件”断言并通过
 
 ## 当前待办
+- [x] 修复 `count(*) FROM pg_flashback(...)` 的错误计数现场
+  - [x] 补最小 RED：
+    - [x] 为 `fb_custom_scan` 增加“target 后含 `INSERT + DELETE`”的计数回归
+    - [x] 断言与非快路径 `SELECT *` 结果集计数一致
+  - [x] 用 live case 复核：
+    - [x] `scenario_oa_50t_50000r.documents`
+          @ `2026-04-04 23:20:13 / 23:30:13 / 23:39:13 / 23:40:13`
+    - [x] `scenario_oa_50t_50000r.approval_comments`
+          @ `2026-04-04 23:00:13 / 23:20:13 / 23:40:13`
+  - [x] 暂时禁用 `FbCountAggScan` / `count_only_fast_path`，让 `count(*)` 回退到正确的常规 flashback 执行链
+  - [x] 回归验证：
+    - [x] `fb_custom_scan`
+    - [x] 相关 live case 的 `count(*)` 与 `SELECT *` 计数一致
+- [ ] 重设计 `count(*) FROM pg_flashback(...)` 的 count-only 优化
+  - [ ] 继续定位 `FbCountAggScan` / `FB_WAL_BUILD_COUNT_ONLY` /
+        `target_{insert,delete,update}_count` 的真实 root cause
+  - [ ] 在 summary 命中 / locator 命中 / metadata fallback 三类路径下补齐 dedicated 回归
+  - [ ] 重新开放 `FbCountAggScan` 与 `count_only_fast_path`
+  - [ ] 复核恢复后的 correctness 与性能收益
+
+- [x] 收敛 `documents @ '2026-04-04 23:40:13'` 的 `4/9 replay discover` 与通用 WAL 物化浪费
+  - [x] 已完成 live `perf/gdb` 定位，确认热点不在 anchor lookup
+  - [x] 已新增 ADR，拍板 reusable WAL record materializer 方向
+  - [x] locator-only cursor 连续读取不再 per-record 重建 reader
+  - [x] deferred payload 连续物化不再 per-record 重建 reader
+  - [x] locator-only 路径重新保留 discover shortcut 所需预计算缺页信息
+  - [x] 为 WAL 物化层新增通用 reusable materializer：
+    - [x] 复用 `XLogReaderState`
+    - [x] 复用当前打开 segment
+    - [x] 复用 archive/source 解析结果
+  - [x] 将 locator-only cursor / deferred payload / replay fallback 统一切到该层
+  - [x] 区分顺扫窗口与稀疏按 LSN 物化的 open hint，避免 locator path 重复 `fadvise`
+  - [x] 为 `4/9` 补充观测：
+    - [x] `record_materializer_resets`
+    - [x] `record_materializer_reuses`
+    - [x] `locator_stub_materializations`
+  - [x] query-local WAL bgworker 先按实例 worker budget 限流，避免反复 register/kill 不可启动 worker
+  - [x] 用 live case 复核：
+    - [x] `select * from pg_flashback(NULL::scenario_oa_50t_50000r.documents, '2026-04-04 23:40:13') limit 100`
+          总时长 `1.39s (< 50s)`
+
+- [x] 修复失败查询后的 `runtime/` spill 残留
+  - [x] 先补最小 RED，锁住 `FbWalIndexScan` 报错后不残留 `fbspill-*`
+  - [x] 给失败路径补当前 backend runtime 兜底清理，确保 abort 后不残留当前 owner 产物
+  - [x] 复跑 `fb_runtime_cleanup`，并用失败场景复核当前 backend 不再残留 runtime 产物
+
 - [ ] 将 summary payload locator 从“查询时现拼现排”升级成“build/cache 期稳定 slice”
   - [ ] 为 payload locator 新增一份架构决策文档，明确 stable slice / query cache / segment 去重契约
   - [ ] 更新 `STATUS.md` / `docs/architecture/overview.md` / spec / plan 到当前口径
@@ -110,11 +170,34 @@
 
 - [ ] 继续压 `documents @ '2026-04-04 23:40:13'` 的 payload materialize / spool 体积
   - [x] 已确认 locator 规划热点已移除，当前 `3/9` 新主耗时不再是 `pg_qsort`
+  - [x] 先把 summary payload locator 访问从“逐条 `XLogBeginRead`”改成批量顺扫
+    - [x] 为 payload locator 访问 batching 新增 ADR / 架构登记
+    - [x] 先补最小 RED，锁住 locator batching 观测：
+      - [x] `payload_windows < payload_refs`
+    - [x] 为 locator 模式增加精确 `record_start_lsn` 过滤，禁止批量顺扫放大 payload 结果集
+    - [x] 为高密度 locator case 构建 covered-segment-run 级 visit windows
+    - [x] 用 live case 复核：
+      - [x] `scenario_oa_50t_50000r.documents @ '2026-04-04 23:40:13'`
+            的 `3/9` 明确压到 `< 20s`
+  - [x] 为 summary 已覆盖且并行开启的 locator-first 路径新增
+    `locator-only payload stub` fast path
+    - [x] `3/9` 不再为 locator-first 全量物化 payload body
+    - [x] record spool 先只落 `record_start_lsn` stub
+    - [x] cursor / replay 侧按需按 LSN 回填真实 record
+    - [x] live case 复核：
+      - [x] `scenario_oa_50t_50000r.documents @ '2026-04-04 23:40:13'`
+            `3/9` 再次稳定压到 `< 20s`
+            (`55% xact-status ~15-16s`, `100% payload ~1s`)
+  - [ ] 收敛 `locator-only payload stub` 与 `precomputed_missing_blocks`
+    的交互，恢复 `fb_replay` 的 discover-round shortcut 契约
+    - [ ] 当前 `PGHOST=/tmp PGPORT=5832 make installcheck REGRESS='fb_recordref fb_replay'`
+          中 `fb_recordref` 通过，但 `fb_replay` 仍有
+          `skips_discover_rounds = f` 的差异
   - [ ] 先补最小 RED，锁住 `apply_image=false` 的 block image 不再进入 record spool
   - [ ] 让 payload capture 对“不可应用 image”只保留 replay 必需元数据，不再写入 `BLCKSZ` image
   - [ ] 复跑回归与 live case，观察：
-    - [ ] `3/9 payload` 显著低于当前约 `178s`
-    - [ ] preflight `estimated working set` 显著低于当前约 `8.45GB`
+    - [x] `3/9 payload` 已显著低于此前约 `178s`
+    - [ ] preflight `estimated working set` 继续低于历史约 `8.45GB`
 
 - [x] 将 summary 推进到 payload locator-first，而不是只停留在 relation spans
   - [x] 保持“一段 WAL 一个 summary sidecar”模型不变
@@ -187,6 +270,9 @@
   - [x] live case 复核：
     - [x] `scenario_oa_50t_50000r.documents @ '2026-04-04 23:40:13'`
           `3/9` 累计约 `19.6s`，达到 `< 20s`
+  - [x] 2026-04-06 已临时关闭该优化：
+    - [x] summary 覆盖 live case 下存在错误计数
+    - [x] 当前先以 correctness 优先，待 count-only 链路修正后再重新开放
 
 - [ ] 破坏性删除 `pg_flashback_to(regclass, text)`
   - [ ] 从公开安装面移除
@@ -500,6 +586,18 @@
       - [x] 先去掉 query 期对每个命中 segment 的 xid outcome 整段复制
         - 当前改成复用 query-local summary cache 内的 public slice
         - live case 上 `xact-status` 已从约 `19s` 档位压到约 `16-17s`
+      - [x] 把 `xact-status` 从 all-or-nothing 回退改成 unresolved-only fallback
+        - summary 已命中的 xid status 直接保留，不再因少量 unresolved 整体失效
+        - fallback 只允许扫描 unresolved `touched/unsafe xid`
+        - 需要补回归，锁住不会重复累计 `target_commit/abort`
+      - [x] 为 `xact-status` fallback 增加专用 coalesced windows
+        - 不再直接复用高碎片 relation/span windows
+        - 至少补 debug 输出：
+          - `xact_fallback_windows`
+          - `xact_fallback_covered_segments`
+        - live case 验收：
+          - `scenario_oa_50t_50000r.documents @ '2026-04-04 23:40:13'`
+            的 `3/9` 压到 `< 20s`
       - [ ] 若继续往下压，需要新的 per-segment xid presence/index
         - 当前仅靠 relation-scoped touched xid 或事务语义剪枝都不安全
         - 已验证“按 before-target/aborted xid 直接裁 payload”会破坏 replay 正确性，不能走这条捷径

@@ -102,7 +102,15 @@ SELECT :'serial_summary' LIKE '%payload_windows=%' AS serial_payload_windows_pre
 	   :'serial_summary' LIKE '%summary_payload_locator_public_builds=%'
 	   AS serial_summary_payload_locator_public_builds_present,
 	   :'serial_summary' LIKE '%summary_payload_locator_fallback_segments=%'
-	   AS serial_summary_payload_locator_fallback_present;
+	   AS serial_summary_payload_locator_fallback_present,
+	   :'serial_summary' LIKE '%xact_fallback_windows=%'
+	   AS serial_xact_fallback_windows_present,
+	   :'serial_summary' LIKE '%xact_fallback_covered_segments=%'
+	   AS serial_xact_fallback_segments_present;
+
+SELECT (regexp_match(:'serial_summary', 'payload_windows=([0-9]+)'))[1]::integer <
+	   (regexp_match(:'serial_summary', 'payload_refs=([0-9]+)'))[1]::integer
+	   AS serial_payload_locator_batched;
 
 SELECT :'parallel_summary' LIKE '%payload_windows=%' AS parallel_payload_windows_present,
 	   :'parallel_summary' LIKE '%payload_scan_mode=%' AS parallel_payload_scan_mode_present,
@@ -116,7 +124,15 @@ SELECT :'parallel_summary' LIKE '%payload_windows=%' AS parallel_payload_windows
 	   :'parallel_summary' LIKE '%summary_payload_locator_public_builds=%'
 	   AS parallel_summary_payload_locator_public_builds_present,
 	   :'parallel_summary' LIKE '%summary_payload_locator_fallback_segments=%'
-	   AS parallel_summary_payload_locator_fallback_present;
+	   AS parallel_summary_payload_locator_fallback_present,
+	   :'parallel_summary' LIKE '%xact_fallback_windows=%'
+	   AS parallel_xact_fallback_windows_present,
+	   :'parallel_summary' LIKE '%xact_fallback_covered_segments=%'
+	   AS parallel_xact_fallback_segments_present;
+
+SELECT (regexp_match(:'parallel_summary', 'payload_windows=([0-9]+)'))[1]::integer <
+	   (regexp_match(:'parallel_summary', 'payload_refs=([0-9]+)'))[1]::integer
+	   AS parallel_payload_locator_batched;
 
 CREATE TABLE fb_recordref_unsafe (
 	id integer PRIMARY KEY,
@@ -165,13 +181,13 @@ SELECT :'parallel_unsafe_summary' LIKE '%unsafe=true%' AS parallel_unsafe_true,
 
 SELECT regexp_replace(
 		   :'serial_unsafe_summary',
-		   ' (parallel|prefilter|visited_segments|payload_windows|payload_scan_mode|payload_parallel_workers|payload_covered_segments|payload_scanned_records|payload_kept_records|summary_payload_locator_records|summary_payload_locator_segments_read|summary_payload_locator_public_builds|summary_payload_locator_fallback_segments|summary_span_windows|summary_xid_hits|summary_xid_fallback|summary_xid_segments_read|summary_unsafe_hits|metadata_fallback_windows)=[^ ]+',
+		   ' (parallel|prefilter|visited_segments|payload_windows|payload_scan_mode|payload_parallel_workers|payload_covered_segments|payload_scanned_records|payload_kept_records|summary_payload_locator_records|summary_payload_locator_segments_read|summary_payload_locator_public_builds|summary_payload_locator_fallback_segments|summary_span_windows|summary_xid_hits|summary_xid_fallback|summary_xid_segments_read|summary_unsafe_hits|metadata_fallback_windows|xact_fallback_windows|xact_fallback_covered_segments)=[^ ]+',
 		   '',
 		   'g'
 	   ) =
 	   regexp_replace(
 		   :'parallel_unsafe_summary',
-		   ' (parallel|prefilter|visited_segments|payload_windows|payload_scan_mode|payload_parallel_workers|payload_covered_segments|payload_scanned_records|payload_kept_records|summary_payload_locator_records|summary_payload_locator_segments_read|summary_payload_locator_public_builds|summary_payload_locator_fallback_segments|summary_span_windows|summary_xid_hits|summary_xid_fallback|summary_xid_segments_read|summary_unsafe_hits|metadata_fallback_windows)=[^ ]+',
+		   ' (parallel|prefilter|visited_segments|payload_windows|payload_scan_mode|payload_parallel_workers|payload_covered_segments|payload_scanned_records|payload_kept_records|summary_payload_locator_records|summary_payload_locator_segments_read|summary_payload_locator_public_builds|summary_payload_locator_fallback_segments|summary_span_windows|summary_xid_hits|summary_xid_fallback|summary_xid_segments_read|summary_unsafe_hits|metadata_fallback_windows|xact_fallback_windows|xact_fallback_covered_segments)=[^ ]+',
 		   '',
 		   'g'
 	   ) AS unsafe_serial_parallel_stable_contract_equal;

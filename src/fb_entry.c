@@ -662,6 +662,7 @@ fb_flashback_cleanup_callback(Datum arg)
 		return;
 
 	fb_flashback_query_release(state);
+	fb_runtime_cleanup_current_backend();
 	state->aborted = true;
 	fb_progress_abort();
 }
@@ -869,7 +870,7 @@ fb_recordref_debug(PG_FUNCTION_ARGS)
 
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
-						 "anchor=%s unsafe=%s reason=%s meta_refs=%llu payload_refs=%u kept=%llu target_dml=%llu commits=%llu aborts=%llu tail_inline=%s head_gap_refs=%u tail_refs=%u parallel=%s prefilter=%s visited_segments=%u/%u payload_windows=%u payload_scan_mode=%s payload_parallel_workers=%u payload_covered_segments=%u payload_scanned_records=%llu payload_kept_records=%llu payload_sparse_reader_resets=%llu payload_sparse_reader_reuses=%llu summary_payload_locator_records=%llu summary_payload_locator_segments_read=%u summary_payload_locator_public_builds=%llu summary_payload_locator_fallback_segments=%u summary_span_windows=%u summary_xid_hits=%u summary_xid_fallback=%u summary_xid_segments_read=%u summary_unsafe_hits=%u metadata_fallback_windows=%u anchor_redo=%X/%08X",
+						 "anchor=%s unsafe=%s reason=%s meta_refs=%llu payload_refs=%u kept=%llu target_dml=%llu commits=%llu aborts=%llu tail_inline=%s head_gap_refs=%u tail_refs=%u parallel=%s prefilter=%s visited_segments=%u/%u payload_windows=%u payload_scan_mode=%s payload_parallel_workers=%u payload_covered_segments=%u payload_scanned_records=%llu payload_kept_records=%llu payload_sparse_reader_resets=%llu payload_sparse_reader_reuses=%llu summary_payload_locator_records=%llu summary_payload_locator_segments_read=%u summary_payload_locator_public_builds=%llu summary_payload_locator_fallback_segments=%u summary_span_windows=%u summary_xid_hits=%u summary_xid_fallback=%u summary_xid_segments_read=%u xact_fallback_windows=%u xact_fallback_covered_segments=%u summary_unsafe_hits=%u metadata_fallback_windows=%u anchor_redo=%X/%08X",
 						 index.anchor_found ? "true" : "false",
 						 index.unsafe ? "true" : "false",
 						 fb_wal_unsafe_reason_name(index.unsafe_reason),
@@ -902,6 +903,8 @@ fb_recordref_debug(PG_FUNCTION_ARGS)
 						 scan_ctx.summary_xid_hits,
 						 scan_ctx.summary_xid_fallback,
 						 scan_ctx.summary_xid_segments_read,
+						 scan_ctx.xact_fallback_windows,
+						 scan_ctx.xact_fallback_covered_segments,
 						 scan_ctx.summary_unsafe_hits,
 						 scan_ctx.metadata_fallback_windows,
 						 LSN_FORMAT_ARGS(index.anchor_redo_lsn));
@@ -1077,7 +1080,7 @@ fb_replay_debug(PG_FUNCTION_ARGS)
 
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
-						 "records=%llu blocks=%llu errors=%llu precomputed_missing_blocks=%u discover_rounds=%u discover_skipped=%u summary_anchor_hits=%u summary_anchor_fallback=%u summary_anchor_segments_read=%u target_insert=%llu target_delete=%llu target_update=%llu",
+						 "records=%llu blocks=%llu errors=%llu precomputed_missing_blocks=%u discover_rounds=%u discover_skipped=%u summary_anchor_hits=%u summary_anchor_fallback=%u summary_anchor_segments_read=%u target_insert=%llu target_delete=%llu target_update=%llu record_materializer_resets=%llu record_materializer_reuses=%llu locator_stub_materializations=%llu deferred_payload_materializations=%llu",
 						 (unsigned long long) replay_result.records_replayed,
 						 (unsigned long long) replay_result.blocks_materialized,
 						 (unsigned long long) replay_result.replay_errors,
@@ -1089,7 +1092,11 @@ fb_replay_debug(PG_FUNCTION_ARGS)
 						 replay_result.summary_anchor_segments_read,
 						 (unsigned long long) replay_result.target_insert_count,
 						 (unsigned long long) replay_result.target_delete_count,
-						 (unsigned long long) replay_result.target_update_count);
+						 (unsigned long long) replay_result.target_update_count,
+						 (unsigned long long) index.record_materializer_resets,
+						 (unsigned long long) index.record_materializer_reuses,
+						 (unsigned long long) index.locator_stub_materializations,
+						 (unsigned long long) index.deferred_payload_materializations);
 
 		fb_spool_session_destroy(spool);
 		spool = NULL;

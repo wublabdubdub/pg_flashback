@@ -592,6 +592,8 @@ fb_spool_cursor_seek_item(FbSpoolCursor *cursor, uint32 item_index)
 	log = cursor->log;
 	if (log == NULL || item_index > log->item_count)
 		return false;
+	if (log->item_count > 0 && log->anchor_count == 0)
+		fb_spool_log_rebuild_anchors(log);
 	if (item_index == log->item_count)
 	{
 		cursor->offset = log->size;

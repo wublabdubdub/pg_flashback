@@ -312,6 +312,12 @@ fb_runtime_cleanup_stale(void)
 	fb_runtime_cleanup_matching_owner(true, 0);
 }
 
+void
+fb_runtime_cleanup_current_backend(void)
+{
+	fb_runtime_cleanup_matching_owner(false, MyProcPid);
+}
+
 PGDLLEXPORT Datum
 fb_runtime_create_test_artifacts_debug(PG_FUNCTION_ARGS)
 {

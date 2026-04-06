@@ -107,3 +107,48 @@ SELECT count(*) AS live_entries_cleaned
 FROM pg_ls_dir(current_setting('data_directory') || '/pg_flashback/runtime') AS t(name)
 WHERE name LIKE format('fbspill-%s-%%', pg_backend_pid())
    OR name LIKE format('toast-retired-%s-%%', pg_backend_pid());
+
+DROP TABLE IF EXISTS fb_runtime_error_target;
+DROP TABLE IF EXISTS fb_runtime_error_mark;
+
+CREATE TABLE fb_runtime_error_target (
+	id integer PRIMARY KEY,
+	payload text
+);
+
+CHECKPOINT;
+
+INSERT INTO fb_runtime_error_target VALUES (1, 'before');
+
+CREATE TABLE fb_runtime_error_mark (
+	target_ts timestamptz NOT NULL
+);
+
+INSERT INTO fb_runtime_error_mark VALUES (clock_timestamp());
+
+DO $$
+BEGIN
+	PERFORM pg_sleep(1.1);
+END;
+$$;
+
+TRUNCATE fb_runtime_error_target;
+
+DO $$
+BEGIN
+	BEGIN
+		PERFORM count(*)
+		FROM pg_flashback(
+			NULL::fb_runtime_error_target,
+			(SELECT target_ts::text FROM fb_runtime_error_mark)
+		);
+	EXCEPTION WHEN OTHERS THEN
+		RAISE NOTICE 'caught=%', SQLERRM;
+	END;
+END;
+$$;
+
+SELECT count(*) AS error_entries_after
+FROM pg_ls_dir(current_setting('data_directory') || '/pg_flashback/runtime') AS t(name)
+WHERE name LIKE format('fbspill-%s-%%', pg_backend_pid())
+   OR name LIKE format('toast-retired-%s-%%', pg_backend_pid());

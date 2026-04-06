@@ -3983,6 +3983,9 @@ fb_summary_segment_lookup_payload_locators_cached(const char *path,
 			locators[count++] = *best;
 			positions[best_index]++;
 		}
+
+		if (count > 1)
+			count = fb_summary_payload_locator_deduplicate(locators, count);
 	}
 	else
 		count = 0;

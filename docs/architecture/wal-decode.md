@@ -51,6 +51,8 @@ WAL 层当前只做三件大事：
 
 - 从 spool log / tail log 中按顺序取回 `FbRecordRef`
 - 支持 forward/backward 方向读取
+- 对 locator-only / deferred payload 使用通用 WAL record materializer
+  做按需回填
 
 ## 二、当前不是做什么
 
@@ -199,6 +201,18 @@ WAL 层当前只做三件大事：
 
 - `record_log`
 - `record_tail_log`
+
+当前补充口径：
+
+- 当 `summary payload locator-first` 完整覆盖 payload 且满足并行条件时，
+  `record_log` 可只落 `locator-only payload stub`
+- 但 replay / deferred payload 不允许再以“每条 stub 新建一个 WAL reader”
+  的方式回填真实记录
+- 当前已拍板引入可复用的 WAL record materializer，供：
+  - replay discover / warm / final
+  - anchor fallback
+  - deferred payload materialize
+  共用
 
 ## 五、当前识别的 record 范围
 

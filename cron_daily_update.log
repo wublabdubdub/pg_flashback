@@ -215,3 +215,48 @@ To github.com:wublabdubdub/pg_flashback.git
 To github.com:wublabdubdub/pg_flashback.git
    1578d77..382bd4d  main -> main
 [2026-04-04 01:00:11 CST] auto update finished
+[2026-04-06 01:00:01 CST] committing changes to origin/main
+[main 04d873d] update
+ 71 files changed, 7144 insertions(+), 282 deletions(-)
+ create mode 100644 .codex
+ create mode 100644 docs/decisions/ADR-0026-open-source-mirror-directory.md
+ create mode 100644 docs/decisions/ADR-0027-summary-payload-locator-section.md
+ create mode 100644 docs/decisions/ADR-0028-summary-payload-locator-stable-slice.md
+ create mode 100644 docs/superpowers/plans/2026-04-04-open-source-mirror-plan.md
+ create mode 100644 docs/superpowers/plans/2026-04-04-release-gate-stage-control-plan.md
+ create mode 100644 docs/superpowers/plans/2026-04-05-summary-payload-locator-plan.md
+ create mode 100644 docs/superpowers/plans/2026-04-05-summary-payload-stable-slice-plan.md
+ create mode 100644 docs/superpowers/specs/2026-04-04-open-source-mirror-design.md
+ create mode 100644 docs/superpowers/specs/2026-04-05-summary-payload-locator-design.md
+ create mode 100644 docs/superpowers/specs/2026-04-05-summary-payload-stable-slice-design.md
+ create mode 100644 expected/fb_payload_scan_mode.out
+ rewrite perf.data (75%)
+ copy perf.data => perf.data.old (100%)
+ create mode 100755 scripts/sync_open_source.sh
+ create mode 100644 sql/fb_payload_scan_mode.sql
+ rewrite tests/release_gate/README.md (62%)
+ create mode 100755 tests/release_gate/bin/capture_truth_snapshots.sh
+ create mode 100755 tests/release_gate/bin/evaluate_gate.sh
+ create mode 100755 tests/release_gate/bin/grow_flashback_target.sh
+ create mode 100755 tests/release_gate/bin/load_alldb_seed.sh
+ create mode 100755 tests/release_gate/bin/render_report.sh
+ create mode 100755 tests/release_gate/bin/run_alldb_dml_pressure.sh
+ create mode 100755 tests/release_gate/bin/run_flashback_matrix.sh
+ mode change 100644 => 100755 tests/release_gate/bin/start_alldbsim.sh
+ create mode 100644 tests/release_gate/golden/pg14.json
+ create mode 100644 tests/release_gate/golden/pg15.json
+ create mode 100644 tests/release_gate/golden/pg16.json
+ create mode 100644 tests/release_gate/golden/pg17.json
+ create mode 100644 tests/release_gate/golden/pg18.json
+ create mode 100755 tests/release_gate/output/latest/.gitignore
+ mode change 100644 => 100755 tests/release_gate/output/latest/logs/alldbsim.log
+ create mode 100644 tests/release_gate/sql/create_flashback_ctas.sql
+ create mode 100644 tests/release_gate/sql/drop_flashback_ctas.sql
+ create mode 100644 tests/release_gate/sql/export_flashback_csv.sql
+ create mode 100644 tests/release_gate/sql/export_table_csv.sql
+ create mode 100644 tests/release_gate/sql/recreate_alldb.sql
+ create mode 100644 tests/release_gate/sql/table_size_summary.sql
+[2026-04-06 01:00:01 CST] pushing to origin/main
+To github.com:wublabdubdub/pg_flashback.git
+   382bd4d..04d873d  main -> main
+[2026-04-06 01:00:10 CST] auto update finished

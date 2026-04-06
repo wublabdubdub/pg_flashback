@@ -40,5 +40,6 @@ char *fb_runtime_meta_summary_dir(void);
 
 void fb_runtime_ensure_initialized(void);
 void fb_runtime_cleanup_stale(void);
+void fb_runtime_cleanup_current_backend(void);
 
 #endif

@@ -1982,7 +1982,12 @@ fb_flashback_create_upper_paths(PlannerInfo *root,
 	count_path->path.rows = 1;
 	count_path->path.startup_cost = 0;
 	count_path->path.total_cost = 1;
-	add_path(output_rel, &count_path->path);
+	/*
+	 * COUNT(*) pushdown currently shares the same incorrect count-only state
+	 * used by the base custom scan fast path. Keep the planner on the regular
+	 * pg_flashback path until the dedicated count-only implementation is fixed.
+	 */
+	(void) count_path;
 }
 
 static CustomPath *
@@ -2094,11 +2099,7 @@ fb_flashback_plan_custom_path(PlannerInfo *root,
 			fb_flashback_is_full_output_targetlist(tlist,
 												   rel->relid,
 												   source_relid);
-		count_only_fast_path =
-			!has_fast_path &&
-			!full_output_fast_path &&
-			clauses == NIL &&
-			fb_flashback_is_count_star_query(root->parse);
+		count_only_fast_path = false;
 	}
 	private = fb_flashback_make_private(kind,
 										source_relid,
@@ -2161,12 +2162,14 @@ fb_flashback_ensure_wal_index_ready(FbFlashbackCustomScanState *state)
 	state->spool = fb_spool_session_create();
 	fb_progress_enter_stage(FB_PROGRESS_STAGE_PREPARE_WAL, NULL);
 	fb_wal_prepare_scan_context(state->target_ts, state->spool, &state->scan_ctx);
+	/*
+	 * COUNT_ONLY currently under-counts post-target DML when summary coverage
+	 * short-circuits metadata/xact collection. Reuse the validated full index
+	 * build for count pushdown until the dedicated count-only path is repaired.
+	 */
 	fb_wal_build_record_index(&state->info,
 							  &state->scan_ctx,
 							  &state->index,
-							  (state->count_only_fast_path ||
-							   state->kind == FB_CUSTOM_NODE_COUNT_AGG) ?
-							  FB_WAL_BUILD_COUNT_ONLY :
 							  FB_WAL_BUILD_FULL);
 	if (state->index.unsafe)
 	{
@@ -2336,158 +2339,162 @@ fb_flashback_exec_custom_scan(CustomScanState *node)
 {
 	FbFlashbackCustomScanState *state = fb_flashback_custom_state(node);
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+	TupleTableSlot *result = NULL;
 
-	if (state->kind == FB_CUSTOM_NODE_COUNT_AGG)
+	PG_TRY();
 	{
-		if (state->query_done)
-			return ExecClearTuple(slot);
-
-		if (!state->progress_started)
+		if (state->kind == FB_CUSTOM_NODE_COUNT_AGG)
 		{
-			fb_progress_begin();
-			state->progress_started = true;
-		}
-
-		if (!state->stage_ready)
-		{
-			uint64 current_rows;
-			uint64 final_rows;
-
-			fb_flashback_ensure_wal_index_ready(state);
-			current_rows = fb_flashback_count_current_rows(state->source_relid);
-			final_rows = current_rows + state->index.target_delete_count;
-			if (final_rows < state->index.target_insert_count)
-				final_rows = 0;
+			if (state->query_done)
+				result = ExecClearTuple(slot);
 			else
-				final_rows -= state->index.target_insert_count;
+			{
+				if (!state->progress_started)
+				{
+					fb_progress_begin();
+					state->progress_started = true;
+				}
 
-			ExecClearTuple(slot);
-			slot->tts_values[0] = Int64GetDatum((int64) final_rows);
-			slot->tts_isnull[0] = false;
-			ExecStoreVirtualTuple(slot);
-			state->stage_ready = true;
-			state->query_done = true;
-			fb_flashback_finish_progress(state);
-			return slot;
+				if (!state->stage_ready)
+				{
+					uint64 current_rows;
+					uint64 final_rows;
+
+					fb_flashback_ensure_wal_index_ready(state);
+					current_rows = fb_flashback_count_current_rows(state->source_relid);
+					final_rows = current_rows + state->index.target_delete_count;
+					if (final_rows < state->index.target_insert_count)
+						final_rows = 0;
+					else
+						final_rows -= state->index.target_insert_count;
+
+					ExecClearTuple(slot);
+					slot->tts_values[0] = Int64GetDatum((int64) final_rows);
+					slot->tts_isnull[0] = false;
+					ExecStoreVirtualTuple(slot);
+					state->stage_ready = true;
+					state->query_done = true;
+					fb_flashback_finish_progress(state);
+					result = slot;
+				}
+				else
+					result = ExecClearTuple(slot);
+			}
 		}
-
-		return ExecClearTuple(slot);
-	}
-
-	if (state->kind == FB_CUSTOM_NODE_APPLY)
-	{
-		PG_TRY();
+		else if (state->kind == FB_CUSTOM_NODE_APPLY)
 		{
 			if (state->full_output_fast_path || state->count_only_fast_path)
-				return fb_flashback_apply_next(&state->css.ss);
-			return ExecScan(&state->css.ss,
-							fb_flashback_apply_next,
-							fb_flashback_custom_recheck);
+				result = fb_flashback_apply_next(&state->css.ss);
+			else
+				result = ExecScan(&state->css.ss,
+								  fb_flashback_apply_next,
+								  fb_flashback_custom_recheck);
 		}
-		PG_CATCH();
+		else
 		{
-			fb_flashback_abort_progress(state);
-			fb_flashback_cleanup_state(state);
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-	}
-
-	ExecClearTuple(slot);
-	if (state->stage_ready)
-		return slot;
-
-	if (state->kind == FB_CUSTOM_NODE_WAL_INDEX)
-	{
-		fb_flashback_ensure_wal_index_ready(state);
-		state->stage_ready = true;
-		return slot;
-	}
-
-	{
-		FbFlashbackCustomScanState *child = fb_flashback_child_state(state);
-		FbFlashbackCustomScanState *wal_state;
-		FbFlashbackCustomScanState *discover_state;
-		FbFlashbackCustomScanState *warm_state;
-		bool allow_disk_spill;
-		bool shareable_reverse = false;
-
-		if (child != NULL)
-			ExecProcNode(&child->css.ss.ps);
-
-		wal_state = fb_flashback_find_state(state, FB_CUSTOM_NODE_WAL_INDEX);
-		discover_state = fb_flashback_find_state(state, FB_CUSTOM_NODE_REPLAY_DISCOVER);
-		warm_state = fb_flashback_find_state(state, FB_CUSTOM_NODE_REPLAY_WARM);
-		if (wal_state == NULL)
-			elog(ERROR, "fb custom node lost wal state");
-
-		switch (state->kind)
-		{
-			case FB_CUSTOM_NODE_REPLAY_DISCOVER:
-				state->discover = fb_replay_discover(&wal_state->info,
-													 &wal_state->index);
-				break;
-			case FB_CUSTOM_NODE_REPLAY_WARM:
-				state->warm = fb_replay_warm(&wal_state->info,
-											 &wal_state->index,
-											 discover_state != NULL ?
-											 discover_state->discover : NULL,
-											 &state->replay_result);
-				break;
-			case FB_CUSTOM_NODE_REPLAY_FINAL:
-				if (warm_state == NULL || warm_state->warm == NULL)
-					elog(ERROR, "fb custom replay final missing warm state");
-				allow_disk_spill =
-					fb_flashback_allow_disk_spill(&wal_state->info,
-												  wal_state->tupdesc,
-												  &wal_state->index);
-				shareable_reverse =
-					fb_apply_parallel_candidate(&wal_state->info,
-												(state->fast_path.mode == FB_FAST_PATH_NONE) ?
-												NULL : &state->fast_path,
-												wal_state->info.relid);
-				state->replay_result.tracked_bytes = wal_state->index.tracked_bytes;
-				state->replay_result.memory_limit_bytes =
-					wal_state->index.memory_limit_bytes;
-				state->reverse =
-					fb_reverse_source_create((allow_disk_spill || shareable_reverse) ?
-											 wal_state->spool : NULL,
-											 &state->replay_result.tracked_bytes,
-											 state->replay_result.memory_limit_bytes);
-				fb_replay_final_build_reverse_source(&wal_state->info,
-													 &wal_state->index,
-													 wal_state->tupdesc,
-													 warm_state->warm,
-													 &state->replay_result,
-													 state->reverse);
-				break;
-			case FB_CUSTOM_NODE_REVERSE_SOURCE:
+			ExecClearTuple(slot);
+			result = slot;
+			if (!state->stage_ready)
+			{
+				if (state->kind == FB_CUSTOM_NODE_WAL_INDEX)
+					fb_flashback_ensure_wal_index_ready(state);
+				else
 				{
-					FbFlashbackCustomScanState *final_state;
+					FbFlashbackCustomScanState *child = fb_flashback_child_state(state);
+					FbFlashbackCustomScanState *wal_state;
+					FbFlashbackCustomScanState *discover_state;
+					FbFlashbackCustomScanState *warm_state;
+					bool allow_disk_spill;
+					bool shareable_reverse = false;
 
-					final_state = fb_flashback_find_state(state,
-														  FB_CUSTOM_NODE_REPLAY_FINAL);
-					if (final_state == NULL || final_state->reverse == NULL)
-						elog(ERROR, "fb custom reverse source missing final reverse");
-					state->reverse = final_state->reverse;
-					final_state->reverse = NULL;
-					fb_reverse_source_finish(state->reverse);
-					if (fb_apply_parallel_candidate(&wal_state->info,
-												   (state->fast_path.mode == FB_FAST_PATH_NONE) ?
-												   NULL : &state->fast_path,
-												   wal_state->info.relid))
-						fb_reverse_source_materialize(state->reverse);
+					if (child != NULL)
+						ExecProcNode(&child->css.ss.ps);
+
+					wal_state = fb_flashback_find_state(state, FB_CUSTOM_NODE_WAL_INDEX);
+					discover_state = fb_flashback_find_state(state, FB_CUSTOM_NODE_REPLAY_DISCOVER);
+					warm_state = fb_flashback_find_state(state, FB_CUSTOM_NODE_REPLAY_WARM);
+					if (wal_state == NULL)
+						elog(ERROR, "fb custom node lost wal state");
+
+					switch (state->kind)
+					{
+						case FB_CUSTOM_NODE_REPLAY_DISCOVER:
+							state->discover = fb_replay_discover(&wal_state->info,
+																 &wal_state->index);
+							break;
+						case FB_CUSTOM_NODE_REPLAY_WARM:
+							state->warm = fb_replay_warm(&wal_state->info,
+														 &wal_state->index,
+														 discover_state != NULL ?
+														 discover_state->discover : NULL,
+														 &state->replay_result);
+							break;
+						case FB_CUSTOM_NODE_REPLAY_FINAL:
+							if (warm_state == NULL || warm_state->warm == NULL)
+								elog(ERROR, "fb custom replay final missing warm state");
+							allow_disk_spill =
+								fb_flashback_allow_disk_spill(&wal_state->info,
+															  wal_state->tupdesc,
+															  &wal_state->index);
+							shareable_reverse =
+								fb_apply_parallel_candidate(&wal_state->info,
+															(state->fast_path.mode == FB_FAST_PATH_NONE) ?
+															NULL : &state->fast_path,
+															wal_state->info.relid);
+							state->replay_result.tracked_bytes = wal_state->index.tracked_bytes;
+							state->replay_result.memory_limit_bytes =
+								wal_state->index.memory_limit_bytes;
+							state->reverse =
+								fb_reverse_source_create((allow_disk_spill || shareable_reverse) ?
+														 wal_state->spool : NULL,
+														 &state->replay_result.tracked_bytes,
+														 state->replay_result.memory_limit_bytes);
+							fb_replay_final_build_reverse_source(&wal_state->info,
+																 &wal_state->index,
+																 wal_state->tupdesc,
+																 warm_state->warm,
+																 &state->replay_result,
+																 state->reverse);
+							break;
+						case FB_CUSTOM_NODE_REVERSE_SOURCE:
+							{
+								FbFlashbackCustomScanState *final_state;
+
+								final_state = fb_flashback_find_state(state,
+																  FB_CUSTOM_NODE_REPLAY_FINAL);
+								if (final_state == NULL || final_state->reverse == NULL)
+									elog(ERROR, "fb custom reverse source missing final reverse");
+								state->reverse = final_state->reverse;
+								final_state->reverse = NULL;
+								fb_reverse_source_finish(state->reverse);
+								if (fb_apply_parallel_candidate(&wal_state->info,
+															   (state->fast_path.mode == FB_FAST_PATH_NONE) ?
+															   NULL : &state->fast_path,
+															   wal_state->info.relid))
+									fb_reverse_source_materialize(state->reverse);
+							}
+							break;
+						case FB_CUSTOM_NODE_WAL_INDEX:
+						case FB_CUSTOM_NODE_APPLY:
+						case FB_CUSTOM_NODE_COUNT_AGG:
+							break;
+					}
 				}
-				break;
-			case FB_CUSTOM_NODE_WAL_INDEX:
-			case FB_CUSTOM_NODE_APPLY:
-			case FB_CUSTOM_NODE_COUNT_AGG:
-				break;
+
+				state->stage_ready = true;
+			}
 		}
 	}
+	PG_CATCH();
+	{
+		fb_flashback_abort_progress(state);
+		fb_flashback_cleanup_state(state);
+		fb_runtime_cleanup_current_backend();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
-	state->stage_ready = true;
-	return slot;
+	return result;
 }
 
 static void

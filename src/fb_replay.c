@@ -75,6 +75,13 @@ typedef struct FbReplayRawWarmVisitorState
 	FbReplayResult *result;
 } FbReplayRawWarmVisitorState;
 
+typedef struct FbReplayRawAnchorVisitorState
+{
+	const FbRelationInfo *info;
+	HTAB *missing_blocks;
+	uint32 unresolved;
+} FbReplayRawAnchorVisitorState;
+
 struct FbReplayDiscoverState
 {
 	HTAB *backtrack_blocks;
@@ -343,6 +350,7 @@ static void fb_replay_apply_record(const FbRelationInfo *info,
 								   FbReverseOpSource *source,
 								   FbPendingReverseOpQueue *pending_ops);
 static bool fb_replay_raw_warm_visitor(XLogReaderState *reader, void *arg);
+static bool fb_replay_raw_anchor_visitor(XLogReaderState *reader, void *arg);
 
 /*
  * fb_replay_progress_stage
@@ -995,6 +1003,22 @@ fb_replay_note_record_missing_blocks(FbReplayControl *control,
 	}
 }
 
+static bool
+fb_replay_record_block_has_wal_id(const FbRecordRef *record,
+								  int block_index,
+								  uint8 wal_block_id)
+{
+	const FbRecordBlockRef *block_ref;
+
+	if (record == NULL ||
+		block_index < 0 ||
+		block_index >= record->block_count)
+		return false;
+
+	block_ref = &record->blocks[block_index];
+	return block_ref->in_use && block_ref->block_id == wal_block_id;
+}
+
 /*
  * fb_record_allows_init_for_block
  *    Replay helper.
@@ -1003,7 +1027,7 @@ fb_replay_note_record_missing_blocks(FbReplayControl *control,
 static bool
 fb_record_allows_init_for_block(const FbRecordRef *record, int block_index)
 {
-	if (record == NULL || !record->init_page || block_index != 0)
+	if (record == NULL || !record->init_page)
 		return false;
 
 	switch (record->kind)
@@ -1012,7 +1036,7 @@ fb_record_allows_init_for_block(const FbRecordRef *record, int block_index)
 		case FB_WAL_RECORD_HEAP_UPDATE:
 		case FB_WAL_RECORD_HEAP_HOT_UPDATE:
 		case FB_WAL_RECORD_HEAP2_MULTI_INSERT:
-			return true;
+			return fb_replay_record_block_has_wal_id(record, block_index, 0);
 		default:
 			return false;
 	}
@@ -1201,6 +1225,46 @@ fb_replay_raw_warm_visitor(XLogReaderState *reader, void *arg)
 	return true;
 }
 
+static bool
+fb_replay_raw_anchor_visitor(XLogReaderState *reader, void *arg)
+{
+	FbReplayRawAnchorVisitorState *state = (FbReplayRawAnchorVisitorState *) arg;
+	FbRecordRef record;
+	int block_index;
+
+	if (state == NULL || state->info == NULL || state->missing_blocks == NULL)
+		return true;
+	if (!fb_wal_decode_record_ref(reader, state->info, &record))
+		return true;
+
+	for (block_index = 0; block_index < record.block_count; block_index++)
+	{
+		const FbRecordBlockRef *block_ref = &record.blocks[block_index];
+		FbReplayMissingBlock *entry;
+		bool materializes;
+
+		entry = fb_replay_find_missing_block(state->missing_blocks, block_ref);
+		if (entry == NULL ||
+			XLogRecPtrIsInvalid(entry->first_record_lsn) ||
+			record.lsn >= entry->first_record_lsn)
+			continue;
+
+		materializes =
+			fb_record_block_has_materializing_image(block_ref) ||
+			fb_record_allows_init_for_block(&record, block_index);
+		if (!materializes)
+			continue;
+
+		if (!entry->anchor_found && state->unresolved > 0)
+			state->unresolved--;
+		entry->anchor_found = true;
+		entry->anchor_lsn = record.lsn;
+	}
+
+	fb_wal_release_record(&record);
+	return state->unresolved > 0;
+}
+
 /*
  * fb_replay_resolve_missing_anchors
  *    Replay helper.
@@ -1285,7 +1349,7 @@ fb_replay_resolve_missing_anchors(const FbRelationInfo *info,
 
 	cursor = fb_wal_record_cursor_open(index, FB_SPOOL_BACKWARD);
 	while (unresolved > 0 &&
-		   fb_wal_record_cursor_read(cursor, &record, &record_index))
+		   fb_wal_record_cursor_read_skeleton(cursor, &record, &record_index))
 	{
 		int block_index;
 
@@ -1309,6 +1373,40 @@ fb_replay_resolve_missing_anchors(const FbRelationInfo *info,
 		}
 	}
 	fb_wal_record_cursor_close(cursor);
+
+	if (unresolved > 0 &&
+		index != NULL &&
+		!XLogRecPtrIsInvalid(index->anchor_redo_lsn))
+	{
+		HASH_SEQ_STATUS seq;
+		FbReplayMissingBlock *entry;
+		XLogRecPtr raw_end_lsn = InvalidXLogRecPtr;
+		FbReplayRawAnchorVisitorState raw_state;
+
+		hash_seq_init(&seq, missing_blocks);
+		while ((entry = (FbReplayMissingBlock *) hash_seq_search(&seq)) != NULL)
+		{
+			if (entry->anchor_found || XLogRecPtrIsInvalid(entry->first_record_lsn))
+				continue;
+			if (XLogRecPtrIsInvalid(raw_end_lsn) ||
+				entry->first_record_lsn > raw_end_lsn)
+				raw_end_lsn = entry->first_record_lsn;
+		}
+
+		if (!XLogRecPtrIsInvalid(raw_end_lsn) && raw_end_lsn > index->anchor_redo_lsn)
+		{
+			MemSet(&raw_state, 0, sizeof(raw_state));
+			raw_state.info = info;
+			raw_state.missing_blocks = missing_blocks;
+			raw_state.unresolved = unresolved;
+			fb_wal_visit_resolved_records(index,
+										  index->anchor_redo_lsn,
+										  raw_end_lsn,
+										  fb_replay_raw_anchor_visitor,
+										  &raw_state);
+			unresolved = raw_state.unresolved;
+		}
+	}
 
 }
 
@@ -1509,7 +1607,7 @@ fb_replay_ensure_block_ready(FbReplayStore *store,
 		state->key.blkno = block_ref->blkno;
 	}
 
-	if (fb_record_block_has_applicable_image(block_ref) &&
+	if (fb_record_block_has_materializing_image(block_ref) &&
 		block_ref->image != NULL)
 	{
 		memcpy(state->page, block_ref->image, BLCKSZ);
@@ -1734,7 +1832,6 @@ fb_replay_sync_toast_page_if_image(const FbRecordBlockRef *block_ref,
 	if (block_ref == NULL || page == NULL ||
 		!block_ref->is_toast_relation ||
 		!block_ref->has_image ||
-		!block_ref->apply_image ||
 		toast_store == NULL ||
 		toast_tupdesc == NULL)
 		return;
@@ -1748,7 +1845,7 @@ fb_replay_block_needs_redo(const FbRecordBlockRef *block_ref)
 	if (block_ref == NULL)
 		return false;
 
-	return !fb_record_block_has_applicable_image(block_ref);
+	return !fb_record_block_has_materializing_image(block_ref);
 }
 
 /*
@@ -1981,10 +2078,14 @@ fb_replay_future_block_record_compose(const FbRecordRef *record,
 			xl_heap_update *xlrec = (xl_heap_update *) record->main_data;
 			bool image_applied =
 				fb_record_block_has_applicable_image(&record->blocks[block_index]);
+			bool is_new_block =
+				fb_replay_record_block_has_wal_id(record, block_index, 0);
+			bool is_old_block =
+				fb_replay_record_block_has_wal_id(record, block_index, 1);
 
-			if (record->block_count > 1)
+			if (is_new_block || is_old_block)
 			{
-				if (block_index == 0)
+				if (is_new_block)
 				{
 					if (fb_wal_record_block_materializes_page(record, block_index))
 					{
@@ -2134,12 +2235,20 @@ fb_replay_page_supports_future_same_block_record(const FbRecordRef *record,
 		case FB_WAL_RECORD_HEAP_INSERT:
 		{
 			xl_heap_insert *xlrec = (xl_heap_insert *) record->main_data;
+			int match_index = -1;
 
-			if (!fb_replay_block_ref_matches_key(&record->blocks[0], key))
+			for (int block_index = 0; block_index < record->block_count; block_index++)
+			{
+				if (!fb_replay_block_ref_matches_key(&record->blocks[block_index], key))
+					continue;
+				match_index = block_index;
+				break;
+			}
+			if (match_index < 0)
 				return true;
 			if (relevant != NULL)
 				*relevant = true;
-			if (fb_wal_record_block_materializes_page(record, 0))
+			if (fb_wal_record_block_materializes_page(record, match_index))
 				return true;
 			return fb_replay_page_has_insert_room(page, xlrec->offnum);
 		}
@@ -2149,32 +2258,36 @@ fb_replay_page_supports_future_same_block_record(const FbRecordRef *record,
 			xl_heap_update *xlrec = (xl_heap_update *) record->main_data;
 			bool matched = false;
 			bool supported = true;
+			int block_index;
 
-			if (record->block_count > 1)
+			for (block_index = 0; block_index < record->block_count; block_index++)
 			{
-				if (fb_replay_block_ref_matches_key(&record->blocks[1], key))
+				if (!fb_replay_block_ref_matches_key(&record->blocks[block_index], key))
+					continue;
+
+				matched = true;
+				if (fb_replay_record_block_has_wal_id(record, block_index, 1))
 				{
-					matched = true;
 					supported = fb_replay_get_old_tuple_from_page(page,
 															  xlrec->old_offnum,
 															  NULL) != NULL;
 				}
-				if (supported &&
-					fb_replay_block_ref_matches_key(&record->blocks[0], key))
+				else if (fb_replay_record_block_has_wal_id(record, block_index, 0))
 				{
-					matched = true;
-					if (!fb_wal_record_block_materializes_page(record, 0))
+					if (!fb_wal_record_block_materializes_page(record, block_index))
 						supported = fb_replay_page_has_insert_room(page,
 														   xlrec->new_offnum);
 				}
-			}
-			else if (fb_replay_block_ref_matches_key(&record->blocks[0], key))
-			{
-				matched = true;
-				supported = (fb_replay_get_old_tuple_from_page(page,
-														   xlrec->old_offnum,
-														   NULL) != NULL) &&
-					fb_replay_page_has_insert_room(page, xlrec->new_offnum);
+				else
+				{
+					supported = (fb_replay_get_old_tuple_from_page(page,
+															   xlrec->old_offnum,
+															   NULL) != NULL) &&
+						fb_replay_page_has_insert_room(page, xlrec->new_offnum);
+				}
+
+				if (!supported)
+					break;
 			}
 
 			if (matched && relevant != NULL)
@@ -2184,8 +2297,16 @@ fb_replay_page_supports_future_same_block_record(const FbRecordRef *record,
 		case FB_WAL_RECORD_HEAP_DELETE:
 		{
 			xl_heap_delete *xlrec = (xl_heap_delete *) record->main_data;
+			int match_index = -1;
 
-			if (!fb_replay_block_ref_matches_key(&record->blocks[0], key))
+			for (int block_index = 0; block_index < record->block_count; block_index++)
+			{
+				if (!fb_replay_block_ref_matches_key(&record->blocks[block_index], key))
+					continue;
+				match_index = block_index;
+				break;
+			}
+			if (match_index < 0)
 				return true;
 			if (relevant != NULL)
 				*relevant = true;
@@ -2194,8 +2315,16 @@ fb_replay_page_supports_future_same_block_record(const FbRecordRef *record,
 		case FB_WAL_RECORD_HEAP_LOCK:
 		{
 			xl_heap_lock *xlrec = (xl_heap_lock *) record->main_data;
+			int match_index = -1;
 
-			if (!fb_replay_block_ref_matches_key(&record->blocks[0], key))
+			for (int block_index = 0; block_index < record->block_count; block_index++)
+			{
+				if (!fb_replay_block_ref_matches_key(&record->blocks[block_index], key))
+					continue;
+				match_index = block_index;
+				break;
+			}
+			if (match_index < 0)
 				return true;
 			if (relevant != NULL)
 				*relevant = true;
@@ -2204,8 +2333,16 @@ fb_replay_page_supports_future_same_block_record(const FbRecordRef *record,
 		case FB_WAL_RECORD_HEAP_CONFIRM:
 		{
 			xl_heap_confirm *xlrec = (xl_heap_confirm *) record->main_data;
+			int match_index = -1;
 
-			if (!fb_replay_block_ref_matches_key(&record->blocks[0], key))
+			for (int block_index = 0; block_index < record->block_count; block_index++)
+			{
+				if (!fb_replay_block_ref_matches_key(&record->blocks[block_index], key))
+					continue;
+				match_index = block_index;
+				break;
+			}
+			if (match_index < 0)
 				return true;
 			if (relevant != NULL)
 				*relevant = true;
@@ -2214,8 +2351,16 @@ fb_replay_page_supports_future_same_block_record(const FbRecordRef *record,
 		case FB_WAL_RECORD_HEAP_INPLACE:
 		{
 			xl_heap_inplace *xlrec = (xl_heap_inplace *) record->main_data;
+			int match_index = -1;
 
-			if (!fb_replay_block_ref_matches_key(&record->blocks[0], key))
+			for (int block_index = 0; block_index < record->block_count; block_index++)
+			{
+				if (!fb_replay_block_ref_matches_key(&record->blocks[block_index], key))
+					continue;
+				match_index = block_index;
+				break;
+			}
+			if (match_index < 0)
 				return true;
 			if (relevant != NULL)
 				*relevant = true;
@@ -2224,8 +2369,16 @@ fb_replay_page_supports_future_same_block_record(const FbRecordRef *record,
 		case FB_WAL_RECORD_HEAP2_LOCK_UPDATED:
 		{
 			xl_heap_lock_updated *xlrec = (xl_heap_lock_updated *) record->main_data;
+			int match_index = -1;
 
-			if (!fb_replay_block_ref_matches_key(&record->blocks[0], key))
+			for (int block_index = 0; block_index < record->block_count; block_index++)
+			{
+				if (!fb_replay_block_ref_matches_key(&record->blocks[block_index], key))
+					continue;
+				match_index = block_index;
+				break;
+			}
+			if (match_index < 0)
 				return true;
 			if (relevant != NULL)
 				*relevant = true;
@@ -2588,6 +2741,23 @@ fb_replay_heap_insert(const FbRelationInfo *info,
 	ItemPointerData target_tid;
 	bool image_applied;
 	bool ready;
+	const char *phase = "none";
+
+	if (control != NULL)
+	{
+		switch (control->phase)
+		{
+			case FB_REPLAY_PHASE_DISCOVER:
+				phase = "discover";
+				break;
+			case FB_REPLAY_PHASE_WARM:
+				phase = "warm";
+				break;
+			case FB_REPLAY_PHASE_FINAL:
+				phase = "final";
+				break;
+		}
+	}
 
 	fb_replay_ensure_block_ready(store, block_ref, record, record->init_page,
 								 control, result, &state, &ready);
@@ -2668,7 +2838,9 @@ fb_replay_heap_insert(const FbRelationInfo *info,
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("failed to replay heap insert"),
-					 errdetail("lsn=%X/%08X rel=%u/%u/%u blk=%u off=%u image=%s apply_image=%s data=%s init_page=%s maxoff=%u has_item=%s lower=%u upper=%u exact_free=%u heap_free=%u page_lsn=%X/%08X lp23=%s lp24=%s lp41=%s",
+					 errdetail("phase=%s recidx=%u lsn=%X/%08X rel=%u/%u/%u blk=%u off=%u image=%s apply_image=%s data=%s init_page=%s maxoff=%u has_item=%s lower=%u upper=%u exact_free=%u heap_free=%u page_lsn=%X/%08X lp23=%s lp24=%s lp41=%s",
+							   phase,
+							   control != NULL ? control->record_index : 0,
 							   LSN_FORMAT_ARGS(record->lsn),
 							   FB_LOCATOR_SPCOID(block_ref->locator),
 							   FB_LOCATOR_DBOID(block_ref->locator),
@@ -3962,6 +4134,8 @@ fb_replay_run_pass(const FbRelationInfo *info,
 	FbRecordRef record;
 	uint32 record_index;
 	uint32 progress_stride = 1;
+	bool have_prev = false;
+	XLogRecPtr prev_record_lsn = InvalidXLogRecPtr;
 
 	if (index != NULL && index->record_count > 0)
 		progress_stride = Max((uint32) 1, index->record_count / 1024);
@@ -3972,6 +4146,19 @@ fb_replay_run_pass(const FbRelationInfo *info,
 		elog(ERROR, "failed to seek WAL cursor to record %u", start_record_index);
 	while (fb_wal_record_cursor_read(cursor, &record, &record_index))
 	{
+		/*
+		 * Summary locator replay can surface the same WAL record twice as
+		 * adjacent cursor entries. WAL record start LSNs are unique, so exact
+		 * repeated starts are safe to drop here.
+		 */
+		if (have_prev &&
+			!XLogRecPtrIsInvalid(prev_record_lsn) &&
+			record.lsn == prev_record_lsn)
+			continue;
+
+		have_prev = true;
+		prev_record_lsn = record.lsn;
+
 		if (!XLogRecPtrIsInvalid(lower_bound) && record.lsn < lower_bound)
 			continue;
 		if (!XLogRecPtrIsInvalid(upper_bound) && record.lsn >= upper_bound)

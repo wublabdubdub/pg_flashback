@@ -26,6 +26,9 @@ BEGIN
 	IF to_regprocedure('fb_replay_debug(regclass,timestamptz)') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_replay_debug(regclass, timestamptz)';
 	END IF;
+	IF to_regprocedure('fb_recordref_debug(regclass,timestamptz)') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_recordref_debug(regclass, timestamptz)';
+	END IF;
 	IF to_regprocedure('fb_replay_apply_image_contract_debug()') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_replay_apply_image_contract_debug()';
 	END IF;
@@ -73,6 +76,12 @@ CREATE FUNCTION fb_replay_debug(regclass, timestamptz)
 RETURNS text
 AS '$libdir/pg_flashback', 'fb_replay_debug'
 LANGUAGE C;
+
+CREATE FUNCTION fb_recordref_debug(regclass, timestamptz)
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_recordref_debug'
+LANGUAGE C
+STRICT;
 
 CREATE FUNCTION fb_replay_apply_image_contract_debug()
 RETURNS text
@@ -127,8 +136,8 @@ LANGUAGE C;
 SELECT fb_replay_apply_image_contract_debug() AS apply_image_contract
 \gset
 
-SELECT :'apply_image_contract' LIKE '%preserve_existing=true%' AS preserve_existing,
-	   :'apply_image_contract' LIKE '%materialize_requires_apply=true%' AS materialize_requires_apply;
+SELECT :'apply_image_contract' LIKE '%preserve_existing=false%' AS image_replaces_existing,
+	   :'apply_image_contract' LIKE '%materialize_requires_apply=false%' AS materialize_ignores_apply_flag;
 
 SELECT fb_wal_nonapply_image_spool_contract_debug() AS nonapply_image_spool_contract
 \gset
@@ -210,20 +219,48 @@ SELECT fb_summary_build_available_debug() > 0 AS built_summary;
 SELECT fb_summary_block_anchor_debug('fb_replay_target'::regclass) >= 0
 	   AS block_anchor_debug_callable;
 
+SET pg_flashback.parallel_workers = 2;
+
+SELECT fb_recordref_debug(
+		   'fb_replay_target'::regclass,
+		   (SELECT target_ts FROM fb_replay_mark)
+	   ) AS replay_recordref_summary
+\gset
+
+SELECT substring(:'replay_recordref_summary'
+				 FROM 'summary_payload_locator_records=([0-9]+)')::bigint > 0
+	   AS replay_uses_payload_locators,
+	   :'replay_recordref_summary' LIKE '%payload_scan_mode=locator%'
+	   AS replay_prefers_locator_mode;
+
+SELECT fb_replay_debug(
+		   'fb_replay_target'::regclass,
+		   (SELECT target_ts FROM fb_replay_mark)
+	   ) AS replay_debug_summary
+\gset
+
 SELECT substring(
-		   fb_replay_debug(
-			   'fb_replay_target'::regclass,
-			   (SELECT target_ts FROM fb_replay_mark)
-		   )
+		   :'replay_debug_summary'
 		   FROM 'precomputed_missing_blocks=([0-9]+)')::int = 0
 	   AS avoids_precomputed_missing_blocks,
 	   substring(
-		   fb_replay_debug(
-			   'fb_replay_target'::regclass,
-			   (SELECT target_ts FROM fb_replay_mark)
-		   )
+		   :'replay_debug_summary'
 		   FROM 'discover_rounds=([0-9]+)')::int = 0
-	   AS skips_discover_rounds;
+	   AS skips_discover_rounds,
+	   substring(
+		   :'replay_debug_summary'
+		   FROM 'record_materializer_resets=([0-9]+)')::bigint >= 1
+	   AS tracks_record_materializer_resets,
+	   substring(
+		   :'replay_debug_summary'
+		   FROM 'record_materializer_reuses=([0-9]+)')::bigint > 0
+	   AS reuses_record_materializer,
+	   substring(
+		   :'replay_debug_summary'
+		   FROM 'locator_stub_materializations=([0-9]+)')::bigint > 0
+	   AS materializes_locator_stubs;
+
+SET pg_flashback.parallel_workers = 0;
 
 SELECT *
 FROM pg_flashback(
@@ -231,3 +268,5 @@ FROM pg_flashback(
 	(SELECT target_ts::text FROM fb_replay_mark)
 )
 ORDER BY id;
+
+\echo fb_replay_end

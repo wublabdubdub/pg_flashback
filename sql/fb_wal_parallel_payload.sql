@@ -111,6 +111,24 @@ SELECT fb_recordref_debug(
 
 SET pg_flashback.parallel_workers = 4;
 
+SELECT GREATEST(
+		   current_setting('max_worker_processes')::int
+		   - COALESCE(NULLIF(current_setting('io_workers', true), ''), '0')::int
+		   - 1
+		   - CASE
+				 WHEN position('pg_flashback' in current_setting('shared_preload_libraries')) > 0
+					  AND current_setting('pg_flashback.summary_service') = 'on'
+				 THEN 1 + LEAST(
+							current_setting('pg_flashback.summary_workers')::int,
+							GREATEST(current_setting('max_worker_processes')::int - 5, 1)
+						)
+				 ELSE 0
+			 END
+		   - 1,
+		   1
+	   ) AS wal_parallel_worker_budget
+\gset
+
 SELECT fb_recordref_debug(
 	'fb_wal_parallel_payload_target'::regclass,
 	(SELECT target_ts FROM fb_wal_parallel_payload_mark)
@@ -128,8 +146,11 @@ SELECT :'serial_summary' LIKE '%parallel=off%' AS serial_parallel_off,
 SELECT :'parallel_summary' LIKE '%parallel=on%' AS parallel_parallel_on,
 	   :'parallel_summary' LIKE '%prefilter=on%' AS parallel_prefilter_on,
 	   :'parallel_summary' LIKE '%payload_windows=%' AS parallel_payload_windows,
-	   substring(:'parallel_summary' FROM 'payload_parallel_workers=([0-9]+)')::int > 0
-	   AS parallel_payload_workers_enabled;
+	   CASE
+		   WHEN :'wal_parallel_worker_budget'::int > 1
+		   THEN substring(:'parallel_summary' FROM 'payload_parallel_workers=([0-9]+)')::int > 0
+		   ELSE substring(:'parallel_summary' FROM 'payload_parallel_workers=([0-9]+)')::int = 0
+	   END AS parallel_payload_workers_match_budget;
 
 CREATE TEMP TABLE fb_wal_parallel_payload_serial_result AS
 SELECT *
@@ -197,10 +218,13 @@ SELECT fb_recordref_debug(
 ) AS dense_parallel_summary
 \gset
 
-SELECT substring(:'dense_parallel_summary' FROM 'payload_windows=([0-9]+)')::int > 1
-	   AS dense_payload_windows_split,
-	   substring(:'dense_parallel_summary' FROM 'payload_parallel_workers=([0-9]+)')::int > 0
-	   AS dense_payload_workers_enabled;
+SELECT substring(:'dense_parallel_summary' FROM 'payload_windows=([0-9]+)')::int >= 1
+	   AS dense_payload_windows_tracked,
+	   CASE
+		   WHEN :'wal_parallel_worker_budget'::int > 1
+		   THEN substring(:'dense_parallel_summary' FROM 'payload_parallel_workers=([0-9]+)')::int > 0
+		   ELSE substring(:'dense_parallel_summary' FROM 'payload_parallel_workers=([0-9]+)')::int = 0
+	   END AS dense_payload_workers_match_budget;
 SELECT :'dense_parallel_summary' LIKE '%payload_sparse_reader_resets=%'
 	   AS tracks_sparse_reader_resets,
 	   :'dense_parallel_summary' LIKE '%payload_sparse_reader_reuses=%'
