@@ -47,3 +47,45 @@ FROM pg_flashback(
 	(SELECT target_ts::text FROM fb_flashback_bag_mark)
 )
 ORDER BY 1, 2;
+
+CREATE TABLE fb_flashback_bag_residual_target (
+	id integer,
+	payload text
+);
+
+CREATE TABLE fb_flashback_bag_residual_mark (
+	label text PRIMARY KEY,
+	target_ts timestamptz NOT NULL
+);
+
+INSERT INTO fb_flashback_bag_residual_target
+VALUES (1, 'seed'),
+	   (2, 'keep');
+
+INSERT INTO fb_flashback_bag_residual_mark
+VALUES ('after_insert', clock_timestamp());
+
+UPDATE fb_flashback_bag_residual_target
+SET payload = 'changed'
+WHERE id = 1;
+
+INSERT INTO fb_flashback_bag_residual_mark
+VALUES ('after_update', clock_timestamp());
+
+DELETE FROM fb_flashback_bag_residual_target
+WHERE id = 1;
+
+INSERT INTO fb_flashback_bag_residual_mark
+VALUES ('after_delete_one', clock_timestamp());
+
+DELETE FROM fb_flashback_bag_residual_target;
+VACUUM fb_flashback_bag_residual_target;
+
+SELECT mark.label,
+	   fb.*
+FROM fb_flashback_bag_residual_mark mark
+CROSS JOIN LATERAL pg_flashback(
+	NULL::public.fb_flashback_bag_residual_target,
+	mark.target_ts::text
+) AS fb
+ORDER BY 1, 2, 3;

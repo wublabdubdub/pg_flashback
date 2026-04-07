@@ -30,6 +30,9 @@ BEGIN
 	IF to_regprocedure('fb_replay_apply_image_contract_debug()') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_replay_apply_image_contract_debug()';
 	END IF;
+	IF to_regprocedure('fb_replay_heap_update_same_block_init_contract_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_replay_heap_update_same_block_init_contract_debug()';
+	END IF;
 	IF to_regprocedure('fb_wal_nonapply_image_spool_contract_debug()') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_wal_nonapply_image_spool_contract_debug()';
 	END IF;
@@ -80,6 +83,10 @@ CREATE FUNCTION fb_replay_apply_image_contract_debug()
 RETURNS text
 AS '$libdir/pg_flashback', 'fb_replay_apply_image_contract_debug'
 LANGUAGE C;
+CREATE FUNCTION fb_replay_heap_update_same_block_init_contract_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_replay_heap_update_same_block_init_contract_debug'
+LANGUAGE C;
 CREATE FUNCTION fb_wal_nonapply_image_spool_contract_debug()
 RETURNS text
 AS '$libdir/pg_flashback', 'fb_wal_nonapply_image_spool_contract_debug'
@@ -123,6 +130,15 @@ SELECT :'apply_image_contract' LIKE '%preserve_existing=false%' AS image_replace
  image_replaces_existing | materialize_ignores_apply_flag 
 -------------------------+--------------------------------
  t                       | t
+(1 row)
+
+SELECT fb_replay_heap_update_same_block_init_contract_debug() AS same_block_update_init_contract
+\gset
+SELECT :'same_block_update_init_contract' LIKE '%same_block_update_allow_init=true%' AS same_block_update_allows_init,
+	   :'same_block_update_init_contract' LIKE '%same_block_update_ready=true%' AS same_block_update_init_ready;
+ same_block_update_allows_init | same_block_update_init_ready 
+-------------------------------+------------------------------
+ t                             | t
 (1 row)
 
 SELECT fb_wal_nonapply_image_spool_contract_debug() AS nonapply_image_spool_contract
@@ -234,6 +250,24 @@ SELECT fb_summary_block_anchor_debug('fb_replay_target'::regclass) >= 0
  t
 (1 row)
 
+DO $$
+DECLARE
+	summary text;
+	tries integer;
+BEGIN
+	FOR tries IN 1..50 LOOP
+		SELECT fb_recordref_debug(
+				   'fb_replay_target'::regclass,
+				   (SELECT target_ts FROM fb_replay_mark)
+			   )
+		  INTO summary;
+		EXIT WHEN coalesce(
+			substring(summary FROM 'summary_payload_locator_records=([0-9]+)')::int,
+			0) > 0;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END;
+$$;
 SET pg_flashback.parallel_workers = 2;
 SELECT fb_recordref_debug(
 		   'fb_replay_target'::regclass,

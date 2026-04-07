@@ -39,13 +39,15 @@ PG_FUNCTION_INFO_V1(fb_summary_block_anchor_debug);
 PG_FUNCTION_INFO_V1(fb_summary_meta_stats_debug);
 PG_FUNCTION_INFO_V1(fb_summary_path_debug);
 PG_FUNCTION_INFO_V1(fb_summary_v6_rejected_debug);
+PG_FUNCTION_INFO_V1(fb_summary_candidate_debug);
+PG_FUNCTION_INFO_V1(fb_summary_build_candidate_debug);
 
 #define FB_SUMMARY_MAGIC ((uint32) 0x4642534d)
 /*
- * v7 invalidates stale v6 summary files generated before the current summary
- * span builder fixes, forcing a rebuild from WAL.
+ * v10 invalidates stale v9 summary files generated before the current
+ * RM_XACT xid-outcome parse fix, forcing a rebuild from WAL.
  */
-#define FB_SUMMARY_VERSION 9
+#define FB_SUMMARY_VERSION 10
 #define FB_SUMMARY_LOCATOR_BLOOM_BYTES 64
 #define FB_SUMMARY_RELTAG_BLOOM_BYTES 64
 #define FB_SUMMARY_SECTION_COUNT 7
@@ -327,6 +329,7 @@ typedef struct FbSummaryQueryCacheEntry
 	FbSummaryDiskBlockAnchor *block_anchors;
 	FbSummaryDiskPayloadLocator *payload_locators;
 	struct FbSummaryQueryPayloadLocatorSlice *payload_locator_public_slices;
+	struct FbSummaryQuerySpanSlice *spans_public;
 } FbSummaryQueryCacheEntry;
 
 typedef struct FbSummaryQueryPayloadLocatorSlice
@@ -336,20 +339,33 @@ typedef struct FbSummaryQueryPayloadLocatorSlice
 	bool ready;
 } FbSummaryQueryPayloadLocatorSlice;
 
+typedef struct FbSummaryQuerySpanSlice
+{
+	FbSummarySpan *spans;
+	uint32 count;
+	uint64 relation_identity_hash;
+	bool ready;
+} FbSummaryQuerySpanSlice;
+
 struct FbSummaryQueryCache
 {
 	HTAB *entries;
 	MemoryContext mcxt;
 	uint64 payload_locator_public_builds;
+	uint64 span_public_builds;
 };
 
 static uint64 fb_summary_hash_bytes(uint64 seed, const void *data, Size len);
 static TransactionId fb_summary_record_xid(XLogReaderState *reader);
-static uint64 fb_summary_file_identity_hash(const char *path, const struct stat *st);
+static uint64 fb_summary_file_identity_hash(const char *path,
+											const struct stat *st,
+											int source_kind);
+static int fb_summary_source_kind_for_path(const char *path);
 static bool fb_summary_file_path_into(char *summary_path,
 									  Size summary_path_len,
 									  const char *path,
-									  const struct stat *st);
+									  const struct stat *st,
+									  int source_kind);
 static char *fb_summary_file_path(const char *path, const struct stat *st);
 static bool fb_summary_load_file(const char *path,
 								 off_t bytes,
@@ -432,6 +448,7 @@ static bool fb_summary_record_block_is_anchor(XLogReaderState *reader,
 											  uint16 *flags_out);
 static void fb_summary_note_record(XLogReaderState *reader,
 								   FbSummaryBuildState *state);
+static bool fb_summary_record_tracks_xid(XLogReaderState *reader);
 static bool fb_summary_record_payload_kind(XLogReaderState *reader,
 										   uint8 *kind_out,
 										   uint8 *flags_out);
@@ -479,6 +496,12 @@ static bool fb_summary_cache_get_payload_locator_slice(FbSummaryQueryCache *cach
 													   int wal_seg_size,
 													   FbSummaryPayloadLocator **locators_out,
 													   uint32 *locator_count_out);
+static uint64 fb_summary_relation_info_identity_hash(const FbRelationInfo *info);
+static bool fb_summary_cache_get_span_slice(FbSummaryQueryCache *cache,
+											FbSummaryQueryCacheEntry *entry,
+											const FbRelationInfo *info,
+											const FbSummarySpan **spans_out,
+											uint32 *span_count_out);
 static int fb_summary_transactionid_cmp(const void *lhs, const void *rhs);
 static bool fb_summary_cache_get_xid_outcome_slice(FbSummaryQueryCacheEntry *entry,
 												   MemoryContext mcxt,
@@ -545,42 +568,93 @@ fb_summary_record_xid(XLogReaderState *reader)
 }
 
 static uint64
-fb_summary_file_identity_hash(const char *path, const struct stat *st)
+fb_summary_file_identity_hash(const char *path,
+							 const struct stat *st,
+							 int source_kind)
 {
 	uint64 hash = UINT64CONST(1469598103934665603);
+	const char *segment_name;
+	uint16 source_kind16;
 	off_t bytes;
-	time_t mtime_sec;
-	long mtime_nsec = 0;
-	time_t ctime_sec;
-	long ctime_nsec = 0;
 
 	if (st == NULL)
 		return hash;
 
+	segment_name = strrchr(path, '/');
+	segment_name = (segment_name == NULL) ? path : (segment_name + 1);
+	source_kind16 = (uint16) source_kind;
 	bytes = st->st_size;
-	mtime_sec = st->st_mtime;
-	ctime_sec = st->st_ctime;
-#if defined(__APPLE__)
-	mtime_nsec = st->st_mtimespec.tv_nsec;
-	ctime_nsec = st->st_ctimespec.tv_nsec;
-#else
-	mtime_nsec = st->st_mtim.tv_nsec;
-	ctime_nsec = st->st_ctim.tv_nsec;
-#endif
-	hash = fb_summary_hash_bytes(hash, path, strlen(path));
+
+	hash = fb_summary_hash_bytes(hash, &source_kind16, sizeof(source_kind16));
+	hash = fb_summary_hash_bytes(hash, segment_name, strlen(segment_name));
 	hash = fb_summary_hash_bytes(hash, &bytes, sizeof(bytes));
-	hash = fb_summary_hash_bytes(hash, &mtime_sec, sizeof(mtime_sec));
-	hash = fb_summary_hash_bytes(hash, &mtime_nsec, sizeof(mtime_nsec));
-	hash = fb_summary_hash_bytes(hash, &ctime_sec, sizeof(ctime_sec));
-	hash = fb_summary_hash_bytes(hash, &ctime_nsec, sizeof(ctime_nsec));
 	return hash;
+}
+
+static int
+fb_summary_source_kind_for_path(const char *path)
+{
+	char *archive_dir = NULL;
+	char *pg_wal_dir = NULL;
+	char *recovered_dir = NULL;
+	FbArchiveDirSource archive_source;
+	int source_kind = FB_SUMMARY_SOURCE_ARCHIVE_DEST;
+	Size path_len;
+	Size archive_len = 0;
+	Size pg_wal_len = 0;
+	Size recovered_len = 0;
+
+	if (path == NULL)
+		return source_kind;
+
+	path_len = strlen(path);
+	archive_dir = fb_try_resolve_archive_dir(&archive_source, NULL);
+	pg_wal_dir = fb_get_pg_wal_dir();
+	recovered_dir = fb_runtime_recovered_wal_dir();
+
+	if (archive_dir != NULL)
+		archive_len = strlen(archive_dir);
+	if (pg_wal_dir != NULL)
+		pg_wal_len = strlen(pg_wal_dir);
+	if (recovered_dir != NULL)
+		recovered_len = strlen(recovered_dir);
+
+	if (archive_len > 0 &&
+		path_len > archive_len &&
+		strncmp(path, archive_dir, archive_len) == 0 &&
+		path[archive_len] == '/')
+	{
+		source_kind = (archive_source == FB_ARCHIVE_DIR_SOURCE_LEGACY_DIR) ?
+			FB_SUMMARY_SOURCE_ARCHIVE_DIR_LEGACY :
+			FB_SUMMARY_SOURCE_ARCHIVE_DEST;
+	}
+	else if (pg_wal_len > 0 &&
+			 path_len > pg_wal_len &&
+			 strncmp(path, pg_wal_dir, pg_wal_len) == 0 &&
+			 path[pg_wal_len] == '/')
+		source_kind = FB_SUMMARY_SOURCE_PG_WAL;
+	else if (recovered_len > 0 &&
+			 path_len > recovered_len &&
+			 strncmp(path, recovered_dir, recovered_len) == 0 &&
+			 path[recovered_len] == '/')
+		source_kind = FB_SUMMARY_SOURCE_CKWAL;
+
+	if (archive_dir != NULL)
+		pfree(archive_dir);
+	if (pg_wal_dir != NULL)
+		pfree(pg_wal_dir);
+	if (recovered_dir != NULL)
+		pfree(recovered_dir);
+
+	return source_kind;
 }
 
 static bool
 fb_summary_file_path_into(char *summary_path,
 						  Size summary_path_len,
 						  const char *path,
-						  const struct stat *st)
+						  const struct stat *st,
+						  int source_kind)
 {
 	char summary_dir[MAXPGPATH];
 	uint64 identity_hash;
@@ -594,7 +668,7 @@ fb_summary_file_path_into(char *summary_path,
 	if (written < 0 || written >= (int) sizeof(summary_dir))
 		return false;
 
-	identity_hash = fb_summary_file_identity_hash(path, st);
+	identity_hash = fb_summary_file_identity_hash(path, st, source_kind);
 	written = snprintf(summary_path, summary_path_len,
 					   "%s/summary-%016llx.meta",
 					   summary_dir,
@@ -609,8 +683,10 @@ static char *
 fb_summary_file_path(const char *path, const struct stat *st)
 {
 	char summary_path[MAXPGPATH];
+	int source_kind = fb_summary_source_kind_for_path(path);
 
-	if (!fb_summary_file_path_into(summary_path, sizeof(summary_path), path, st))
+	if (!fb_summary_file_path_into(summary_path, sizeof(summary_path), path, st,
+								   source_kind))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("summary file path exceeds MAXPGPATH"),
@@ -643,8 +719,9 @@ fb_summary_open_validated_file(const char *path,
 	if (path == NULL || file == NULL || stat(path, &st) != 0)
 		return false;
 
-	file_identity_hash = fb_summary_file_identity_hash(path, &st);
-	if (!fb_summary_file_path_into(summary_path, sizeof(summary_path), path, &st))
+	file_identity_hash = fb_summary_file_identity_hash(path, &st, source_kind);
+	if (!fb_summary_file_path_into(summary_path, sizeof(summary_path), path, &st,
+								   source_kind))
 		return false;
 	fd = open(summary_path, O_RDONLY | PG_BINARY, 0);
 	if (fd < 0)
@@ -1378,6 +1455,27 @@ fb_summary_relation_entry_matches_info(const FbSummaryDiskRelationEntry *entry,
 	return false;
 }
 
+static uint64
+fb_summary_relation_info_identity_hash(const FbRelationInfo *info)
+{
+	uint64 hash = UINT64CONST(1469598103934665603);
+
+	if (info == NULL)
+		return hash;
+
+	hash = fb_summary_hash_bytes(hash, &info->locator, sizeof(info->locator));
+	hash = fb_summary_hash_bytes(hash, &info->relid, sizeof(info->relid));
+	hash = fb_summary_hash_bytes(hash,
+								 &info->has_toast_locator,
+								 sizeof(info->has_toast_locator));
+	if (info->has_toast_locator)
+		hash = fb_summary_hash_bytes(hash,
+									 &info->toast_locator,
+									 sizeof(info->toast_locator));
+	hash = fb_summary_hash_bytes(hash, &info->toast_relid, sizeof(info->toast_relid));
+	return hash;
+}
+
 static int
 fb_summary_block_anchor_public_cmp(const void *lhs, const void *rhs)
 {
@@ -1715,6 +1813,34 @@ fb_summary_open_file_at_path(const char *path)
 }
 
 static bool
+fb_summary_record_tracks_xid(XLogReaderState *reader)
+{
+	uint8 rmid;
+	uint8 info_code;
+
+	if (reader == NULL)
+		return false;
+
+	rmid = XLogRecGetRmid(reader);
+	if (rmid == RM_HEAP_ID)
+	{
+		info_code = XLogRecGetInfo(reader) & XLOG_HEAP_OPMASK;
+		return info_code == XLOG_HEAP_INSERT ||
+			info_code == XLOG_HEAP_DELETE ||
+			info_code == XLOG_HEAP_UPDATE ||
+			info_code == XLOG_HEAP_HOT_UPDATE ||
+			info_code == XLOG_HEAP_INPLACE;
+	}
+	if (rmid == RM_HEAP2_ID)
+	{
+		info_code = XLogRecGetInfo(reader) & XLOG_HEAP_OPMASK;
+		return info_code == XLOG_HEAP2_MULTI_INSERT;
+	}
+
+	return false;
+}
+
+static bool
 fb_summary_record_payload_kind(XLogReaderState *reader,
 							   uint8 *kind_out,
 							   uint8 *flags_out)
@@ -1820,6 +1946,7 @@ fb_summary_note_record(XLogReaderState *reader, FbSummaryBuildState *state)
 	TransactionId top_xid;
 	uint8 payload_kind = 0;
 	bool payload_candidate;
+	bool track_xid;
 	uint16 payload_slots[16];
 	uint32 payload_slot_count = 0;
 
@@ -1833,6 +1960,7 @@ fb_summary_note_record(XLogReaderState *reader, FbSummaryBuildState *state)
 	top_xid = FB_XLOGREC_GET_TOP_XID(reader);
 	state->file.flags |= (1U << Min((unsigned int) rmid, 31U));
 	payload_candidate = fb_summary_record_payload_kind(reader, &payload_kind, NULL);
+	track_xid = fb_summary_record_tracks_xid(reader);
 
 	for (block_id = 0; block_id <= FB_XLOGREC_MAX_BLOCK_ID(reader); block_id++)
 	{
@@ -1850,9 +1978,12 @@ fb_summary_note_record(XLogReaderState *reader, FbSummaryBuildState *state)
 		fb_summary_add_locator(state, &locator);
 		entry = fb_summary_get_or_add_locator_relation(state, &locator);
 		fb_summary_relation_append_span(entry, record_start, record_end, 0);
-		fb_summary_relation_append_touched_xid(entry, xid);
-		if (TransactionIdIsValid(top_xid) && top_xid != xid)
-			fb_summary_relation_append_touched_xid(entry, top_xid);
+		if (track_xid)
+		{
+			fb_summary_relation_append_touched_xid(entry, xid);
+			if (TransactionIdIsValid(top_xid) && top_xid != xid)
+				fb_summary_relation_append_touched_xid(entry, top_xid);
+		}
 		if (fb_summary_record_block_is_anchor(reader, block_id, &anchor_flags))
 			fb_summary_relation_append_block_anchor(entry,
 													&locator,
@@ -1990,6 +2121,7 @@ fb_summary_note_record(XLogReaderState *reader, FbSummaryBuildState *state)
 	}
 	else if (rmid == RM_XACT_ID)
 	{
+		uint8 info = XLogRecGetInfo(reader);
 		uint8 info_code = XLogRecGetInfo(reader) & XLOG_XACT_OPMASK;
 
 		if (info_code == XLOG_XACT_COMMIT ||
@@ -1999,7 +2131,7 @@ fb_summary_note_record(XLogReaderState *reader, FbSummaryBuildState *state)
 				xl_xact_parsed_commit parsed;
 				int i;
 
-				ParseCommitRecord(info_code, xlrec, &parsed);
+				ParseCommitRecord(info, xlrec, &parsed);
 			fb_summary_note_xact_timestamp(state, parsed.xact_time);
 			fb_summary_note_xid_outcome(state,
 										xid,
@@ -2020,7 +2152,7 @@ fb_summary_note_record(XLogReaderState *reader, FbSummaryBuildState *state)
 				xl_xact_parsed_abort parsed;
 				int i;
 
-				ParseAbortRecord(info_code, xlrec, &parsed);
+				ParseAbortRecord(info, xlrec, &parsed);
 			fb_summary_note_xact_timestamp(state, parsed.xact_time);
 			fb_summary_note_xid_outcome(state,
 										xid,
@@ -2484,7 +2616,7 @@ fb_summary_build_file_for_segment(const FbSummarySegmentEntry *entry,
 	state.file.version = FB_SUMMARY_VERSION;
 	state.file.source_kind = (uint16) entry->source_kind;
 	state.file.file_identity_hash =
-		fb_summary_file_identity_hash(entry->path, &st);
+		fb_summary_file_identity_hash(entry->path, &st, entry->source_kind);
 	state.file.timeline_id = entry->timeline_id;
 	state.file.wal_seg_size = wal_seg_size;
 	state.file.segno = entry->segno;
@@ -3091,6 +3223,109 @@ fb_summary_cache_get_payload_locator_slice(FbSummaryQueryCache *cache,
 }
 
 static bool
+fb_summary_cache_get_span_slice(FbSummaryQueryCache *cache,
+								FbSummaryQueryCacheEntry *entry,
+								const FbRelationInfo *info,
+								const FbSummarySpan **spans_out,
+								uint32 *span_count_out)
+{
+	FbSummaryQuerySpanSlice *slice;
+	uint64 relation_identity_hash;
+	uint32 count = 0;
+	uint32 i;
+
+	if (spans_out != NULL)
+		*spans_out = NULL;
+	if (span_count_out != NULL)
+		*span_count_out = 0;
+	if (cache == NULL || entry == NULL || info == NULL)
+		return false;
+
+	if (entry->spans_public == NULL)
+	{
+		entry->spans_public = MemoryContextAllocZero(cache->mcxt,
+													 sizeof(*entry->spans_public));
+	}
+
+	slice = entry->spans_public;
+	relation_identity_hash = fb_summary_relation_info_identity_hash(info);
+	if (slice->ready && slice->relation_identity_hash == relation_identity_hash)
+	{
+		if (spans_out != NULL)
+			*spans_out = slice->spans;
+		if (span_count_out != NULL)
+			*span_count_out = slice->count;
+		return true;
+	}
+
+	if (entry->file.relation_entry_count == 0)
+	{
+		slice->ready = true;
+		slice->relation_identity_hash = relation_identity_hash;
+		if (spans_out != NULL)
+			*spans_out = NULL;
+		if (span_count_out != NULL)
+			*span_count_out = 0;
+		return true;
+	}
+	if (entry->relations == NULL)
+		elog(ERROR, "summary relation entry section is missing");
+	if (entry->spans == NULL && entry->file.relation_span_count > 0)
+		elog(ERROR, "summary relation span section is missing");
+
+	for (i = 0; i < entry->file.relation_entry_count; i++)
+	{
+		FbSummaryDiskRelationEntry *relation = &entry->relations[i];
+
+		if (!fb_summary_relation_entry_matches_info(relation, info))
+			continue;
+		count += relation->span_count;
+	}
+
+	if (slice->spans != NULL)
+		pfree(slice->spans);
+	slice->spans = NULL;
+	slice->count = 0;
+
+	if (count > 0)
+	{
+		uint32 span_index = 0;
+
+		slice->spans = MemoryContextAlloc(cache->mcxt, sizeof(*slice->spans) * count);
+		for (i = 0; i < entry->file.relation_entry_count; i++)
+		{
+			FbSummaryDiskRelationEntry *relation = &entry->relations[i];
+			uint32 j;
+
+			if (!fb_summary_relation_entry_matches_info(relation, info))
+				continue;
+
+			for (j = 0; j < relation->span_count; j++)
+			{
+				FbSummaryDiskRelationSpan *src =
+					&entry->spans[relation->first_span + j];
+
+				slice->spans[span_index].start_lsn = src->start_lsn;
+				slice->spans[span_index].end_lsn = src->end_lsn;
+				slice->spans[span_index].flags = src->flags;
+				span_index++;
+			}
+		}
+		slice->count = count;
+	}
+
+	slice->relation_identity_hash = relation_identity_hash;
+	slice->ready = true;
+	cache->span_public_builds++;
+
+	if (spans_out != NULL)
+		*spans_out = slice->spans;
+	if (span_count_out != NULL)
+		*span_count_out = slice->count;
+	return true;
+}
+
+static bool
 fb_summary_cache_get_or_load(const char *path,
 							 off_t bytes,
 							 TimeLineID timeline_id,
@@ -3112,7 +3347,7 @@ fb_summary_cache_get_or_load(const char *path,
 	if (cache == NULL || cache->entries == NULL || path == NULL || stat(path, &st) != 0)
 		return false;
 
-	file_identity_hash = fb_summary_file_identity_hash(path, &st);
+	file_identity_hash = fb_summary_file_identity_hash(path, &st, source_kind);
 	entry = (FbSummaryQueryCacheEntry *) hash_search(cache->entries,
 													 &file_identity_hash,
 													 HASH_ENTER,
@@ -3220,7 +3455,7 @@ fb_summary_segment_lookup_spans(const char *path,
 								 int wal_seg_size,
 								 int source_kind,
 								 const FbRelationInfo *info,
-								 FbSummarySpan **spans_out,
+								 const FbSummarySpan **spans_out,
 								 uint32 *span_count_out)
 {
 	return fb_summary_segment_lookup_spans_cached(path,
@@ -3265,13 +3500,10 @@ fb_summary_segment_lookup_spans_cached(const char *path,
 										int source_kind,
 										const FbRelationInfo *info,
 										FbSummaryQueryCache *cache,
-										FbSummarySpan **spans_out,
+										const FbSummarySpan **spans_out,
 										uint32 *span_count_out)
 {
 	FbSummaryQueryCacheEntry *cache_entry = NULL;
-	FbSummarySpan *spans = NULL;
-	uint32 match_count = 0;
-	uint32 i;
 
 	if (spans_out != NULL)
 		*spans_out = NULL;
@@ -3296,51 +3528,11 @@ fb_summary_segment_lookup_spans_cached(const char *path,
 
 	if (cache_entry == NULL)
 		return false;
-	if (cache_entry->file.relation_entry_count == 0)
-		return true;
-	if (cache_entry->relations == NULL)
-		elog(ERROR, "summary relation entry section is missing");
-	if (cache_entry->spans == NULL && cache_entry->file.relation_span_count > 0)
-		elog(ERROR, "summary relation span section is missing");
-
-	for (i = 0; i < cache_entry->file.relation_entry_count; i++)
-	{
-		FbSummaryDiskRelationEntry *entry = &cache_entry->relations[i];
-
-		if (!fb_summary_relation_entry_matches_info(entry, info))
-			continue;
-		match_count += entry->span_count;
-	}
-
-	if (match_count > 0)
-		spans = palloc(sizeof(*spans) * match_count);
-
-	match_count = 0;
-	for (i = 0; i < cache_entry->file.relation_entry_count; i++)
-	{
-		uint32 j;
-		FbSummaryDiskRelationEntry *entry = &cache_entry->relations[i];
-
-		if (!fb_summary_relation_entry_matches_info(entry, info))
-			continue;
-
-		for (j = 0; j < entry->span_count; j++)
-		{
-			FbSummaryDiskRelationSpan *src = &cache_entry->spans[entry->first_span + j];
-			spans[match_count].start_lsn = src->start_lsn;
-			spans[match_count].end_lsn = src->end_lsn;
-			spans[match_count].flags = src->flags;
-			match_count++;
-		}
-	}
-
-	if (spans_out != NULL)
-		*spans_out = spans;
-	else if (spans != NULL)
-		pfree(spans);
-	if (span_count_out != NULL)
-		*span_count_out = match_count;
-	return true;
+	return fb_summary_cache_get_span_slice(cache,
+										   cache_entry,
+										   info,
+										   spans_out,
+										   span_count_out);
 }
 
 bool
@@ -4015,6 +4207,15 @@ fb_summary_query_cache_payload_locator_public_builds(FbSummaryQueryCache *cache)
 	return cache->payload_locator_public_builds;
 }
 
+uint64
+fb_summary_query_cache_span_public_builds(FbSummaryQueryCache *cache)
+{
+	if (cache == NULL)
+		return 0;
+
+	return cache->span_public_builds;
+}
+
 int
 fb_summary_collect_build_candidates(FbSummaryBuildCandidate **candidates_out,
 									 bool skip_unstable_tail)
@@ -4182,7 +4383,8 @@ fb_summary_candidate_identity_hash(const FbSummaryBuildCandidate *candidate)
 
 	if (candidate == NULL || stat(candidate->path, &st) != 0)
 		return 0;
-	return fb_summary_file_identity_hash(candidate->path, &st);
+	return fb_summary_file_identity_hash(candidate->path, &st,
+										 candidate->source_kind);
 }
 
 uint64
@@ -4330,7 +4532,8 @@ fb_summary_path_debug(PG_FUNCTION_ARGS)
 	if (stat(wal_path, &st) != 0)
 		PG_RETURN_NULL();
 	if (!fb_summary_file_path_into(summary_path, sizeof(summary_path),
-								   wal_path, &st))
+								   wal_path, &st,
+								   fb_summary_source_kind_for_path(wal_path)))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("summary file path exceeds MAXPGPATH"),
@@ -4377,7 +4580,8 @@ fb_summary_v6_rejected_debug(PG_FUNCTION_ARGS)
 	}
 
 	if (!fb_summary_file_path_into(summary_path, sizeof(summary_path),
-								   candidate->path, &st))
+								   candidate->path, &st,
+								   candidate->source_kind))
 	{
 		fb_summary_free_build_candidates(candidates);
 		elog(ERROR, "failed to build debug summary path");
@@ -4449,4 +4653,136 @@ fb_summary_v6_rejected_debug(PG_FUNCTION_ARGS)
 
 	PG_RETURN_TEXT_P(cstring_to_text(psprintf("summary_v6_rejected=%s",
 											 rejected ? "true" : "false")));
+}
+
+Datum
+fb_summary_candidate_debug(PG_FUNCTION_ARGS)
+{
+	char *wal_path = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	FbSummaryBuildCandidate *candidates = NULL;
+	FbSummaryBuildCandidate *candidate = NULL;
+	FbSummaryBuildCandidate candidate_copy;
+	char summary_path[MAXPGPATH];
+	struct stat st;
+	bool summary_exists = false;
+	int candidate_count;
+	int i;
+
+	fb_runtime_ensure_initialized();
+	candidate_count = fb_summary_collect_build_candidates(&candidates, false);
+
+	for (i = 0; i < candidate_count; i++)
+	{
+		if (strcmp(candidates[i].path, wal_path) == 0)
+		{
+			candidate = &candidates[i];
+			break;
+		}
+	}
+
+	if (candidate == NULL)
+	{
+		if (candidates != NULL)
+			fb_summary_free_build_candidates(candidates);
+		PG_RETURN_TEXT_P(cstring_to_text("candidate=false"));
+	}
+
+	if (stat(candidate->path, &st) != 0)
+	{
+		if (candidates != NULL)
+			fb_summary_free_build_candidates(candidates);
+		PG_RETURN_TEXT_P(cstring_to_text("candidate=true stat=false"));
+	}
+
+	if (!fb_summary_file_path_into(summary_path, sizeof(summary_path),
+								   candidate->path, &st,
+								   candidate->source_kind))
+	{
+		if (candidates != NULL)
+			fb_summary_free_build_candidates(candidates);
+		elog(ERROR, "failed to build candidate summary path");
+	}
+
+	candidate_copy = *candidate;
+	summary_exists = fb_summary_candidate_summary_exists(candidate);
+	if (candidates != NULL)
+		fb_summary_free_build_candidates(candidates);
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+		"candidate=true source=%u segno=%llu bytes=%lld summary_exists=%s summary_path=%s",
+		candidate_copy.source_kind,
+		(unsigned long long) candidate_copy.segno,
+		(long long) candidate_copy.bytes,
+		summary_exists ? "true" : "false",
+		summary_path)));
+}
+
+Datum
+fb_summary_build_candidate_debug(PG_FUNCTION_ARGS)
+{
+	char *wal_path = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	FbSummaryBuildCandidate *candidates = NULL;
+	FbSummaryBuildCandidate *candidate = NULL;
+	FbSummaryBuildCandidate candidate_copy;
+	char summary_path[MAXPGPATH];
+	struct stat st;
+	bool summary_exists_before = false;
+	bool build_result = false;
+	bool summary_exists_after = false;
+	int candidate_count;
+	int i;
+
+	fb_runtime_ensure_initialized();
+	candidate_count = fb_summary_collect_build_candidates(&candidates, false);
+
+	for (i = 0; i < candidate_count; i++)
+	{
+		if (strcmp(candidates[i].path, wal_path) == 0)
+		{
+			candidate = &candidates[i];
+			break;
+		}
+	}
+
+	if (candidate == NULL)
+	{
+		if (candidates != NULL)
+			fb_summary_free_build_candidates(candidates);
+		PG_RETURN_TEXT_P(cstring_to_text("candidate=false"));
+	}
+
+	if (stat(candidate->path, &st) != 0)
+	{
+		if (candidates != NULL)
+			fb_summary_free_build_candidates(candidates);
+		PG_RETURN_TEXT_P(cstring_to_text("candidate=true stat=false"));
+	}
+
+	if (!fb_summary_file_path_into(summary_path, sizeof(summary_path),
+								   candidate->path, &st,
+								   candidate->source_kind))
+	{
+		if (candidates != NULL)
+			fb_summary_free_build_candidates(candidates);
+		elog(ERROR, "failed to build candidate summary path");
+	}
+
+	candidate_copy = *candidate;
+	summary_exists_before = fb_summary_candidate_summary_exists(candidate);
+	if (!summary_exists_before)
+		build_result = fb_summary_build_candidate(candidate);
+	summary_exists_after = fb_summary_candidate_summary_exists(candidate);
+
+	if (candidates != NULL)
+		fb_summary_free_build_candidates(candidates);
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+		"candidate=true source=%u segno=%llu bytes=%lld summary_exists_before=%s build_result=%s summary_exists_after=%s summary_path=%s",
+		candidate_copy.source_kind,
+		(unsigned long long) candidate_copy.segno,
+		(long long) candidate_copy.bytes,
+		summary_exists_before ? "true" : "false",
+		build_result ? "true" : "false",
+		summary_exists_after ? "true" : "false",
+		summary_path)));
 }

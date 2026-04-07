@@ -177,4 +177,210 @@ FB_RELEASE_GATE_PSQL="$fake_bin_dir/psql" \
 bash "$RUN_SH" --only render_gate_report >"$mid_stage_log" 2>&1 || fail "mid-stage render_gate_report should succeed"
 [[ -f "$fake_archive_dir/keep.seg" ]] || fail "mid-stage run should not delete existing archive files"
 
+prepare_test_repo="$tmp_dir/repo"
+prepare_test_root="$prepare_test_repo/tests/release_gate"
+mkdir -p "$prepare_test_root"
+cp -R "$REPO_ROOT/tests/release_gate/bin" "$prepare_test_root/bin"
+cp -R "$REPO_ROOT/tests/release_gate/sql" "$prepare_test_root/sql"
+cp -R "$REPO_ROOT/tests/release_gate/config" "$prepare_test_root/config"
+cp -R "$REPO_ROOT/tests/release_gate/templates" "$prepare_test_root/templates"
+cat > "$prepare_test_root/config/release_gate.conf" <<EOF
+FB_RELEASE_GATE_DBNAME=alldb
+FB_RELEASE_GATE_ARCHIVE_ROOT=$tmp_dir/prepare_walstorage
+FB_RELEASE_GATE_LARGE_DB_THRESHOLD_MB=100
+EOF
+
+prepare_test_sh="$prepare_test_root/bin/prepare_empty_instance.sh"
+prepare_fake_bin_dir="$tmp_dir/prepare_fakebin"
+prepare_log="$tmp_dir/prepare_calls.log"
+prepare_archive_root="$tmp_dir/prepare_walstorage"
+prepare_archive_dir="$prepare_archive_root/18waldata"
+mkdir -p "$prepare_fake_bin_dir" "$prepare_archive_dir"
+
+cat > "$prepare_fake_bin_dir/psql" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'psql %s\n' "\$*" >> "$prepare_log"
+if [[ "\$*" == *"show server_version_num;"* ]]; then
+	printf '%s\n' 180000
+	exit 0
+fi
+if [[ "\$*" == *"check_environment.sql"* ]]; then
+	printf '%s\n' "archive_mode=on"
+	printf '%s\n' "archive_command=cp %p $prepare_archive_dir/%f"
+	exit 0
+fi
+if [[ "\$*" == *"list_large_databases.sql"* ]]; then
+	exit 0
+fi
+exit 0
+EOF
+chmod +x "$prepare_fake_bin_dir/psql"
+
+cat > "$prepare_fake_bin_dir/createdb" <<EOF
+#!/usr/bin/env bash
+printf 'createdb %s\n' "\$*" >> "$prepare_log"
+EOF
+chmod +x "$prepare_fake_bin_dir/createdb"
+
+cat > "$prepare_fake_bin_dir/dropdb" <<EOF
+#!/usr/bin/env bash
+printf 'dropdb %s\n' "\$*" >> "$prepare_log"
+EOF
+chmod +x "$prepare_fake_bin_dir/dropdb"
+
+prepare_output_dir="$tmp_dir/prepare_output"
+mkdir -p "$prepare_output_dir"
+FB_RELEASE_GATE_OUTPUT_DIR="$prepare_output_dir" \
+FB_RELEASE_GATE_PSQL="$prepare_fake_bin_dir/psql" \
+FB_RELEASE_GATE_CREATEDB="$prepare_fake_bin_dir/createdb" \
+FB_RELEASE_GATE_DROPDB="$prepare_fake_bin_dir/dropdb" \
+FB_RELEASE_GATE_OS_USER="$(id -un)" \
+bash "$prepare_test_sh" >"$tmp_dir/prepare.log" 2>&1 || fail "prepare_empty_instance should succeed with fake commands"
+assert_file_contains "$prepare_log" "createdb -p 5832 -U 18pg alldb"
+assert_file_contains "$prepare_log" "psql -X -v ON_ERROR_STOP=1 -p 5832 -U 18pg -d alldb -Atqc CREATE EXTENSION IF NOT EXISTS pg_flashback;"
+
+cleanup_test_repo="$tmp_dir/cleanup_repo"
+cleanup_test_root="$cleanup_test_repo/tests/release_gate"
+mkdir -p "$cleanup_test_root"
+cp -R "$REPO_ROOT/tests/release_gate/bin" "$cleanup_test_root/bin"
+cp -R "$REPO_ROOT/tests/release_gate/sql" "$cleanup_test_root/sql"
+cp -R "$REPO_ROOT/tests/release_gate/config" "$cleanup_test_root/config"
+cp -R "$REPO_ROOT/tests/release_gate/templates" "$cleanup_test_root/templates"
+cat > "$cleanup_test_root/config/release_gate.conf" <<EOF
+FB_RELEASE_GATE_DBNAME=alldb
+FB_RELEASE_GATE_ARCHIVE_ROOT=$tmp_dir/cleanup_walstorage
+FB_RELEASE_GATE_LARGE_DB_THRESHOLD_MB=100
+EOF
+
+cleanup_run_sh="$cleanup_test_root/bin/run_release_gate.sh"
+cleanup_prepare_sh="$cleanup_test_root/bin/prepare_empty_instance.sh"
+cleanup_fake_bin_dir="$tmp_dir/cleanup_fakebin"
+cleanup_log="$tmp_dir/cleanup_calls.log"
+cleanup_archive_root="$tmp_dir/cleanup_walstorage"
+cleanup_archive_dir="$cleanup_archive_root/18waldata"
+cleanup_marker="$cleanup_archive_dir/post_prepare.seg"
+mkdir -p "$cleanup_fake_bin_dir" "$cleanup_archive_dir"
+
+cat > "$cleanup_fake_bin_dir/psql" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'psql %s\n' "\$*" >> "$cleanup_log"
+if [[ "\$*" == *"show server_version_num;"* ]]; then
+	printf '%s\n' 180000
+	exit 0
+fi
+if [[ "\$*" == *"check_environment.sql"* ]]; then
+	printf '%s\n' "archive_mode=on"
+	printf '%s\n' "archive_command=cp %p $cleanup_archive_dir/%f"
+	exit 0
+fi
+if [[ "\$*" == *"list_large_databases.sql"* ]]; then
+	exit 0
+fi
+exit 0
+EOF
+chmod +x "$cleanup_fake_bin_dir/psql"
+
+cat > "$cleanup_fake_bin_dir/createdb" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'createdb %s\n' "\$*" >> "$cleanup_log"
+mkdir -p "$cleanup_archive_dir"
+touch "$cleanup_marker"
+EOF
+chmod +x "$cleanup_fake_bin_dir/createdb"
+
+cat > "$cleanup_fake_bin_dir/dropdb" <<EOF
+#!/usr/bin/env bash
+printf 'dropdb %s\n' "\$*" >> "$cleanup_log"
+EOF
+chmod +x "$cleanup_fake_bin_dir/dropdb"
+
+cat > "$cleanup_test_root/bin/start_alldbsim.sh" <<EOF
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$cleanup_test_root/bin/start_alldbsim.sh"
+
+cleanup_output_dir="$tmp_dir/cleanup_output"
+mkdir -p "$cleanup_output_dir"
+FB_RELEASE_GATE_OUTPUT_DIR="$cleanup_output_dir" \
+FB_RELEASE_GATE_PSQL="$cleanup_fake_bin_dir/psql" \
+FB_RELEASE_GATE_CREATEDB="$cleanup_fake_bin_dir/createdb" \
+FB_RELEASE_GATE_DROPDB="$cleanup_fake_bin_dir/dropdb" \
+FB_RELEASE_GATE_OS_USER="$(id -un)" \
+bash "$cleanup_run_sh" --only prepare_instance >"$tmp_dir/cleanup_prepare.log" 2>&1 || fail "run_release_gate --only prepare_instance should succeed with fake commands"
+[[ -f "$cleanup_marker" ]] || fail "archive files created after prepare_instance should be preserved on exit"
+
+matrix_test_root="$tmp_dir/matrix_repo/tests/release_gate"
+mkdir -p "$matrix_test_root"
+cp -R "$REPO_ROOT/tests/release_gate/bin" "$matrix_test_root/bin"
+cp -R "$REPO_ROOT/tests/release_gate/sql" "$matrix_test_root/sql"
+cp -R "$REPO_ROOT/tests/release_gate/config" "$matrix_test_root/config"
+cp -R "$REPO_ROOT/tests/release_gate/templates" "$matrix_test_root/templates"
+
+matrix_output_dir="$tmp_dir/matrix_output"
+matrix_log="$tmp_dir/matrix_psql.log"
+matrix_archive_root="$tmp_dir/matrix_walstorage"
+matrix_archive_dir="$matrix_archive_root/18waldata"
+matrix_pgwal_dir="$tmp_dir/matrix_pgwal"
+mkdir -p "$matrix_output_dir/json" "$matrix_archive_dir" "$matrix_pgwal_dir"
+touch \
+	"$matrix_archive_dir/000000010000000A00000003" \
+	"$matrix_pgwal_dir/000000010000000A00000004"
+cat > "$matrix_output_dir/json/truth_manifest.json" <<'EOF'
+[
+  {
+    "scenario_id": "random_flashback_1",
+    "target_ts": "2026-04-07 03:17:56.806265+00",
+    "schema_name": "scenario_oa_50t_50000r",
+    "table_name": "documents",
+    "qualified_name": "scenario_oa_50t_50000r.documents",
+    "csv_path": "/tmp/fake.csv",
+    "sha256": "fake",
+    "row_count": 1,
+    "table_class": "large_5gb_target",
+    "capture_mode": "all"
+  }
+]
+EOF
+
+matrix_fake_bin_dir="$tmp_dir/matrix_fakebin"
+mkdir -p "$matrix_fake_bin_dir"
+cat > "$matrix_fake_bin_dir/psql" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'psql %s\n' "\$*" >> "$matrix_log"
+if [[ "\$*" == *"show server_version_num;"* ]]; then
+	printf '%s\n' 180000
+	exit 0
+fi
+if [[ "\$*" == *"string_agg(format('%I', a.attname), ', ' order by key_ord.ord)"* ]]; then
+	printf '%s\n' 'id'
+	exit 0
+fi
+printf 'id\n1\n'
+EOF
+chmod +x "$matrix_fake_bin_dir/psql"
+
+FB_RELEASE_GATE_OUTPUT_DIR="$matrix_output_dir" \
+FB_RELEASE_GATE_ARCHIVE_ROOT="$matrix_archive_root" \
+FB_RELEASE_GATE_PSQL="$matrix_fake_bin_dir/psql" \
+FB_RELEASE_GATE_OS_USER="$(id -un)" \
+FB_RELEASE_GATE_WARMUP_RUNS=0 \
+FB_RELEASE_GATE_MEASURED_RUNS=1 \
+bash "$matrix_test_root/bin/run_flashback_matrix.sh" >"$tmp_dir/matrix_run.log" 2>&1 || \
+	fail "run_flashback_matrix should succeed with fake psql"
+
+if grep -Fq 'set pg_flashback.archive_dest =' "$matrix_log"; then
+	fail "run_flashback_matrix should not override archive_dest"
+fi
+if grep -Fq 'pg_switch_wal()' "$matrix_log"; then
+	fail "run_flashback_matrix should not seal WAL tail"
+fi
+if grep -Fq 'archive_dest=' "$matrix_log"; then
+	fail "CTAS path should not pass archive_dest variable"
+fi
+
 echo "[release_gate:selftest] PASS"

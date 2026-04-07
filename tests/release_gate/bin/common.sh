@@ -232,6 +232,7 @@ fb_release_gate_prepare_output_tree() {
 		"$(fb_release_gate_output_path json)" \
 		"$(fb_release_gate_output_path csv)" \
 		"$(fb_release_gate_output_path logs)" \
+		"$(fb_release_gate_output_path wal)" \
 		"$(fb_release_gate_output_path reports)" \
 		"$(fb_release_gate_output_path csv/truth)" \
 		"$(fb_release_gate_output_path csv/flashback)" \

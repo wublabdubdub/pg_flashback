@@ -44,10 +44,15 @@ PG_FUNCTION_INFO_V1(fb_wal_payload_window_contract_debug);
 PG_FUNCTION_INFO_V1(fb_wal_nonapply_image_spool_contract_debug);
 PG_FUNCTION_INFO_V1(fb_wal_hint_fpi_payload_contract_debug);
 PG_FUNCTION_INFO_V1(fb_wal_heap2_visible_payload_contract_debug);
+PG_FUNCTION_INFO_V1(fb_summary_xid_resolution_debug);
+PG_FUNCTION_INFO_V1(fb_summary_payload_locator_plan_debug);
 
 static bool fb_wal_payload_kind_enabled(uint8 kind);
 static bool fb_record_touches_main_relation(XLogReaderState *reader,
 											const FbRelationInfo *info);
+static void fb_append_touched_xid_hash_samples(StringInfo buf,
+												 HTAB *xids,
+												 uint32 limit);
 
 #if !defined(HAVE_MEMMEM)
 /*
@@ -371,6 +376,26 @@ typedef struct FbWalPayloadLocatorSegmentPlan
 	XLogRecPtr end_lsn;
 } FbWalPayloadLocatorSegmentPlan;
 
+typedef struct FbPayloadLocatorPlanDebug
+{
+	uint32 base_segments;
+	uint32 success_segments;
+	uint32 empty_success_segments;
+	uint32 segments_with_locators;
+	uint32 fallback_segments;
+	uint64 locator_records;
+	uint32 base_by_source[FB_WAL_SOURCE_CKWAL + 1];
+	uint32 success_by_source[FB_WAL_SOURCE_CKWAL + 1];
+	uint32 fallback_by_source[FB_WAL_SOURCE_CKWAL + 1];
+	uint32 locator_by_source[FB_WAL_SOURCE_CKWAL + 1];
+	uint32 failed_sample_count;
+	struct
+	{
+		char name[25];
+		int source_kind;
+	} failed_samples[8];
+} FbPayloadLocatorPlanDebug;
+
 /*
  * FbPrefilterCacheEntry
  *    Stores one prefilter cache entry.
@@ -664,12 +689,16 @@ static void fb_index_note_materialized_record(FbWalRecordIndex *index,
 											  FbRecordRef *record);
 static void fb_append_xact_summary(XLogReaderState *reader,
 								   FbWalIndexBuildState *state);
-static void fb_apply_xact_summary_entry(FbWalScanContext *ctx,
-										FbWalRecordIndex *index,
-										HTAB *touched_xids,
-										HTAB *unsafe_xids,
-										const char *data,
-										Size len);
+static uint32 fb_apply_xact_summary_entry(FbWalScanContext *ctx,
+										  FbWalRecordIndex *index,
+										  HTAB *touched_xids,
+										  HTAB *unsafe_xids,
+										  const char *data,
+										  Size len);
+static uint32 fb_wal_apply_xact_summary_log(FbWalScanContext *ctx,
+											FbWalRecordIndex *index,
+											HTAB *touched_xids,
+											HTAB *unsafe_xids);
 /*
  * fb_standby_record_matches_relation
  *    WAL helper.
@@ -993,6 +1022,17 @@ static bool fb_summary_fill_xact_statuses(const FbRelationInfo *info,
 										  uint32 window_count,
 										  HTAB *touched_xids,
 										  HTAB *unsafe_xids);
+static uint32 fb_apply_summary_xid_outcome(FbWalScanContext *ctx,
+										   FbWalRecordIndex *index,
+										   HTAB *touched_xids,
+										   HTAB *unsafe_xids,
+										   const FbSummaryXidOutcome *outcome);
+static bool fb_summary_fill_exact_xact_statuses(FbWalScanContext *ctx,
+												FbWalRecordIndex *index,
+												const FbWalVisitWindow *windows,
+												uint32 window_count,
+												HTAB *touched_xids,
+												HTAB *unsafe_xids);
 static void fb_build_unresolved_xid_fallback_sets(FbWalRecordIndex *index,
 												  HTAB *touched_xids,
 												  HTAB *unsafe_xids,
@@ -1018,7 +1058,8 @@ static uint32 fb_build_summary_payload_locator_plan(const FbRelationInfo *info,
 													FbWalVisitWindow **fallback_windows_out,
 													uint32 *fallback_window_count_out,
 													uint32 *fallback_segment_count_out,
-													uint32 *segments_read_out);
+													uint32 *segments_read_out,
+													FbPayloadLocatorPlanDebug *plan_debug);
 static FbWalVisitWindow *fb_copy_visit_windows(const FbWalVisitWindow *windows,
 											   uint32 window_count);
 static uint32 fb_count_payload_locator_segments(FbWalScanContext *ctx,
@@ -2348,10 +2389,11 @@ fb_build_summary_span_visit_windows(const FbRelationInfo *info,
 		for (j = 0; j < base->segment_count; j++)
 		{
 			FbWalSegmentEntry *segment = &base->segments[j];
-			FbSummarySpan *spans = NULL;
+			const FbSummarySpan *spans = NULL;
 			uint32 span_count = 0;
 			uint32 k;
 
+			ctx->summary_span_segments_read++;
 			if (!fb_summary_segment_lookup_spans_cached(segment->path,
 														segment->bytes,
 														segment->timeline_id,
@@ -2425,9 +2467,6 @@ fb_build_summary_span_visit_windows(const FbRelationInfo *info,
 				windows[window_count].read_end_lsn = span_end;
 				window_count++;
 			}
-
-			if (spans != NULL)
-				pfree(spans);
 		}
 	}
 
@@ -2443,6 +2482,8 @@ fb_build_summary_span_visit_windows(const FbRelationInfo *info,
 	else
 		pfree(windows);
 	ctx->summary_span_windows = window_count;
+	ctx->summary_span_public_builds =
+		fb_summary_query_cache_span_public_builds(ctx->summary_cache);
 	return window_count;
 }
 
@@ -3071,7 +3112,8 @@ fb_build_summary_payload_locator_plan(const FbRelationInfo *info,
 										FbWalVisitWindow **fallback_windows_out,
 										uint32 *fallback_window_count_out,
 										uint32 *fallback_segment_count_out,
-										uint32 *segments_read_out)
+										uint32 *segments_read_out,
+										FbPayloadLocatorPlanDebug *plan_debug)
 {
 	FbWalSegmentEntry *segments;
 	FbWalPayloadLocatorSegmentPlan *segment_plans = NULL;
@@ -3161,6 +3203,15 @@ fb_build_summary_payload_locator_plan(const FbRelationInfo *info,
 		if (plan->segment == NULL)
 			continue;
 
+		if (plan_debug != NULL)
+		{
+			uint32 source_index = (uint32) plan->segment->source_kind;
+
+			plan_debug->base_segments++;
+			if (source_index <= FB_WAL_SOURCE_CKWAL)
+				plan_debug->base_by_source[source_index]++;
+		}
+
 		segments_read++;
 		if (!fb_summary_segment_lookup_payload_locators_cached(plan->segment->path,
 																 plan->segment->bytes,
@@ -3173,6 +3224,24 @@ fb_build_summary_payload_locator_plan(const FbRelationInfo *info,
 																 &segment_locators,
 																 &segment_locator_count))
 		{
+			if (plan_debug != NULL)
+			{
+				uint32 source_index = (uint32) plan->segment->source_kind;
+
+				plan_debug->fallback_segments++;
+				if (source_index <= FB_WAL_SOURCE_CKWAL)
+					plan_debug->fallback_by_source[source_index]++;
+				if (plan_debug->failed_sample_count <
+					lengthof(plan_debug->failed_samples))
+				{
+					strlcpy(plan_debug->failed_samples[plan_debug->failed_sample_count].name,
+							plan->segment->name,
+							sizeof(plan_debug->failed_samples[0].name));
+					plan_debug->failed_samples[plan_debug->failed_sample_count].source_kind =
+						plan->segment->source_kind;
+					plan_debug->failed_sample_count++;
+				}
+			}
 			if (fallback_count == fallback_capacity)
 			{
 				fallback_capacity = (fallback_capacity == 0) ? 16 : fallback_capacity * 2;
@@ -3193,6 +3262,17 @@ fb_build_summary_payload_locator_plan(const FbRelationInfo *info,
 			continue;
 		}
 
+		if (plan_debug != NULL)
+		{
+			uint32 source_index = (uint32) plan->segment->source_kind;
+
+			plan_debug->success_segments++;
+			if (source_index <= FB_WAL_SOURCE_CKWAL)
+				plan_debug->success_by_source[source_index]++;
+			if (segment_locator_count == 0)
+				plan_debug->empty_success_segments++;
+		}
+
 		for (k = 0; k < segment_locator_count; k++)
 		{
 			if (!fb_wal_payload_kind_enabled(segment_locators[k].kind))
@@ -3211,10 +3291,20 @@ fb_build_summary_payload_locator_plan(const FbRelationInfo *info,
 			}
 
 			locators[locator_count++] = segment_locators[k];
-		}
+			if (plan_debug != NULL)
+			{
+				uint32 source_index = (uint32) plan->segment->source_kind;
 
+				plan_debug->locator_records++;
+				if (source_index <= FB_WAL_SOURCE_CKWAL)
+					plan_debug->locator_by_source[source_index]++;
+			}
+		}
+		if (plan_debug != NULL && segment_locator_count > 0)
+			plan_debug->segments_with_locators++;
 		if (segment_locators != NULL)
 			pfree(segment_locators);
+
 	}
 
 	if (locator_count == 0 && locators != NULL)
@@ -4484,6 +4574,60 @@ fb_create_unsafe_xid_hash(void)
 
 	return hash_create("fb unsafe xids", 64, &ctl,
 					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+static void
+fb_append_touched_xid_hash_samples(StringInfo buf, HTAB *xids, uint32 limit)
+{
+	HASH_SEQ_STATUS status;
+	FbTouchedXidEntry *entry;
+	uint32 emitted = 0;
+
+	if (buf == NULL)
+		return;
+
+	appendStringInfoChar(buf, '[');
+	if (xids != NULL)
+	{
+		hash_seq_init(&status, xids);
+		while ((entry = (FbTouchedXidEntry *) hash_seq_search(&status)) != NULL)
+		{
+			if (limit == 0 || emitted < limit)
+			{
+				if (emitted > 0)
+					appendStringInfoString(buf, ",");
+				appendStringInfo(buf, "%u", entry->xid);
+				emitted++;
+			}
+		}
+	}
+	appendStringInfoChar(buf, ']');
+}
+
+static void
+fb_append_payload_locator_failed_samples(StringInfo buf,
+										 const FbPayloadLocatorPlanDebug *plan_debug)
+{
+	uint32 i;
+
+	if (buf == NULL)
+		return;
+
+	appendStringInfoChar(buf, '[');
+	if (plan_debug != NULL)
+	{
+		for (i = 0; i < plan_debug->failed_sample_count; i++)
+		{
+			if (i > 0)
+				appendStringInfoString(buf, ",");
+			appendStringInfo(buf,
+							 "%s:%s",
+							 plan_debug->failed_samples[i].name,
+							 fb_wal_source_name((FbWalSourceKind)
+												plan_debug->failed_samples[i].source_kind));
+		}
+	}
+	appendStringInfoChar(buf, ']');
 }
 
 /*
@@ -6994,7 +7138,7 @@ fb_append_xact_summary(XLogReaderState *reader,
 	}
 }
 
-static void
+static uint32
 fb_apply_xact_summary_entry(FbWalScanContext *ctx,
 							FbWalRecordIndex *index,
 							HTAB *touched_xids,
@@ -7004,12 +7148,17 @@ fb_apply_xact_summary_entry(FbWalScanContext *ctx,
 {
 	FbWalXactSummaryHeader hdr;
 	const TransactionId *subxids;
-	const FbUnsafeXidEntry *unsafe_entry;
+	FbUnsafeXidEntry *unsafe_entry;
+	FbXidStatusEntry *status_entry;
+	bool found = false;
+	bool already_resolved;
+	bool is_touched;
+	uint32 hits = 0;
 	uint32 i;
 
 	if (ctx == NULL || index == NULL || touched_xids == NULL ||
 		unsafe_xids == NULL || data == NULL || len < sizeof(hdr))
-		return;
+		return 0;
 
 	memcpy(&hdr, data, sizeof(hdr));
 	if (len != sizeof(hdr) + sizeof(TransactionId) * hdr.subxact_count)
@@ -7018,45 +7167,114 @@ fb_apply_xact_summary_entry(FbWalScanContext *ctx,
 				 errmsg("fb xact summary spool entry has invalid length")));
 	subxids = (const TransactionId *) (data + sizeof(hdr));
 
-	if (fb_hash_has_xid(touched_xids, hdr.xid))
+	is_touched = fb_hash_has_xid(touched_xids, hdr.xid);
+	unsafe_entry = fb_find_unsafe_xid(unsafe_xids, hdr.xid);
+	if (is_touched || unsafe_entry != NULL)
 	{
+		status_entry = fb_get_xid_status_entry(index->xid_statuses, hdr.xid, &found);
+		already_resolved = (found && status_entry->status != FB_WAL_XID_UNKNOWN);
 		fb_note_xid_status(index->xid_statuses, hdr.xid,
 						   hdr.status, hdr.timestamp, hdr.end_lsn);
-		if (hdr.timestamp > ctx->target_ts && hdr.timestamp <= ctx->query_now_ts)
+		if (!already_resolved)
 		{
-			if (hdr.status == FB_WAL_XID_COMMITTED)
-				index->target_commit_count++;
-			else if (hdr.status == FB_WAL_XID_ABORTED)
-				index->target_abort_count++;
+			hits++;
+			if (is_touched &&
+				hdr.timestamp > ctx->target_ts &&
+				hdr.timestamp <= ctx->query_now_ts)
+			{
+				if (hdr.status == FB_WAL_XID_COMMITTED)
+					index->target_commit_count++;
+				else if (hdr.status == FB_WAL_XID_ABORTED)
+					index->target_abort_count++;
+			}
+		}
+		if (unsafe_entry != NULL &&
+			hdr.status == FB_WAL_XID_COMMITTED &&
+			hdr.timestamp > ctx->target_ts &&
+			hdr.timestamp <= ctx->query_now_ts &&
+			fb_unsafe_entry_requires_reject(unsafe_entry) &&
+			!ctx->unsafe)
+		{
+			fb_capture_unsafe_context(ctx, unsafe_entry, hdr.xid, hdr.timestamp);
+			fb_mark_unsafe(ctx, unsafe_entry->reason);
 		}
 	}
 
 	for (i = 0; i < hdr.subxact_count; i++)
 	{
-		if (!fb_hash_has_xid(touched_xids, subxids[i]))
+		is_touched = fb_hash_has_xid(touched_xids, subxids[i]);
+		unsafe_entry = fb_find_unsafe_xid(unsafe_xids, subxids[i]);
+		if (!is_touched && unsafe_entry == NULL)
 			continue;
 
+		status_entry = fb_get_xid_status_entry(index->xid_statuses, subxids[i], &found);
+		already_resolved = (found && status_entry->status != FB_WAL_XID_UNKNOWN);
 		fb_note_xid_status(index->xid_statuses, subxids[i],
 						   hdr.status, hdr.timestamp, hdr.end_lsn);
-		if (hdr.timestamp > ctx->target_ts && hdr.timestamp <= ctx->query_now_ts)
+		if (!already_resolved)
 		{
-			if (hdr.status == FB_WAL_XID_COMMITTED)
-				index->target_commit_count++;
-			else if (hdr.status == FB_WAL_XID_ABORTED)
-				index->target_abort_count++;
+			hits++;
+			if (is_touched &&
+				hdr.timestamp > ctx->target_ts &&
+				hdr.timestamp <= ctx->query_now_ts)
+			{
+				if (hdr.status == FB_WAL_XID_COMMITTED)
+					index->target_commit_count++;
+				else if (hdr.status == FB_WAL_XID_ABORTED)
+					index->target_abort_count++;
+			}
+		}
+		if (unsafe_entry != NULL &&
+			hdr.status == FB_WAL_XID_COMMITTED &&
+			hdr.timestamp > ctx->target_ts &&
+			hdr.timestamp <= ctx->query_now_ts &&
+			fb_unsafe_entry_requires_reject(unsafe_entry) &&
+			!ctx->unsafe)
+		{
+			fb_capture_unsafe_context(ctx, unsafe_entry, subxids[i], hdr.timestamp);
+			fb_mark_unsafe(ctx, unsafe_entry->reason);
 		}
 	}
 
-	unsafe_entry = fb_find_unsafe_xid(unsafe_xids, hdr.xid);
-	if (hdr.status == FB_WAL_XID_COMMITTED &&
-		hdr.timestamp > ctx->target_ts &&
-		hdr.timestamp <= ctx->query_now_ts &&
-		fb_unsafe_entry_requires_reject(unsafe_entry) &&
-		!ctx->unsafe)
+	return hits;
+}
+
+static uint32
+fb_wal_apply_xact_summary_log(FbWalScanContext *ctx,
+							  FbWalRecordIndex *index,
+							  HTAB *touched_xids,
+							  HTAB *unsafe_xids)
+{
+	FbSpoolCursor *cursor;
+	StringInfoData buf;
+	uint32 item_index;
+	uint32 hits = 0;
+
+	if (ctx == NULL || index == NULL || index->xact_summary_log == NULL)
+		return 0;
+	if ((touched_xids == NULL || hash_get_num_entries(touched_xids) <= 0) &&
+		(unsafe_xids == NULL || hash_get_num_entries(unsafe_xids) <= 0))
+		return 0;
+
+	cursor = fb_spool_cursor_open(index->xact_summary_log, FB_SPOOL_FORWARD);
+	if (cursor == NULL)
+		return 0;
+
+	initStringInfo(&buf);
+	while (fb_spool_cursor_read(cursor, &buf, &item_index))
 	{
-		fb_capture_unsafe_context(ctx, unsafe_entry, hdr.xid, hdr.timestamp);
-		fb_mark_unsafe(ctx, unsafe_entry->reason);
+		hits += fb_apply_xact_summary_entry(ctx,
+											index,
+											touched_xids,
+											unsafe_xids,
+											buf.data,
+											buf.len);
+		if (ctx->unsafe)
+			break;
 	}
+	pfree(buf.data);
+	fb_spool_cursor_close(cursor);
+	return hits;
 }
 
 static bool
@@ -8261,56 +8479,11 @@ fb_summary_fill_xact_statuses(const FbRelationInfo *info,
 
 			for (outcome_index = 0; outcome_index < outcome_count; outcome_index++)
 			{
-				TransactionId xid = outcomes[outcome_index].xid;
-				FbUnsafeXidEntry *unsafe_entry;
-				FbXidStatusEntry *status_entry;
-				bool is_touched;
-				bool is_unsafe;
-				bool found = false;
-				bool already_resolved;
-
-				is_touched = fb_hash_has_xid(touched_xids, xid);
-				is_unsafe = (unsafe_xids != NULL &&
-							 fb_find_unsafe_xid(unsafe_xids, xid) != NULL);
-				if (!is_touched && !is_unsafe)
-					continue;
-
-				status_entry = fb_get_xid_status_entry(index->xid_statuses,
-													   xid,
-													   &found);
-				already_resolved = (found && status_entry->status != FB_WAL_XID_UNKNOWN);
-				fb_note_xid_status(index->xid_statuses,
-								   xid,
-								   (FbWalXidStatus) outcomes[outcome_index].status,
-								   outcomes[outcome_index].commit_ts,
-								   outcomes[outcome_index].commit_lsn);
-				if (!already_resolved)
-				{
-					hits++;
-					if (is_touched &&
-						outcomes[outcome_index].status == FB_WAL_XID_COMMITTED &&
-						outcomes[outcome_index].commit_ts > ctx->target_ts &&
-						outcomes[outcome_index].commit_ts <= ctx->query_now_ts)
-						index->target_commit_count++;
-					else if (is_touched &&
-							 outcomes[outcome_index].status == FB_WAL_XID_ABORTED &&
-							 outcomes[outcome_index].commit_ts > ctx->target_ts &&
-							 outcomes[outcome_index].commit_ts <= ctx->query_now_ts)
-						index->target_abort_count++;
-				}
-
-				unsafe_entry = fb_find_unsafe_xid(unsafe_xids, xid);
-				if (unsafe_entry != NULL &&
-					outcomes[outcome_index].status == FB_WAL_XID_COMMITTED &&
-					outcomes[outcome_index].commit_ts > ctx->target_ts &&
-					outcomes[outcome_index].commit_ts <= ctx->query_now_ts &&
-					fb_unsafe_entry_requires_reject(unsafe_entry))
-				{
-					fb_capture_unsafe_context(ctx, unsafe_entry,
-											  xid,
-											  outcomes[outcome_index].commit_ts);
-					fb_mark_unsafe(ctx, unsafe_entry->reason);
-				}
+				hits += fb_apply_summary_xid_outcome(ctx,
+												 index,
+												 touched_xids,
+												 unsafe_xids,
+												 &outcomes[outcome_index]);
 			}
 		}
 	}
@@ -8347,6 +8520,250 @@ fb_summary_fill_xact_statuses(const FbRelationInfo *info,
 	ctx->summary_xid_hits = hits;
 	ctx->summary_xid_fallback = unresolved;
 	return unresolved == 0;
+}
+
+static uint32
+fb_apply_summary_xid_outcome(FbWalScanContext *ctx,
+							 FbWalRecordIndex *index,
+							 HTAB *touched_xids,
+							 HTAB *unsafe_xids,
+							 const FbSummaryXidOutcome *outcome)
+{
+	TransactionId xid;
+	FbUnsafeXidEntry *unsafe_entry;
+	FbXidStatusEntry *status_entry;
+	bool is_touched;
+	bool is_unsafe;
+	bool found = false;
+	bool already_resolved;
+
+	if (ctx == NULL || index == NULL || outcome == NULL)
+		return 0;
+
+	xid = outcome->xid;
+	is_touched = fb_hash_has_xid(touched_xids, xid);
+	is_unsafe = (unsafe_xids != NULL &&
+				 fb_find_unsafe_xid(unsafe_xids, xid) != NULL);
+	if (!is_touched && !is_unsafe)
+		return 0;
+
+	status_entry = fb_get_xid_status_entry(index->xid_statuses, xid, &found);
+	already_resolved = (found && status_entry->status != FB_WAL_XID_UNKNOWN);
+	fb_note_xid_status(index->xid_statuses,
+					   xid,
+					   (FbWalXidStatus) outcome->status,
+					   outcome->commit_ts,
+					   outcome->commit_lsn);
+	if (!already_resolved)
+	{
+		if (is_touched &&
+			outcome->status == FB_WAL_XID_COMMITTED &&
+			outcome->commit_ts > ctx->target_ts &&
+			outcome->commit_ts <= ctx->query_now_ts)
+			index->target_commit_count++;
+		else if (is_touched &&
+				 outcome->status == FB_WAL_XID_ABORTED &&
+				 outcome->commit_ts > ctx->target_ts &&
+				 outcome->commit_ts <= ctx->query_now_ts)
+			index->target_abort_count++;
+	}
+
+	unsafe_entry = fb_find_unsafe_xid(unsafe_xids, xid);
+	if (unsafe_entry != NULL &&
+		outcome->status == FB_WAL_XID_COMMITTED &&
+		outcome->commit_ts > ctx->target_ts &&
+		outcome->commit_ts <= ctx->query_now_ts &&
+		fb_unsafe_entry_requires_reject(unsafe_entry))
+	{
+		fb_capture_unsafe_context(ctx, unsafe_entry, xid, outcome->commit_ts);
+		fb_mark_unsafe(ctx, unsafe_entry->reason);
+	}
+
+	return already_resolved ? 0 : 1;
+}
+
+static bool
+fb_summary_fill_exact_xact_statuses(FbWalScanContext *ctx,
+									FbWalRecordIndex *index,
+									const FbWalVisitWindow *windows,
+									uint32 window_count,
+									HTAB *touched_xids,
+									HTAB *unsafe_xids)
+{
+	FbWalSegmentEntry *segments;
+	FbWalVisitWindow full_window;
+	const FbWalVisitWindow *source_windows;
+	uint32 source_window_count;
+	bool *segment_seen;
+	TransactionId *xids = NULL;
+	const FbSummaryXidOutcome *outcomes = NULL;
+	HASH_SEQ_STATUS hash_status;
+	FbTouchedXidEntry *touched_entry;
+	FbUnsafeXidEntry *unsafe_entry;
+	uint32 xid_count = 0;
+	uint32 unresolved = 0;
+	uint32 hits = 0;
+	uint32 i;
+
+	if (ctx == NULL || index == NULL)
+		return false;
+	if ((touched_xids == NULL || hash_get_num_entries(touched_xids) <= 0) &&
+		(unsafe_xids == NULL || hash_get_num_entries(unsafe_xids) <= 0))
+		return true;
+
+	if (touched_xids != NULL)
+		xid_count += (uint32) hash_get_num_entries(touched_xids);
+	if (unsafe_xids != NULL)
+	{
+		hash_seq_init(&hash_status, unsafe_xids);
+		while ((unsafe_entry = (FbUnsafeXidEntry *) hash_seq_search(&hash_status)) != NULL)
+		{
+			if (touched_xids != NULL && fb_hash_has_xid(touched_xids, unsafe_entry->xid))
+				continue;
+			xid_count++;
+		}
+	}
+	if (xid_count == 0)
+		return true;
+
+	xids = palloc(sizeof(*xids) * xid_count);
+	xid_count = 0;
+	if (touched_xids != NULL)
+	{
+		hash_seq_init(&hash_status, touched_xids);
+		while ((touched_entry = (FbTouchedXidEntry *) hash_seq_search(&hash_status)) != NULL)
+			xids[xid_count++] = touched_entry->xid;
+	}
+	if (unsafe_xids != NULL)
+	{
+		hash_seq_init(&hash_status, unsafe_xids);
+		while ((unsafe_entry = (FbUnsafeXidEntry *) hash_seq_search(&hash_status)) != NULL)
+		{
+			if (touched_xids != NULL && fb_hash_has_xid(touched_xids, unsafe_entry->xid))
+				continue;
+			xids[xid_count++] = unsafe_entry->xid;
+		}
+	}
+	if (xid_count > 1)
+		qsort(xids, xid_count, sizeof(*xids), fb_transactionid_cmp);
+
+	segments = (FbWalSegmentEntry *) ctx->resolved_segments;
+	if (window_count == 0 || windows == NULL)
+	{
+		full_window.segments = segments;
+		full_window.segment_count = ctx->resolved_segment_count;
+		full_window.start_lsn = ctx->start_lsn;
+		full_window.end_lsn = ctx->end_lsn;
+		full_window.read_end_lsn = ctx->end_lsn;
+		source_windows = &full_window;
+		source_window_count = 1;
+	}
+	else
+	{
+		source_windows = windows;
+		source_window_count = window_count;
+	}
+	segment_seen = palloc0(sizeof(bool) * ctx->resolved_segment_count);
+	for (i = 0; i < source_window_count; i++)
+	{
+		const FbWalVisitWindow *window = &source_windows[i];
+		uint32 j;
+
+		for (j = 0; j < window->segment_count; j++)
+		{
+			FbWalSegmentEntry *segment = &window->segments[j];
+			uint32 segment_index = (uint32) ((segment - segments));
+			uint32 xid_index = 0;
+			uint32 outcome_count = 0;
+			uint32 outcome_index = 0;
+
+			if (segment_index >= ctx->resolved_segment_count)
+				elog(ERROR, "summary exact xid fill segment index is out of bounds");
+			if (segment_seen[segment_index])
+				continue;
+			segment_seen[segment_index] = true;
+
+			if (!fb_summary_segment_lookup_xid_outcome_slice_cached(segment->path,
+																   segment->bytes,
+																   segment->timeline_id,
+																   segment->segno,
+																   ctx->wal_seg_size,
+																   segment->source_kind,
+																   ctx->summary_cache,
+																   &outcomes,
+																   &outcome_count))
+				continue;
+			ctx->summary_xid_exact_segments_read++;
+			if (outcome_count == 0)
+				continue;
+
+			while (xid_index < xid_count && outcome_index < outcome_count)
+			{
+				if (xids[xid_index] < outcomes[outcome_index].xid)
+				{
+					xid_index++;
+					continue;
+				}
+				if (xids[xid_index] > outcomes[outcome_index].xid)
+				{
+					outcome_index++;
+					continue;
+				}
+
+				hits += fb_apply_summary_xid_outcome(ctx,
+												 index,
+												 touched_xids,
+												 unsafe_xids,
+												 &outcomes[outcome_index]);
+				xid_index++;
+				outcome_index++;
+			}
+
+			if (ctx->unsafe)
+				break;
+		}
+		if (ctx->unsafe)
+			break;
+	}
+
+	pfree(segment_seen);
+	if (xids != NULL)
+		pfree(xids);
+
+	if (touched_xids != NULL)
+	{
+		hash_seq_init(&hash_status, touched_xids);
+		while ((touched_entry = (FbTouchedXidEntry *) hash_seq_search(&hash_status)) != NULL)
+		{
+			FbXidStatusEntry *entry;
+
+			entry = (FbXidStatusEntry *) hash_search(index->xid_statuses,
+													 &touched_entry->xid,
+													 HASH_FIND,
+													 NULL);
+			if (entry == NULL || entry->status == FB_WAL_XID_UNKNOWN)
+				unresolved++;
+		}
+	}
+	if (unsafe_xids != NULL)
+	{
+		hash_seq_init(&hash_status, unsafe_xids);
+		while ((unsafe_entry = (FbUnsafeXidEntry *) hash_seq_search(&hash_status)) != NULL)
+		{
+			FbXidStatusEntry *entry;
+
+			entry = (FbXidStatusEntry *) hash_search(index->xid_statuses,
+													 &unsafe_entry->xid,
+													 HASH_FIND,
+													 NULL);
+			if (entry == NULL || entry->status == FB_WAL_XID_UNKNOWN)
+				unresolved++;
+		}
+	}
+
+	ctx->summary_xid_exact_hits = hits;
+	ctx->summary_xid_fallback = unresolved;
+	return ctx->unsafe || unresolved == 0;
 }
 
 static void
@@ -8448,10 +8865,40 @@ fb_wal_fill_xact_statuses_serial(const FbRelationInfo *info,
 	if (hash_get_num_entries(touched_xids) <= 0 &&
 		hash_get_num_entries(unsafe_xids) <= 0)
 		return;
-	if (fb_summary_fill_xact_statuses(info, ctx, index, windows, window_count,
-									  touched_xids, unsafe_xids))
+	ctx->xact_summary_spool_hits =
+		fb_wal_apply_xact_summary_log(ctx, index, touched_xids, unsafe_xids);
+	if (ctx->unsafe)
 		return;
 
+	fb_build_unresolved_xid_fallback_sets(index,
+										  touched_xids,
+										  unsafe_xids,
+										  &fallback_touched,
+										  &fallback_unsafe);
+	if ((fallback_touched == NULL || hash_get_num_entries(fallback_touched) <= 0) &&
+		(fallback_unsafe == NULL || hash_get_num_entries(fallback_unsafe) <= 0))
+	{
+		ctx->summary_xid_fallback = 0;
+		goto cleanup;
+	}
+	if (fb_summary_fill_xact_statuses(info,
+									  ctx,
+									  index,
+									  windows,
+									  window_count,
+									  (fallback_touched != NULL) ? fallback_touched : touched_xids,
+									  (fallback_unsafe != NULL) ? fallback_unsafe : unsafe_xids))
+		goto cleanup;
+	if (fallback_touched != NULL)
+	{
+		hash_destroy(fallback_touched);
+		fallback_touched = NULL;
+	}
+	if (fallback_unsafe != NULL)
+	{
+		hash_destroy(fallback_unsafe);
+		fallback_unsafe = NULL;
+	}
 	fb_build_unresolved_xid_fallback_sets(index,
 										  touched_xids,
 										  unsafe_xids,
@@ -8463,6 +8910,57 @@ fb_wal_fill_xact_statuses_serial(const FbRelationInfo *info,
 
 	fallback_window_count =
 		fb_build_xact_fallback_visit_windows(ctx, windows, window_count, &fallback_windows);
+	if (fb_summary_fill_exact_xact_statuses(ctx,
+											index,
+											fallback_windows,
+											fallback_window_count,
+											fallback_touched,
+											fallback_unsafe))
+		goto cleanup;
+	if (fallback_touched != NULL)
+	{
+		hash_destroy(fallback_touched);
+		fallback_touched = NULL;
+	}
+	if (fallback_unsafe != NULL)
+	{
+		hash_destroy(fallback_unsafe);
+		fallback_unsafe = NULL;
+	}
+	fb_build_unresolved_xid_fallback_sets(index,
+										  touched_xids,
+										  unsafe_xids,
+										  &fallback_touched,
+										  &fallback_unsafe);
+	if ((fallback_touched == NULL || hash_get_num_entries(fallback_touched) <= 0) &&
+		(fallback_unsafe == NULL || hash_get_num_entries(fallback_unsafe) <= 0))
+		goto cleanup;
+
+	if (fb_summary_fill_exact_xact_statuses(ctx,
+											index,
+											NULL,
+											0,
+											fallback_touched,
+											fallback_unsafe))
+		goto cleanup;
+	if (fallback_touched != NULL)
+	{
+		hash_destroy(fallback_touched);
+		fallback_touched = NULL;
+	}
+	if (fallback_unsafe != NULL)
+	{
+		hash_destroy(fallback_unsafe);
+		fallback_unsafe = NULL;
+	}
+	fb_build_unresolved_xid_fallback_sets(index,
+										  touched_xids,
+										  unsafe_xids,
+										  &fallback_touched,
+										  &fallback_unsafe);
+	if ((fallback_touched == NULL || hash_get_num_entries(fallback_touched) <= 0) &&
+		(fallback_unsafe == NULL || hash_get_num_entries(fallback_unsafe) <= 0))
+		goto cleanup;
 	ctx->xact_fallback_windows = fallback_window_count;
 	ctx->xact_fallback_covered_segments =
 		fb_wal_count_window_segments(fallback_windows, fallback_window_count);
@@ -8801,12 +9299,11 @@ fb_index_record_visitor(XLogReaderState *reader, void *arg)
 		{
 			uint8 heap_code = XLogRecGetInfo(reader) & XLOG_HEAP_OPMASK;
 
-			if (state->collect_metadata)
-				fb_mark_record_xids_touched(reader, touched_xids, ctx);
-
 			switch (heap_code)
 			{
 				case XLOG_HEAP_INSERT:
+					if (state->collect_metadata)
+						fb_mark_record_xids_touched(reader, touched_xids, ctx);
 					if (state->collect_metadata)
 						fb_index_note_record_metadata(index);
 					if (state->collect_metadata)
@@ -8825,6 +9322,8 @@ fb_index_record_visitor(XLogReaderState *reader, void *arg)
 					break;
 				case XLOG_HEAP_DELETE:
 					if (state->collect_metadata)
+						fb_mark_record_xids_touched(reader, touched_xids, ctx);
+					if (state->collect_metadata)
 						fb_index_note_record_metadata(index);
 					if (state->collect_metadata)
 						fb_count_only_note_metadata_record(state, reader,
@@ -8842,6 +9341,8 @@ fb_index_record_visitor(XLogReaderState *reader, void *arg)
 					break;
 				case XLOG_HEAP_UPDATE:
 					if (state->collect_metadata)
+						fb_mark_record_xids_touched(reader, touched_xids, ctx);
+					if (state->collect_metadata)
 						fb_index_note_record_metadata(index);
 					if (state->collect_metadata)
 						fb_count_only_note_metadata_record(state, reader,
@@ -8858,6 +9359,8 @@ fb_index_record_visitor(XLogReaderState *reader, void *arg)
 											 FB_WAL_RECORD_HEAP_UPDATE, state);
 					break;
 				case XLOG_HEAP_HOT_UPDATE:
+					if (state->collect_metadata)
+						fb_mark_record_xids_touched(reader, touched_xids, ctx);
 					if (state->collect_metadata)
 						fb_index_note_record_metadata(index);
 					if (state->collect_metadata)
@@ -8895,6 +9398,8 @@ fb_index_record_visitor(XLogReaderState *reader, void *arg)
 											 FB_WAL_RECORD_HEAP_LOCK, state);
 					break;
 				case XLOG_HEAP_INPLACE:
+					if (state->collect_metadata)
+						fb_mark_record_xids_touched(reader, touched_xids, ctx);
 					if (state->collect_metadata)
 						fb_index_note_record_metadata(index);
 					if (state->capture_payload &&
@@ -8940,8 +9445,6 @@ fb_index_record_visitor(XLogReaderState *reader, void *arg)
 		{
 			if (state->collect_metadata)
 				fb_index_note_record_metadata(index);
-			if (state->collect_metadata)
-				fb_mark_record_xids_touched(reader, touched_xids, ctx);
 			if (state->capture_payload &&
 				reader->ReadRecPtr >= index->anchor_redo_lsn &&
 				payload_emit_visible)
@@ -8953,8 +9456,6 @@ fb_index_record_visitor(XLogReaderState *reader, void *arg)
 		{
 			if (state->collect_metadata)
 				fb_index_note_record_metadata(index);
-			if (state->collect_metadata)
-				fb_mark_record_xids_touched(reader, touched_xids, ctx);
 			if (state->capture_payload &&
 				reader->ReadRecPtr >= index->anchor_redo_lsn &&
 				payload_emit_visible &&
@@ -8988,8 +9489,6 @@ fb_index_record_visitor(XLogReaderState *reader, void *arg)
 		{
 			if (state->collect_metadata)
 				fb_index_note_record_metadata(index);
-			if (state->collect_metadata)
-				fb_mark_record_xids_touched(reader, touched_xids, ctx);
 			if (state->capture_payload &&
 				reader->ReadRecPtr >= index->anchor_redo_lsn &&
 				payload_emit_visible &&
@@ -10772,10 +11271,15 @@ fb_wal_scan_relation_window(const FbRelationInfo *info, FbWalScanContext *ctx)
 	state.touched_xids = fb_create_touched_xid_hash();
 	state.unsafe_xids = fb_create_unsafe_xid_hash();
 	ctx->summary_span_windows = 0;
+	ctx->summary_span_segments_read = 0;
 	ctx->summary_span_covered_segments = 0;
 	ctx->summary_span_fallback_segments = 0;
+	ctx->summary_span_public_builds = 0;
 	ctx->summary_xid_hits = 0;
+	ctx->summary_xid_exact_hits = 0;
 	ctx->summary_xid_fallback = 0;
+	ctx->summary_xid_segments_read = 0;
+	ctx->summary_xid_exact_segments_read = 0;
 
 	fb_prepare_segment_prefilter(info, ctx);
 	window_count = fb_build_prefilter_visit_windows(ctx, &windows);
@@ -10876,12 +11380,19 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 	state.locator_only_payload_capture = false;
 	state.payload_log = NULL;
 	state.payload_label = NULL;
+	state.xact_summary_log = &index->xact_summary_log;
+	state.xact_summary_label = "wal-xact-summary";
 	ctx->summary_span_windows = 0;
+	ctx->summary_span_segments_read = 0;
 	ctx->summary_span_covered_segments = 0;
 	ctx->summary_span_fallback_segments = 0;
+	ctx->summary_span_public_builds = 0;
 	ctx->summary_xid_hits = 0;
+	ctx->summary_xid_exact_hits = 0;
 	ctx->summary_xid_fallback = 0;
 	ctx->summary_xid_segments_read = 0;
+	ctx->summary_xid_exact_segments_read = 0;
+	ctx->xact_summary_spool_hits = 0;
 	ctx->xact_fallback_windows = 0;
 	ctx->xact_fallback_covered_segments = 0;
 	ctx->summary_unsafe_hits = 0;
@@ -11014,14 +11525,14 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 													  &payload_locator_fallback_base_windows,
 													  &payload_locator_fallback_base_count,
 													  &index->summary_payload_locator_fallback_segments,
-													  &index->summary_payload_locator_segments_read);
+													  &index->summary_payload_locator_segments_read,
+													  NULL);
 		payload_locator_segment_count =
 			fb_count_payload_locator_segments(ctx,
 											  payload_locators,
 											  payload_locator_count);
 		if (payload_locator_fallback_base_count > 0)
 		{
-			payload_capture_anchor_context = true;
 			payload_window_count =
 				fb_build_materialize_visit_windows(ctx,
 												   payload_locator_fallback_base_windows,
@@ -11056,11 +11567,6 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 												  payload_windowed_count,
 												  payload_covered_segment_count);
 		}
-		if (payload_capture_anchor_context)
-		{
-			payload_use_sparse_scan = false;
-			payload_parallel_count = 0;
-		}
 		payload_covered_segment_count += payload_locator_segment_count;
 		state.collect_metadata = false;
 		state.capture_payload = !count_only_mode;
@@ -11087,7 +11593,6 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 				  fb_visit_window_cmp);
 		if (payload_locator_count > 0 &&
 			ctx->parallel_workers > 1 &&
-			payload_locator_fallback_base_count == 0 &&
 			!count_only_mode)
 		{
 			for (i = 0; i < payload_locator_count; i++)
@@ -11417,6 +11922,386 @@ fb_wal_heap2_visible_payload_contract_debug(PG_FUNCTION_ARGS)
 		"heap2_visible_payload_enabled=%s",
 		fb_wal_payload_kind_enabled(FB_WAL_RECORD_HEAP2_VISIBLE) ?
 		"true" : "false")));
+}
+
+Datum
+fb_summary_xid_resolution_debug(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	FbRelationInfo info;
+	FbWalScanContext ctx;
+	FbWalRecordIndex index;
+	FbWalIndexBuildState state;
+	FbWalVisitWindow *windows = NULL;
+	FbWalVisitWindow *span_windows = NULL;
+	FbWalVisitWindow *metadata_windows = NULL;
+	FbWalVisitWindow *fallback_windows = NULL;
+	HTAB *fallback_touched = NULL;
+	HTAB *fallback_unsafe = NULL;
+	StringInfoData buf;
+	uint32 window_count = 0;
+	uint32 span_window_count = 0;
+	uint32 metadata_window_count = 0;
+	uint32 fallback_window_count = 0;
+	uint32 unresolved_touched = 0;
+	uint32 unresolved_unsafe = 0;
+	HASH_SEQ_STATUS status;
+	FbTouchedXidEntry *touched_entry;
+	FbUnsafeXidEntry *unsafe_entry;
+
+	if (target_ts > GetCurrentTimestamp())
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("target timestamp must not be in the future")));
+
+	fb_require_archive_has_wal_segments();
+	fb_catalog_load_relation_info(relid, &info);
+	fb_wal_prepare_scan_context(target_ts, NULL, &ctx);
+
+	MemSet(&index, 0, sizeof(index));
+	index.target_ts = ctx.target_ts;
+	index.query_now_ts = ctx.query_now_ts;
+	index.xid_statuses = fb_create_xid_status_hash();
+	if (ctx.summary_cache == NULL)
+		ctx.summary_cache = fb_summary_query_cache_create(CurrentMemoryContext);
+	index.summary_cache = ctx.summary_cache;
+
+	MemSet(&state, 0, sizeof(state));
+	state.info = &info;
+	state.ctx = &ctx;
+	state.index = &index;
+	state.touched_xids = fb_create_touched_xid_hash();
+	state.unsafe_xids = fb_create_unsafe_xid_hash();
+	state.collect_metadata = true;
+	state.collect_xact_statuses = false;
+	state.capture_payload = false;
+	state.count_only_capture = false;
+	state.tail_capture_allowed = false;
+	state.defer_payload_body = true;
+	state.locator_only_payload_capture = false;
+	state.xact_summary_log = NULL;
+	state.xact_summary_label = NULL;
+
+	fb_prepare_segment_prefilter(&info, &ctx);
+	window_count = fb_build_prefilter_visit_windows(&ctx, &windows);
+	span_window_count =
+		fb_build_summary_span_visit_windows(&info, &ctx, windows, window_count, &span_windows);
+	if (span_window_count > 0)
+		span_window_count = fb_merge_visit_windows(&ctx, &span_windows, span_window_count);
+
+	metadata_window_count =
+		fb_summary_seed_metadata_from_summary(&info,
+											  &ctx,
+											  (span_window_count > 0) ? span_windows : windows,
+											  (span_window_count > 0) ? span_window_count : window_count,
+											  state.touched_xids,
+											  state.unsafe_xids,
+											  &metadata_windows);
+	if (metadata_window_count > 0)
+	{
+		uint32 i;
+
+		for (i = 0; i < metadata_window_count; i++)
+			fb_wal_visit_window(&ctx, &metadata_windows[i], fb_index_record_visitor, &state);
+	}
+
+	(void) fb_summary_fill_xact_statuses(&info,
+										 &ctx,
+										 &index,
+										 (span_window_count > 0) ? span_windows : windows,
+										 (span_window_count > 0) ? span_window_count : window_count,
+										 state.touched_xids,
+										 state.unsafe_xids);
+
+	fb_build_unresolved_xid_fallback_sets(&index,
+										  state.touched_xids,
+										  state.unsafe_xids,
+										  &fallback_touched,
+										  &fallback_unsafe);
+	if ((fallback_touched != NULL && hash_get_num_entries(fallback_touched) > 0) ||
+		(fallback_unsafe != NULL && hash_get_num_entries(fallback_unsafe) > 0))
+	{
+		fallback_window_count =
+			fb_build_xact_fallback_visit_windows(&ctx,
+												 (span_window_count > 0) ? span_windows : windows,
+												 (span_window_count > 0) ? span_window_count : window_count,
+												 &fallback_windows);
+		(void) fb_summary_fill_exact_xact_statuses(&ctx,
+												   &index,
+												   fallback_windows,
+												   fallback_window_count,
+												   fallback_touched,
+												   fallback_unsafe);
+	}
+
+	if (fallback_touched != NULL)
+	{
+		hash_destroy(fallback_touched);
+		fallback_touched = NULL;
+	}
+	if (fallback_unsafe != NULL)
+	{
+		hash_destroy(fallback_unsafe);
+		fallback_unsafe = NULL;
+	}
+
+	fb_build_unresolved_xid_fallback_sets(&index,
+										  state.touched_xids,
+										  state.unsafe_xids,
+										  &fallback_touched,
+										  &fallback_unsafe);
+	if ((fallback_touched != NULL && hash_get_num_entries(fallback_touched) > 0) ||
+		(fallback_unsafe != NULL && hash_get_num_entries(fallback_unsafe) > 0))
+	{
+		(void) fb_summary_fill_exact_xact_statuses(&ctx,
+												   &index,
+												   NULL,
+												   0,
+												   fallback_touched,
+												   fallback_unsafe);
+	}
+
+	if (fallback_touched != NULL)
+	{
+		hash_seq_init(&status, fallback_touched);
+		while ((touched_entry = (FbTouchedXidEntry *) hash_seq_search(&status)) != NULL)
+		{
+			FbXidStatusEntry *entry;
+
+			entry = fb_get_xid_status_entry(index.xid_statuses, touched_entry->xid, NULL);
+			if (entry == NULL || entry->status == FB_WAL_XID_UNKNOWN)
+				unresolved_touched++;
+		}
+	}
+	if (fallback_unsafe != NULL)
+	{
+		hash_seq_init(&status, fallback_unsafe);
+		while ((unsafe_entry = (FbUnsafeXidEntry *) hash_seq_search(&status)) != NULL)
+		{
+			FbXidStatusEntry *entry;
+
+			entry = fb_get_xid_status_entry(index.xid_statuses, unsafe_entry->xid, NULL);
+			if (entry == NULL || entry->status == FB_WAL_XID_UNKNOWN)
+				unresolved_unsafe++;
+		}
+	}
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "summary_hits=%u summary_exact_hits=%u unresolved_touched=%u unresolved_unsafe=%u fallback_windows=%u touched_samples=",
+					 ctx.summary_xid_hits,
+					 ctx.summary_xid_exact_hits,
+					 unresolved_touched,
+					 unresolved_unsafe,
+					 fallback_window_count);
+	fb_append_touched_xid_hash_samples(&buf, fallback_touched, 8);
+
+	if (fallback_windows != NULL)
+		pfree(fallback_windows);
+	if (metadata_windows != NULL)
+		pfree(metadata_windows);
+	if (span_windows != NULL)
+		pfree(span_windows);
+	if (windows != NULL)
+		pfree(windows);
+	if (fallback_touched != NULL)
+		hash_destroy(fallback_touched);
+	if (fallback_unsafe != NULL)
+		hash_destroy(fallback_unsafe);
+	if (state.touched_xids != NULL)
+		hash_destroy(state.touched_xids);
+	if (state.unsafe_xids != NULL)
+		hash_destroy(state.unsafe_xids);
+
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+Datum
+fb_summary_payload_locator_plan_debug(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	FbRelationInfo info;
+	FbWalScanContext ctx;
+	FbWalRecordIndex index;
+	FbWalIndexBuildState state;
+	FbWalScanVisitorState anchor_state;
+	FbWalVisitWindow *windows = NULL;
+	FbWalVisitWindow *span_windows = NULL;
+	FbWalVisitWindow *payload_base_windows = NULL;
+	FbWalVisitWindow *metadata_windows = NULL;
+	FbWalVisitWindow *payload_locator_fallback_base_windows = NULL;
+	FbSummaryPayloadLocator *payload_locators = NULL;
+	FbPayloadLocatorPlanDebug plan_debug;
+	StringInfoData buf;
+	const FbWalVisitWindow *payload_source_windows;
+	uint32 window_count = 0;
+	uint32 span_window_count = 0;
+	uint32 payload_base_window_count = 0;
+	uint32 metadata_window_count = 0;
+	uint32 payload_source_window_count = 0;
+	uint32 payload_locator_count = 0;
+	uint32 payload_locator_fallback_base_count = 0;
+	uint32 payload_locator_fallback_segments = 0;
+	uint32 payload_locator_segments_read = 0;
+	uint32 i;
+
+	if (target_ts > GetCurrentTimestamp())
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("target timestamp must not be in the future")));
+
+	fb_require_archive_has_wal_segments();
+	fb_catalog_load_relation_info(relid, &info);
+	fb_wal_prepare_scan_context(target_ts, NULL, &ctx);
+
+	MemSet(&index, 0, sizeof(index));
+	index.target_ts = ctx.target_ts;
+	index.query_now_ts = ctx.query_now_ts;
+	index.xid_statuses = fb_create_xid_status_hash();
+	if (ctx.summary_cache == NULL)
+		ctx.summary_cache = fb_summary_query_cache_create(CurrentMemoryContext);
+	index.summary_cache = ctx.summary_cache;
+
+	MemSet(&state, 0, sizeof(state));
+	state.info = &info;
+	state.ctx = &ctx;
+	state.index = &index;
+	state.touched_xids = fb_create_touched_xid_hash();
+	state.unsafe_xids = fb_create_unsafe_xid_hash();
+	state.collect_metadata = true;
+	state.collect_xact_statuses = false;
+	state.capture_payload = false;
+	state.count_only_capture = false;
+	state.tail_capture_allowed = false;
+	state.defer_payload_body = true;
+	state.locator_only_payload_capture = false;
+	state.xact_summary_log = NULL;
+	state.xact_summary_label = NULL;
+
+	fb_prepare_segment_prefilter(&info, &ctx);
+	window_count = fb_build_prefilter_visit_windows(&ctx, &windows);
+	span_window_count =
+		fb_build_summary_span_visit_windows(&info, &ctx, windows, window_count, &span_windows);
+	payload_base_window_count = span_window_count;
+	payload_base_windows = fb_copy_visit_windows(span_windows, span_window_count);
+	span_window_count = fb_merge_visit_windows(&ctx, &span_windows, span_window_count);
+	metadata_window_count =
+		fb_summary_seed_metadata_from_summary(&info,
+											  &ctx,
+											  (span_window_count > 0) ? span_windows : windows,
+											  (span_window_count > 0) ? span_window_count : window_count,
+											  state.touched_xids,
+											  state.unsafe_xids,
+											  &metadata_windows);
+	if (metadata_window_count > 0)
+	{
+		for (i = 0; i < metadata_window_count; i++)
+		{
+			fb_wal_visit_window(&ctx, &metadata_windows[i], fb_index_record_visitor, &state);
+			if (ctx.unsafe)
+				break;
+		}
+	}
+	if (!ctx.anchor_found)
+	{
+		if (window_count == 0)
+			fb_wal_visit_records(&ctx, fb_index_record_visitor, &state);
+		else
+		{
+			for (i = 0; i < window_count; i++)
+			{
+				fb_wal_visit_window(&ctx, &windows[i], fb_index_record_visitor, &state);
+				if (ctx.unsafe)
+					break;
+			}
+		}
+	}
+	if (!ctx.anchor_found && window_count > 0 && !ctx.unsafe)
+	{
+		MemSet(&anchor_state, 0, sizeof(anchor_state));
+		anchor_state.info = &info;
+		anchor_state.ctx = &ctx;
+		anchor_state.touched_xids = state.touched_xids;
+		anchor_state.unsafe_xids = state.unsafe_xids;
+		fb_wal_visit_records(&ctx, fb_scan_record_visitor, &anchor_state);
+	}
+	if (!ctx.anchor_found)
+		fb_wal_raise_missing_anchor_error(&ctx, false, 0);
+	index.anchor_found = ctx.anchor_found;
+	index.anchor_redo_lsn = ctx.anchor_redo_lsn;
+	index.tail_inline_payload = false;
+	index.tail_cutover_lsn = InvalidXLogRecPtr;
+	payload_source_windows =
+		(payload_base_window_count > 0) ? payload_base_windows :
+		(span_window_count > 0) ? span_windows : windows;
+	payload_source_window_count =
+		(payload_base_window_count > 0) ? payload_base_window_count :
+		(span_window_count > 0) ? span_window_count : window_count;
+
+	MemSet(&plan_debug, 0, sizeof(plan_debug));
+	payload_locator_count =
+		fb_build_summary_payload_locator_plan(&info,
+											  &ctx,
+											  payload_source_windows,
+											  payload_source_window_count,
+											  index.anchor_redo_lsn,
+											  index.tail_inline_payload ?
+											  index.tail_cutover_lsn :
+											  ctx.end_lsn,
+											  &payload_locators,
+											  &payload_locator_fallback_base_windows,
+											  &payload_locator_fallback_base_count,
+											  &payload_locator_fallback_segments,
+											  &payload_locator_segments_read,
+											  &plan_debug);
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "base_segments=%u success_segments=%u empty_success_segments=%u segments_with_locators=%u fallback_segments=%u locator_records=%u base_archive=%u base_pgwal=%u base_archive_dir=%u base_ckwal=%u success_archive=%u success_pgwal=%u success_archive_dir=%u success_ckwal=%u fallback_archive=%u fallback_pgwal=%u fallback_archive_dir=%u fallback_ckwal=%u locator_archive=%u locator_pgwal=%u locator_archive_dir=%u locator_ckwal=%u failed_segments=",
+					 plan_debug.base_segments,
+					 plan_debug.success_segments,
+					 plan_debug.empty_success_segments,
+					 plan_debug.segments_with_locators,
+					 plan_debug.fallback_segments,
+					 payload_locator_count,
+					 plan_debug.base_by_source[FB_WAL_SOURCE_ARCHIVE_DEST],
+					 plan_debug.base_by_source[FB_WAL_SOURCE_PG_WAL],
+					 plan_debug.base_by_source[FB_WAL_SOURCE_ARCHIVE_DIR_LEGACY],
+					 plan_debug.base_by_source[FB_WAL_SOURCE_CKWAL],
+					 plan_debug.success_by_source[FB_WAL_SOURCE_ARCHIVE_DEST],
+					 plan_debug.success_by_source[FB_WAL_SOURCE_PG_WAL],
+					 plan_debug.success_by_source[FB_WAL_SOURCE_ARCHIVE_DIR_LEGACY],
+					 plan_debug.success_by_source[FB_WAL_SOURCE_CKWAL],
+					 plan_debug.fallback_by_source[FB_WAL_SOURCE_ARCHIVE_DEST],
+					 plan_debug.fallback_by_source[FB_WAL_SOURCE_PG_WAL],
+					 plan_debug.fallback_by_source[FB_WAL_SOURCE_ARCHIVE_DIR_LEGACY],
+					 plan_debug.fallback_by_source[FB_WAL_SOURCE_CKWAL],
+					 plan_debug.locator_by_source[FB_WAL_SOURCE_ARCHIVE_DEST],
+					 plan_debug.locator_by_source[FB_WAL_SOURCE_PG_WAL],
+					 plan_debug.locator_by_source[FB_WAL_SOURCE_ARCHIVE_DIR_LEGACY],
+					 plan_debug.locator_by_source[FB_WAL_SOURCE_CKWAL]);
+	fb_append_payload_locator_failed_samples(&buf, &plan_debug);
+
+	if (payload_locators != NULL)
+		pfree(payload_locators);
+	if (payload_locator_fallback_base_windows != NULL)
+		pfree(payload_locator_fallback_base_windows);
+	if (metadata_windows != NULL)
+		pfree(metadata_windows);
+	if (payload_base_windows != NULL)
+		pfree(payload_base_windows);
+	if (span_windows != NULL)
+		pfree(span_windows);
+	if (windows != NULL)
+		pfree(windows);
+	if (state.touched_xids != NULL)
+		hash_destroy(state.touched_xids);
+	if (state.unsafe_xids != NULL)
+		hash_destroy(state.unsafe_xids);
+
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }
 
 /*

@@ -134,6 +134,7 @@ capture_bundle() {
 			fb_release_gate_manifest_append "$truth_dml_manifest" "$item_json"
 		fi
 	done
+
 }
 
 merge_manifests() {

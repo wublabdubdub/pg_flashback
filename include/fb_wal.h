@@ -126,11 +126,16 @@ typedef struct FbWalScanContext
 	uint32 prefilter_total_segments;
 	bool *segment_hit_map;
 	uint32 summary_span_windows;
+	uint32 summary_span_segments_read;
 	uint32 summary_span_covered_segments;
 	uint32 summary_span_fallback_segments;
+	uint64 summary_span_public_builds;
 	uint32 summary_xid_hits;
+	uint32 summary_xid_exact_hits;
 	uint32 summary_xid_fallback;
 	uint32 summary_xid_segments_read;
+	uint32 summary_xid_exact_segments_read;
+	uint32 xact_summary_spool_hits;
 	uint32 xact_fallback_windows;
 	uint32 xact_fallback_covered_segments;
 	uint32 summary_unsafe_hits;
@@ -296,6 +301,7 @@ typedef struct FbWalRecordIndex
 	FbSpoolSession *spool_session;
 	FbSpoolLog *record_log;
 	FbSpoolLog *record_tail_log;
+	FbSpoolLog *xact_summary_log;
 	HTAB *precomputed_missing_blocks;
 	uint32 precomputed_missing_block_count;
 	RelFileLocator target_locator;

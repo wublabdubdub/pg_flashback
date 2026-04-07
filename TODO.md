@@ -12,6 +12,24 @@
 
 ## 本轮已完成
 
+- [x] 修复无主键 bag residual 历史行首条丢失的问题
+  - 根因已确认：
+    - `fb_bag_apply_finish_scan()` 会把 `residual_cursor` 初始化到
+      `entries_head`
+    - 但 `fb_bag_emit_residual()` 首次发射 residual 时先推进到
+      `all_next`
+    - 导致 bag residual 链表头永远不会被发射
+  - 当前修复已落地：
+    - `fb_bag_emit_residual()` 改成显式维护当前 entry 的剩余发射次数
+    - 只有当前 entry 发完后才推进到下一个 residual entry
+    - `fb_flashback_bag` 已补最小 RED：
+      - 无主键表 `update -> delete 到空表 -> vacuum`
+      - 回看 `after_insert / after_update / after_delete_one`
+        三个时间点均断言 residual 行完整返回
+  - 当前已验证：
+    - 手工 PG18 `alldb` 同类 case 恢复正确结果
+    - `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_flashback_bag'`
+      `All 1 tests passed.`
 - [x] 修复扩展同版本号接口漂移导致的升级缺口
   - 根因已确认：
     - 历史上曾在同一 `extversion = '0.1.0'` 下先后安装过
@@ -109,6 +127,84 @@
     - `fb_summary_service` 回归新增“删除 WAL 后删除对应 summary 文件”断言并通过
 
 ## 当前待办
+  - [ ] 彻底收敛 release gate `run_flashback_checks` 的 `3/9 build record index`
+  - [x] 先补最小 RED / 观测，锁住 `summary-span` 与 `xact-status` 的新 counters
+  - [x] 将 `summary-span` 从“query 时现拷 spans”升级成 cache 期 stable public slice
+  - [x] 在 query-side `summary-span` 规划中加入 segment 去重与更早 merge，避免窗口爆炸
+  - [x] 给 `xact-status` 接通 metadata 期 `xact_summary_log`，查询期先消费 query-local spool
+  - [x] 为 `xact-status` 增加 summary-first 后的精确补洞路径，避免直接退化到 segment 级 WAL fallback
+  - [x] 仅在精确补洞仍失败时才继续 WAL fallback，并继续压缩 fallback 覆盖范围
+    - [x] 为 unresolved xid 增加“全局 summary exact lookup”，不再受 relation span windows 限制
+    - [x] 优先覆盖“summary 全覆盖但 commit/abort 落在后续 segment”场景
+    - [x] 修复 summary build 的 `RM_XACT_ID` parse 口径：
+      - `src/fb_summary.c` 现已改成把完整 `XLogRecGetInfo(reader)`
+        传给 `ParseCommitRecord()` / `ParseAbortRecord()`
+      - `FB_SUMMARY_VERSION` 已前滚到 `10`，强制旧 summary 重建
+      - `fb_recordref` 已新增 commit-subxact / abort-subxact RED，
+        锁住“仅靠 summary xid outcome 即可解出，不再回退到 WAL”
+    - [x] 用回归锁住：
+      - [x] abort-subxact `unresolved_touched = 0`
+      - [x] abort-subxact `unresolved_unsafe = 0`
+      - [x] abort-subxact `fallback_windows = 0`
+  - [x] 用 `./run_release_gate.sh --from run_flashback_checks` 现场复跑
+  - [ ] 继续压缩 `3/9 30% metadata`，直到 summary 驱动步骤全部稳定落到 `< 5s`
+    - [x] 首个 release gate query case 已压到：
+      - `summary-span` `29.646 ms`
+      - `xact-status` `525.584 ms`
+      - `payload` `516.234 ms`
+    - [x] `metadata` 已在同机二次复跑压到 `3229.323 ms`
+    - [ ] 当前剩余唯一超目标项已转成 `payload` `10951.771 ms`
+    - [ ] 继续追 archive source 上 `summary_payload_locator_records = 0`
+      / `summary_payload_locator_public_builds = 0`
+      / `summary_payload_locator_fallback_segments = 364`
+      的残余 summary locator 缺口
+      - [ ] 先对账 payload locator 四层链路：
+        - [x] summary build 写入
+        - [ ] summary cache load
+        - [ ] query lookup/public slice
+        - [x] archive source identity
+      - [x] 补最小 RED，锁住“同一 archive segment 切换等价 archive 路径后仍复用同一 summary identity”
+      - [x] 调整 summary identity/hash 契约，去掉对 archive 路径字符串的绑定
+      - [x] 复核 summary service / cleanup / query lookup 在默认 `archive_command`
+        与显式 `archive_dest` 双口径下不再互相打架
+      - [ ] 在修复 archive source identity 后，复跑 release gate 现场，
+        继续确认 `summary_payload_locator_public_builds` 与 `3/9 payload`
+        是否同步收敛
+  - [ ] 完成 correctness-only 口径的 release gate truth 对比
+    - [x] `random_flashback_1.documents @ 2026-04-07 04:41:28.555065+00`
+          已对上 truth：
+          `sha256 = 4edde6e0b1e1ee94e1f9e2de12856bb1a50a85e73431dcbceae16a8e18117e0c`
+          / `row_count = 1949969`
+    - [ ] 修掉
+          `random_flashback_1.users @ 2026-04-07 04:41:28.555065+00`
+          在现有 `meta/summary` 下的
+          `ERROR: pfree called with invalid pointer ...`
+    - [ ] 解释并修掉同一 `users` case 在移空 `meta/summary` 后的
+          `ERROR: too many shared backtracking rounds while resolving missing FPI`
+    - [ ] 在上述 blocker 清掉后，继续把 `run_flashback_checks -> evaluate_gate`
+          的 truth compare 跑完
+- [x] 删除 release gate 的 frozen WAL fixture 路径，恢复直接使用 live archive
+  - [x] 补 shell 级最小 RED，锁住 `run_flashback_matrix.sh` 不再切 frozen `archive_dest`
+  - [x] 删除 `capture_truth_snapshots.sh` / `run_flashback_matrix.sh` / `create_flashback_ctas.sql` 中的 frozen WAL 复制与覆盖逻辑
+  - [x] 删除 `common.sh` / `selftest.sh` 中 frozen helper 与相关断言
+  - [x] 更新 `tests/release_gate/README.md`、`STATUS.md` 到 live-archive-only 新口径
+  - [x] 复核：中间阶段运行仍不会误删 live archive
+
+- [x] 修复 release gate 总入口在失败退出后误删归档现场的问题
+  - [x] 补 shell 级最小 RED，锁住“跑过 `prepare_instance` 后退出也不得自动清空 archive dir”
+  - [x] 调整 `tests/release_gate/bin/run_release_gate.sh` 的 cleanup 口径
+  - [x] 更新 release gate 文档与状态文档
+
+- [x] 修复 release gate 初始化阶段未在新建 `alldb` 后安装 `pg_flashback` 扩展的问题
+  - [x] 补 shell 级最小 RED，锁住 `prepare_empty_instance.sh` 在 `createdb` 后会执行 `CREATE EXTENSION`
+  - [x] 调整 release gate 初始化脚本
+  - [x] 更新 release gate 文档与状态文档
+
+- [x] 修复 deep/full 脚本自动清理 live archive 导致缺 checkpoint/FPI 的问题
+  - [x] 补 shell 级最小 RED，锁住 `full` 模式 round cleanup 不得清空 live archive
+  - [x] 调整 `tests/deep/bin/common.sh` / `run_all_deep_tests.sh` 的 cleanup 口径
+  - [x] 更新 `tests/deep/README.md` 与状态文档到新语义
+
 - [x] 修复 `count(*) FROM pg_flashback(...)` 的错误计数现场
   - [x] 补最小 RED：
     - [x] 为 `fb_custom_scan` 增加“target 后含 `INSERT + DELETE`”的计数回归
@@ -169,6 +265,27 @@
           不再卡在 `3/9` 的 payload locator 规划
 
 - [ ] 继续压 `documents @ '2026-04-04 23:40:13'` 的 payload materialize / spool 体积
+  - [ ] 对 release gate 当前 `70% -> 100% payload` 补精确归因：
+    - [ ] locator-only stub
+    - [ ] locator serial materialize
+    - [ ] fallback windows
+    - [ ] replay 必需 image/body
+
+- [ ] 修完 release gate `scenario_oa_50t_50000r.documents @ 2026-04-07 04:41:28.555065+00`
+      的 replay warm blocker，并继续追到新的首个现场瓶颈
+  - [x] 补最小 RED：
+    - [x] `fb_replay_heap_update_block_id_contract_debug()`
+          锁住 cross-block update 必须按 WAL `block_id`
+          识别 new block / old block
+  - [x] 修复 `src/fb_replay.c`：
+    - [x] `fb_replay_heap_update()` 改为优先按
+          `block_id=0/1` 认 new/old block，
+          不再信任过滤后的 `record.blocks[]` 数组位置
+  - [ ] 继续 live 复核：
+    - [ ] `count(*)` / `./run_release_gate.sh --from run_flashback_checks`
+          确认不再复现
+          `failed to locate tuple for heap delete redo`
+    - [ ] 若现场已前移，记录新的首个 blocker 并继续修
   - [x] 已确认 locator 规划热点已移除，当前 `3/9` 新主耗时不再是 `pg_qsort`
   - [x] 先把 summary payload locator 访问从“逐条 `XLogBeginRead`”改成批量顺扫
     - [x] 为 payload locator 访问 batching 新增 ADR / 架构登记

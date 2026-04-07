@@ -115,6 +115,387 @@
 
 ## 当前进行中
 
+- 已完成修复无主键 bag residual 历史行首条丢失的问题：
+  - 2026-04-07 本机 PG18 / `alldb` 用户现场已复现：
+    - `INSERT(2 rows) -> UPDATE a=1 -> DELETE a=1 -> DELETE all -> VACUUM`
+    - 回看 `after_insert / after_update / after_delete_a1` 三个时间点时，
+      `pg_flashback()` 会漏掉 residual 链表头对应的历史行
+  - root cause 已确认：
+    - `src/fb_apply_bag.c` 中 `fb_bag_emit_residual()` 在
+      `fb_bag_apply_finish_scan()` 把 `residual_cursor` 指向 `entries_head` 后，
+      首次发射 residual 时仍先推进到 `all_next`
+    - 结果 bag 模式下 residual 链表头永远不发射
+    - 当当前表已空且目标历史结果全部依赖 residual 发射时，
+      就会表现为“少一行”或“直接空结果”
+  - 当前修复已落地：
+    - `fb_bag_emit_residual()` 改为显式维护“当前 entry 剩余待发射次数”
+    - 只有当前 entry 的 residual 次数耗尽后才推进到下一个 `all_next`
+    - 已补最小 SQL 回归：
+      - `sql/fb_flashback_bag.sql`
+      - `expected/fb_flashback_bag.out`
+    - 新回归锁住：
+      - 无主键表
+      - update + delete 到空表
+      - `VACUUM`
+      - 多个 target timestamp 均能正确发射 residual 历史行
+  - 当前验证已完成：
+    - 手工 PG18 复跑用户同类 case：
+      - `after_insert` 返回 `2` 行
+      - `after_update` 返回 `2` 行
+      - `after_delete_a1` 返回 `1` 行
+    - `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_flashback_bag'`
+      `All 1 tests passed.`
+
+- 已启动 `run_flashback_checks` 现场的 `3/9 build record index` 彻底收敛：
+  - 2026-04-07 本机 PG18 / `alldb` 现场已手工复跑：
+    - `./run_release_gate.sh --from run_flashback_checks`
+  - 当前已确认：
+    - 最近几轮 `3/9` 优化主要压缩的是 payload / locator / materializer 主链
+    - 这些优化并非无效，但新的主耗时已经前移到 query-side 的
+      `summary-span` 与 `xact-status` 路径
+  - 现场 root cause 已确认分成两段：
+    - `summary-span`
+      - `fb_build_summary_span_visit_windows()` 当前仍按 segment 逐次 lookup，
+        并让 `fb_summary_segment_lookup_spans_cached()` 在 query 时
+        重新 `palloc + copy` relation span 数组
+      - `3/9 10% -> 30%` 的大抖动当前对应这一段 query-side 现拼现拷
+    - `xact-status`
+      - `fb_summary_fill_xact_statuses()` 仍先按 source windows 读取 outcome slice
+      - 只要 unresolved xid 仍存在，就会继续走
+        `fb_build_xact_fallback_visit_windows()` 的 segment 级 WAL fallback
+      - 现场 `perf` / `pg_stat_activity` 已确认热点落在
+        `fb_wal_fill_xact_statuses_serial -> fb_wal_visit_window -> WalRead`
+  - 当前实施路线已拍板：
+    - `summary-span` 改成 cache 期 stable public slice，禁止 query 时重复 copy
+    - `summary-span` query 侧增加 segment 去重与更早的 window merge
+    - `xact-status` 先消费 metadata 期产出的 query-local xact summary spool
+    - `xact-status` 在 summary-first 后增加精确补洞路径，优先避免整段 WAL fallback
+    - 若仍需 WAL fallback，继续缩到 unresolved xid 驱动，而不是沿用大窗口 segment 扫描
+  - 2026-04-07 当前新增收敛已落地：
+    - serial metadata 主路径已正式接通 `xact_summary_log`
+    - `RM_XACT_ID` 的 commit/abort outcome 现在会在 metadata 扫描期写入
+      query-local spool
+    - `fb_wal_fill_xact_statuses_serial()` 现改为：
+      - 先消费 `xact_summary_log`
+      - 仅对 spool 未解出的 xid 再走 summary outcome
+      - 仍未解出时才进入 exact-fill / WAL fallback
+    - `fb_recordref_debug()` 已新增：
+      - `xact_summary_spool_records`
+      - `xact_summary_spool_hits`
+    - 最小回归 `fb_recordref` 已锁住：
+      - 当前夹具下 `xact_summary_spool_hits > 0`
+      - `summary_xid_segments_read = 0`
+      - `xact_fallback_windows = 0`
+  - 本轮完成标准：
+    - 直接用 release gate 现场复跑
+    - 若 `./run_release_gate.sh --from run_flashback_checks`
+      中 `3/9` 无明显缩短，则继续迭代，不以“已完成”收尾
+  - 2026-04-07 晚间同机现场已继续确认新的 root cause：
+    - `tests/release_gate/bin/run_release_gate.sh --from run_flashback_checks`
+      当前首个 query case 仍稳定落在：
+      - `3/9 30% metadata` 约 `57s`
+      - `3/9 55% xact-status` 约 `31s`
+      - `3/9 70% -> 100% payload` 约 `27s`
+    - `pg_flashback_summary_progress` 已确认：
+      - `missing_segments = 0`
+      - `last_query_summary_ready = t`
+      - 说明当前现场不是“summary 未覆盖”导致的常规降级
+    - 对 `fb_recordref_debug('scenario_oa_50t_50000r.documents', ...)`
+      现场 backend 做 `gdb/perf` 已确认：
+      - 当前卡点明确在
+        `fb_wal_fill_xact_statuses_serial -> fb_wal_visit_window -> fb_wal_read_page`
+      - `frame fb_wal_fill_xact_statuses_serial` 局部变量已看到：
+        - `window_count = 119543`
+        - `fallback_window_count = 7`
+        - `remaining_xids = 2`
+      - 说明不是“大量 unresolved xid”本身，而是“极少量 unresolved xid`
+        仍把 backend 拉回真实 WAL fallback”
+    - 当前进一步收敛结论：
+      - `xact-status`
+        - 问题不再是 summary 全量 outcome slice copy
+        - 而是少量 unresolved xid 在 relation span 覆盖外仍需要 outcome 时，
+          现路径没有继续做“全局 summary exact lookup”
+        - 结果即使 summary 全覆盖，仍会退回 `WalRead`
+    - 2026-04-07 深夜同机继续做 live xid 样本反查后，当前更细 root cause
+      已进一步收敛到 `summary builder`：
+      - 再次用 `fb_recordref_debug('scenario_oa_50t_50000r.documents',
+        '2026-04-07 04:41:28.555065+00')` 现场复跑，
+        仍看到：
+        - `summary_xid_hits = 44405`
+        - `summary_xid_exact_hits = 0`
+        - `summary_xid_fallback = 54`
+        - `xact_fallback_windows = 7`
+      - `gdb` 直接遍历 `fb_wal_fill_xact_statuses_serial()` 的
+        `fallback_touched` 已取到一批仍需回退的 sample xid：
+        - `13296140`
+        - `13295781`
+        - `13296138`
+        - `13295989`
+        - `13295990`
+        - `13296881`
+        - `13296884`
+      - 对这批 sample xid 做 `pg_waldump` 直接 grep，没有任何顶层
+        `tx:` 命中，说明它们更像是 relation DML 期的 subxid，不是顶层
+        commit xid
+      - 当前最可疑的不一致点已定位到：
+        - `src/fb_summary.c` 在 summary build 期进入 `RM_XACT_ID`
+          后，先把 `xl_info` 掩成 `XLOG_XACT_OPMASK`
+        - 然后把这个被掩码后的值传给
+          `ParseCommitRecord()` / `ParseAbortRecord()`
+        - 但 query-side WAL fallback (`src/fb_wal.c`) 传的是完整
+          `XLogRecGetInfo(reader)`
+      - 当前判断：
+        - 这很可能让 summary build 丢掉 commit/abort record 中的
+          `subxact` 信息
+        - 结果就是 summary xid outcome 只覆盖顶层 xid，
+          query-side 仍要为少量 subxid 退回真实 WAL
+    - 2026-04-07 深夜这条 root cause 已确认并完成首轮修复：
+      - 已补 `fb_summary_xid_resolution_debug()`，把 live case 直接拆成
+        “summary-only 不走 raw WAL fallback” 口径
+      - live case 在 summary-only 下确实仍留下 unresolved xid，
+        说明问题不在“query 没用 summary”，而在“summary 文件没写全”
+      - 已补最小 RED：
+        - `fb_recordref` 新增 commit-subxact / abort-subxact 两组场景
+        - 其中 abort-subxact 在修复前稳定表现为：
+          - `summary_hits = 0`
+          - `unresolved_touched = 3`
+          - `unresolved_unsafe = 1`
+          - `fallback_windows = 1`
+      - 当前修复已落地：
+        - `src/fb_summary.c` 的 `RM_XACT_ID` build 路径改为把完整
+          `XLogRecGetInfo(reader)` 传给
+          `ParseCommitRecord()` / `ParseAbortRecord()`
+        - `FB_SUMMARY_VERSION` 已前滚到 `10`，强制旧 summary 失效并重建
+      - 当前验证已完成：
+        - abort-subxact RED 修复后已变为：
+          - `summary_hits = 4`
+          - `unresolved_touched = 0`
+          - `unresolved_unsafe = 0`
+          - `fallback_windows = 0`
+        - `installcheck REGRESS='fb_recordref'`
+          `All 1 tests passed.`
+      - 对 release gate 实际 archive source (`/walstorage/18waldata`)
+        继续复核后，当前现场进一步收敛为：
+        - `xact-status` 已不再依赖 raw WAL fallback：
+          - `xact_summary_spool_hits = 30432`
+          - `summary_xid_hits = 0`
+          - `xact_fallback_windows = 0`
+        - 但 `metadata` 仍有残余 summary 缺口：
+          - `metadata_fallback_windows = 364`
+          - `summary_payload_locator_public_builds = 0`
+      - 直接复跑
+        `tests/release_gate/bin/run_release_gate.sh --from run_flashback_checks`
+        的首个 query case，当前 `3/9` 已缩到：
+        - `summary-span` `+29.646 ms`
+        - `metadata` `+6412.559 ms`
+        - `xact-status` `+525.584 ms`
+        - `payload` `+516.234 ms`
+      - 同机再次复跑同一首个 query case 后，当前进一步确认：
+        - `metadata` 可继续降到 `+3229.323 ms`
+        - `xact-status` 稳定在 `+417.550 ms`
+        - 但 `payload` 会抬到 `+10951.771 ms`
+      - 当前剩余主瓶颈已进一步收敛为：
+        - `summary payload locator` 没有真正命中 public slice
+        - 现场仍看到：
+          - `summary_payload_locator_records = 0`
+          - `summary_payload_locator_public_builds = 0`
+          - `summary_payload_locator_fallback_segments = 364`
+        - 说明“所有 summary 驱动步骤 < 5s”当前只剩 payload 一段尚未达标
+      - 当前下一步已拍板：
+        - 继续沿 payload locator 数据流逐层对账
+        - 先分清：
+          - summary build 是否真的写了 locator
+          - summary cache/query lookup 是否真的读到了 locator public slice
+          - release gate 的 archive source 是否在 source identity 上与 summary 文件失配
+      - 2026-04-07 深夜沿 archive source identity 继续对账后，当前已确认更细 root cause：
+        - `summary build` 本身没有丢 payload locator：
+          - 对样本 segment `00000001000000B40000001E`
+            离线扫 `.meta` 已确认旧 summary
+            `summary-df414f45d29afb05.meta` 内含目标 relation 的
+            payload locator
+          - 新增单段 debug 后，
+            `fb_summary_build_candidate_debug('/walstorage/18waldata/...1E')`
+            也已确认该 segment 可以单独成功重建
+        - 真正不一致出在 `summary identity`：
+          - 默认 `summary service` / progress 口径走的是 PostgreSQL
+            `archive_command` 解析出的 `/home/18pg/wal_arch`
+          - release gate query session 显式 `SET pg_flashback.archive_dest`
+            后走的是 `/walstorage/18waldata`
+          - 当前 `fb_summary_file_identity_hash()` 把完整 `path`
+            纳入 hash，导致同一 archive segment 在两条路径下生成两份
+            不同 summary identity：
+            - `/home/18pg/wal_arch/...1E` -> `df414f45d29afb05`
+            - `/walstorage/18waldata/...1E` -> `a6a6d66cf85adf72`
+        - 已直接复核：
+          - 默认 source 口径下：
+            - `fb_summary_service_plan_debug()` 对 `segno=46110`
+              返回 `summary_exists = true`
+            - `fb_summary_candidate_debug('/walstorage/...1E')`
+              返回 `candidate = false`
+          - 显式 `SET pg_flashback.archive_dest='/walstorage/18waldata'`
+            后：
+            - 同一 `segno=46110` 变为 `summary_exists = false`
+            - payload locator plan 的 archive source lookup
+              因此整段退回 fallback
+        - 当前判断：
+          - 问题不在 payload locator build/cache 主体
+          - 而在 summary identity 仍绑定“路径字符串”，不能复用
+            等价 archive source 上的同一 WAL segment summary
+      - 当前下一步已拍板为：
+        - 先补最小 RED，锁住“等价 archive 路径共享同一 summary identity”
+        - 再只改 summary identity/hash 契约，不扩大 payload/query 逻辑面
+      - 2026-04-07 深夜这条修复已完成首轮落地并通过 live 复核：
+        - 已补最小 RED：
+          - 新增 `fb_summary_identity`
+          - 锁住：
+            - 等价 archive 路径生成相同 `summary_path`
+            - 先在 archive path A 建 summary 后，archive path B 可直接复用
+        - 当前实现已改为：
+          - `src/fb_summary.c` 的 summary identity 不再 hash 完整路径
+          - 当前统一按：
+            - `source_kind`
+            - WAL segment basename
+            - file size
+            生成 summary identity
+          - 因而 `/home/18pg/wal_arch/...` 与 `/walstorage/18waldata/...`
+            对同一 archive segment 现在会映射到同一 summary 文件
+        - 当前验证已完成：
+          - 回归：
+            - `fb_summary_identity`
+            - `fb_summary_service`
+            - `fb_payload_scan_mode`
+            - `All 3 tests passed.`
+          - live 样本：
+            - 先在 `/home/18pg/wal_arch/00000001000000B40000001E`
+              口径下命中
+              `summary-ebb881a28fb1759d.meta`
+            - 再切到 `/walstorage/18waldata/00000001000000B40000001E`
+              后，`fb_summary_candidate_debug()` 直接返回
+              `summary_exists=true`
+          - live payload locator plan：
+            - 修复前：
+              - `base_segments=363`
+              - `success_segments=0`
+              - `fallback_segments=363`
+            - 按新 identity 契约重建后：
+              - `base_segments=356`
+              - `success_segments=356`
+              - `fallback_segments=0`
+              - `failed_segments=[]`
+        - 当前结论：
+          - 此前 release gate archive source 上的 payload locator 漏命中，
+            root cause 已确认并修复为“summary identity 绑定路径字符串”
+          - 后续主线应回到：
+            - 复跑 release gate 现场
+            - 继续确认 `summary_payload_locator_public_builds`
+              与最终 `3/9 payload` 时延是否一并收敛
+      - `payload`
+        - `NOTICE` 中 `70% payload` 只是 payload 规划开始，不代表 payload 已完成
+        - 真正耗时落在 `70% -> 100%` 的 payload 物化/record spool 阶段
+        - 需要继续区分：
+          - summary payload locator stub/locator 命中
+          - fallback window 物化
+          - replay/final 仍必需的 payload body
+
+- 已推进 release gate `4/9 replay warm` 的 `heap delete redo` blocker：
+  - 2026-04-07 现场 `scenario_oa_50t_50000r.documents`
+    @ `2026-04-07 04:41:28.555065+00`
+    的首个稳定报错此前固定为：
+    - `failed to locate tuple for heap delete redo`
+    - `lsn=B4/3EDE89D8 blk=488294 off=3`
+  - 本轮已补一刀 replay 内核修复：
+    - `src/fb_replay.c` 的 cross-block `heap update`
+      不再依赖 `record.blocks[]` 过滤后的数组位置来认
+      “new block / old block”
+    - 当前改为优先按 WAL `block_id` 语义取：
+      - `block_id = 0` 作为 new block
+      - `block_id = 1` 作为 old block
+      - 只有缺失时才回退到旧的数组位置兜底
+  - 已补最小 debug contract：
+    - `fb_replay_heap_update_block_id_contract_debug()`
+    - 锁住“即使 `record.blocks[]` 顺序与 WAL block_id 脱钩，
+      replay 仍必须把 `new_offnum` 插到 WAL block 0 对应页上”
+  - 当前现场复核状态：
+    - 独立 `count(*)` live query 已持续运行数分钟，
+      未再在原位置复现 `heap delete redo` 报错
+    - `./run_release_gate.sh --from run_flashback_checks`
+      当前也已重新推进到原 `4/9` 失败点之后，未再第一时间炸回同一错误
+  - 当前仍在继续：
+    - 等待 release gate 完整跑出新的首个 blocker
+    - 若后续不再出现该错误，则把本项从“进行中”转为“已完成”
+
+- 已完成回退 release gate 的 frozen WAL fixture 路径，恢复直接使用 live archive：
+  - 2026-04-07 现场复核已确认：
+    - frozen fixture 方案会把 flashback 查询切到复制后的 WAL 路径
+    - 这会绕开 live archive 上已生成的默认 summary 身份，导致 release gate 不能直接复用现成 summary 索引
+  - 当前口径已改为：
+    - live archive 被清理的问题按“release gate 脚本自身不得在 truth capture 后误删 archive”处理
+    - 不再继续维护 `output/.../wal/frozen` 复制路径
+    - `run_flashback_checks` 改回直接依赖实例当前 live archive / `pg_wal` 解析
+  - 当前修复已落地：
+    - 删除 `fb_release_gate_sync_frozen_wal()` / `fb_release_gate_seal_current_wal_tail()` 及其调用
+    - 删除 `capture_truth_snapshots.sh` 中的 frozen WAL 同步
+    - 删除 `run_flashback_matrix.sh` 与 `create_flashback_ctas.sql` 对 frozen `archive_dest` 的强制覆盖
+    - `tests/release_gate/bin/selftest.sh` 已改为锁住：
+      - `run_flashback_matrix.sh` 不再带 `set pg_flashback.archive_dest = ...`
+      - matrix 不再调用 `pg_switch_wal()`
+      - CTAS 路径不再传 `archive_dest=...`
+  - 当前验证已完成：
+    - `bash tests/release_gate/bin/selftest.sh`
+    - `bash -n tests/release_gate/bin/common.sh tests/release_gate/bin/capture_truth_snapshots.sh tests/release_gate/bin/run_flashback_matrix.sh tests/release_gate/bin/selftest.sh tests/release_gate/bin/prepare_empty_instance.sh tests/release_gate/bin/run_release_gate.sh`
+  - 下一步：
+    - 用真实 PG18 release gate 现场复跑，确认 summary 命中恢复到默认 live-archive 路径
+
+- 已完成修复 deep/full 测试脚本自动清理 live archive 导致缺 checkpoint/FPI 的问题：
+  - 已确认根因不在 flashback 内核，而在 `tests/deep/bin/` 的 round cleanup 策略
+  - `full` 模式把 `/isoTest/18waldata` 直接作为 live `archive_dest` 使用时，
+    通用 cleanup 与 full 主入口中的显式 `find ... -delete`
+    会把缺页补锚仍需依赖的更早 checkpoint / FPI WAL 提前删掉
+  - 当前修复已落地：
+    - `fb_deep_cleanup_round_artifacts()` 不再清空 live archive
+    - `run_all_deep_tests.sh` 不再在 baseline snapshot prepare / batch restore 后主动清空 `/isoTest/18waldata`
+    - 若 live archive 模式下因磁盘水位触发 retry，当前改为停止并提示人工清理，避免“自动删档后继续跑”
+    - 已补 shell 级 RED，自测锁住：
+      - live archive round cleanup 不得误删归档
+      - non-live fixture archive 仍会被正常清理
+  - 当前验证已完成：
+    - `bash tests/deep/bin/test_full_snapshot_resume.sh`
+    - `bash -n tests/deep/bin/common.sh tests/deep/bin/run_all_deep_tests.sh tests/deep/bin/test_full_snapshot_resume.sh`
+    - `bash tests/deep/bin/run_all_deep_tests.sh --full --dry-run`
+  - 下一步：
+    - 用真实 `--full` / batch B 现场复跑，确认 shared backscan 能稳定吃到保留下来的更早 WAL
+    - TOAST deep/full 结束后，仍按既定运维动作手工清空 `/isoTest/18waldata`
+
+- 已完成修复 release gate 初始化阶段未在新建 `alldb` 后安装 `pg_flashback` 扩展的问题：
+  - 已确认根因在 `tests/release_gate/bin/prepare_empty_instance.sh`
+  - 旧脚本只执行 `dropdb/createdb`，不会在新库中补 `CREATE EXTENSION pg_flashback`
+  - 当前修复已落地：
+    - `prepare_empty_instance.sh` 在 `createdb` 后立即执行
+      `CREATE EXTENSION IF NOT EXISTS pg_flashback;`
+    - `tests/release_gate/bin/selftest.sh` 已补最小 RED，
+      锁住 prepare 阶段对新建 `alldb` 的扩展安装动作
+    - `tests/release_gate/README.md` 已同步登记 prepare 阶段的新固定动作
+  - 当前验证已完成：
+    - `bash tests/release_gate/bin/selftest.sh`
+    - `bash -n tests/release_gate/bin/prepare_empty_instance.sh tests/release_gate/bin/selftest.sh`
+
+- 已完成修复 release gate 总入口在失败退出后误删归档现场的问题：
+  - 已确认问题点在 `tests/release_gate/bin/run_release_gate.sh` 的 `trap cleanup EXIT`
+  - 旧脚本只要本轮执行过 `prepare_instance`，退出时就会清空当前版本归档目录
+  - 这不会制造本轮 `missing FPI`，但会在 `run_flashback_checks` 失败后抹掉上一轮 truth/WAL 现场，阻断从现有产物继续复跑和排障
+  - 当前修复已落地：
+    - release gate 总入口退出时仅停止 `alldbsimulator`
+    - 不再自动清理当前版本 archive dir
+    - `tests/release_gate/bin/selftest.sh` 已补最小 RED，
+      锁住“跑过 `prepare_instance` 后退出也不得自动删归档”
+    - `tests/release_gate/README.md` 已同步改成“退出不自动清档”的真实口径
+  - 当前验证已完成：
+    - `bash tests/release_gate/bin/selftest.sh`
+    - `bash -n tests/release_gate/bin/run_release_gate.sh tests/release_gate/bin/selftest.sh`
+  - 当前说明：
+    - 本轮修复的是“失败退出后误删归档现场”
+    - 已经出现的 `missing FPI for block 487920` 仍需继续按内核 root cause 追查，不应再被脚本 cleanup 抹现场
+
 - 已完成 `count(*) FROM pg_flashback(...)` 错误计数的止血修复，并将后续工作收口为“重设计 count-only 优化”：
   - 2026-04-06 本机 PG18 / `alldb` 现场先用实际 `pg_waldump` 复核：
     - `scenario_oa_50t_50000r.documents`
@@ -1885,6 +2266,29 @@
     - 去掉 `FbApplyScan` 末尾 `ExecCopySlot/tts_virtual_materialize` 输出拷贝链
     - 完成后回看 `3/9` 当前架构中仍可精简的重复性 work
     - 进程级 payload worker
+  - 2026-04-08 准确率复核继续推进后，当前新增一个 correctness blocker：
+    - `run_flashback_checks` 改成 correctness-only 口径
+      (`FB_RELEASE_GATE_WARMUP_RUNS=0 FB_RELEASE_GATE_MEASURED_RUNS=1`)
+      后，首条
+      `random_flashback_1.documents @ 2026-04-07 04:41:28.555065+00`
+      已完成 truth 对比：
+      - flashback 导出 `sha256 =
+        4edde6e0b1e1ee94e1f9e2de12856bb1a50a85e73431dcbceae16a8e18117e0c`
+      - `row_count = 1949969`
+      - 与 `truth_manifest` 完全一致
+    - 但第二条
+      `random_flashback_1.users @ 2026-04-07 04:41:28.555065+00`
+      当前稳定失败：
+      - 使用现有 `meta/summary` 时：
+        - `ERROR: pfree called with invalid pointer ...`
+      - 临时移空 `meta/summary` 后：
+        - 不再报 invalid `pfree`
+        - 改为 `ERROR: too many shared backtracking rounds while resolving missing FPI`
+    - 当前结论：
+      - release gate 整套 truth compare 还不能宣称跑完
+      - `documents` 首条大表 truth 已过
+      - `users` 的 summary payload/cached lookup 路径与无-summary backtracking/FPI
+        都还存在独立 blocker
 
 ## 下一步
 
@@ -1910,6 +2314,11 @@
     - 以及 `3/9 metadata/xact-status` 的剩余串行 work
   - 完成后清空并重建 `meta/summary`，复跑 live case 与回归
   - 再继续压 `3/9` 后半段 payload/materialize
+  - 先把 `random_flashback_1.users @ 2026-04-07 04:41:28.555065+00`
+    的 correctness blocker 拆开并修掉：
+    - 有 summary 时为什么会触发 invalid `pfree`
+    - 无 summary 时为什么 shared backtracking/FPI 仍过不去
+  - 修完后再继续 correctness-only 口径把整套 truth compare 跑完
   - 继续推进 metadata 并行第二版实现
     - leader 共享 resolved segment snapshot，去掉 worker 侧重复 resolver/prepare
     - worker 本地 spool，leader 按 window/LSN 顺序 merge

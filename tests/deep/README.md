@@ -41,15 +41,18 @@
   - batch 失败时优先回滚到 baseline 快照并重跑当前 batch
   - 终端断连后可基于状态文件从未完成 batch 续跑
   - 运行期间实时监测 `/isoTest`、`/`、`/tmp` 使用率
-  - 任一文件系统使用率超过 `85%` 时，立即中断当前轮次、清理 deep 产物与 `/isoTest/18waldata`，然后 fresh 重跑当前轮次
-  - 每轮结束后自动清理 deep 产物与 `/isoTest/18waldata`
+  - deep round cleanup 现在只自动清理 deep 临时产物与 fake `pg_wal`
+  - `full` 模式不再自动清理 live 归档目录 `/isoTest/18waldata`
+  - 原因是 batch 验证与缺页补锚可能需要回看更早 checkpoint / FPI WAL；自动清理会把仍需的段提前删掉
+  - 任一文件系统使用率超过 `85%` 时，当前轮次会先中断；若 live archive 占满空间，需要人工在合适边界清理后再续跑
 
 快照与空间约束：
 
 - baseline 快照当前保存为单份，不做多代
 - 创建快照前会检查磁盘水位和可用空间
 - 若可用空间不足以容纳一份 PGDATA 快照，则当前 full 轮次直接失败，不进入 workload
-- full 结束后会清理 deep 产物与归档；baseline 快照仅在当前 full 会话内保留
+- full 结束后会清理 deep 临时产物；live archive 保留给排障与续跑使用
+- baseline 快照仅在当前 full 会话内保留
 
 当前 pilot 结果：
 

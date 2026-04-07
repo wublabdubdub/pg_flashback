@@ -35,7 +35,7 @@ run_sql_to_csv() {
 
 	case "$mode" in
 		query)
-			printf -v cmd '%q --csv -X -v ON_ERROR_STOP=1 -p %q -U %q -d %q -c %q > %q' \
+			printf -v cmd '%q --csv -X -q -v ON_ERROR_STOP=1 -p %q -U %q -d %q -c %q > %q' \
 				"$FB_RELEASE_GATE_PSQL" \
 				"$FB_RELEASE_GATE_PGPORT" \
 				"$FB_RELEASE_GATE_PGUSER" \
@@ -140,14 +140,14 @@ run_query_case() {
 			copy)
 				run_sql_to_csv "$sql" "$current_csv" copy
 				;;
-			ctas)
-				fb_release_gate_psql_file "$FB_RELEASE_GATE_DBNAME" "$FB_RELEASE_GATE_SQL_DIR/create_flashback_ctas.sql" \
-					-v ctas_table="$ctas_table" \
-					-v typed_null_expr="$typed_null" \
-					-v target_ts="$target_ts" >/dev/null
-				run_sql_to_csv "select * from ${ctas_table} order by ${order_by};" "$current_csv" query
-				fb_release_gate_psql_file "$FB_RELEASE_GATE_DBNAME" "$FB_RELEASE_GATE_SQL_DIR/drop_flashback_ctas.sql" \
-					-v ctas_table="$ctas_table" >/dev/null
+				ctas)
+					fb_release_gate_psql_file "$FB_RELEASE_GATE_DBNAME" "$FB_RELEASE_GATE_SQL_DIR/create_flashback_ctas.sql" \
+						-v ctas_table="$ctas_table" \
+						-v typed_null_expr="$typed_null" \
+						-v target_ts="$target_ts" >/dev/null
+					run_sql_to_csv "select * from ${ctas_table} order by ${order_by};" "$current_csv" query
+					fb_release_gate_psql_file "$FB_RELEASE_GATE_DBNAME" "$FB_RELEASE_GATE_SQL_DIR/drop_flashback_ctas.sql" \
+						-v ctas_table="$ctas_table" >/dev/null
 				;;
 		esac
 		end_ms="$(date +%s%3N)"

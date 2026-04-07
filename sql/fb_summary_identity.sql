@@ -1,0 +1,131 @@
+DO $$
+BEGIN
+	IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_flashback') THEN
+		EXECUTE 'DROP EXTENSION pg_flashback CASCADE';
+	END IF;
+END;
+$$;
+CREATE EXTENSION pg_flashback;
+
+DO $$
+BEGIN
+	IF to_regprocedure('fb_summary_candidate_debug(text)') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_summary_candidate_debug(text)';
+	END IF;
+	IF to_regprocedure('fb_summary_build_candidate_debug(text)') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_summary_build_candidate_debug(text)';
+	END IF;
+	IF to_regprocedure('fb_summary_path_debug(text)') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_summary_path_debug(text)';
+	END IF;
+END;
+$$;
+
+CREATE FUNCTION fb_summary_candidate_debug(text)
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_summary_candidate_debug'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION fb_summary_build_candidate_debug(text)
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_summary_build_candidate_debug'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION fb_summary_path_debug(text)
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_summary_path_debug'
+LANGUAGE C STRICT;
+
+CREATE TEMP TABLE fb_summary_identity_fixture (
+	seg_name text NOT NULL,
+	seg_path_a text NOT NULL,
+	seg_path_b text NOT NULL
+);
+
+DO $$
+DECLARE
+	data_dir text := current_setting('data_directory');
+	archive_a text := '/tmp/fb_summary_identity_a';
+	archive_b text := '/tmp/fb_summary_identity_b';
+	rec record;
+BEGIN
+	PERFORM pg_switch_wal();
+	PERFORM pg_switch_wal();
+	PERFORM pg_switch_wal();
+
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'rm -rf ' || archive_a || ' ' || archive_b ||
+		' && mkdir -p ' || archive_a || ' ' || archive_b);
+
+	INSERT INTO fb_summary_identity_fixture(seg_name, seg_path_a, seg_path_b)
+	WITH wal AS (
+		SELECT name,
+			   (('x' || substr(name, 9, 8))::bit(32)::bigint *
+				(4294967296::bigint / pg_size_bytes(current_setting('wal_segment_size'))) +
+				('x' || substr(name, 17, 8))::bit(32)::bigint) AS segno,
+			   lead(
+				   (('x' || substr(name, 9, 8))::bit(32)::bigint *
+					(4294967296::bigint / pg_size_bytes(current_setting('wal_segment_size'))) +
+					('x' || substr(name, 17, 8))::bit(32)::bigint),
+				   1
+			   ) OVER (ORDER BY name) AS next_segno
+		FROM pg_ls_dir(data_dir || '/pg_wal') AS d(name)
+		WHERE d.name ~ '^[0-9A-F]{24}$'
+	),
+	pick AS (
+		SELECT segno AS start_segno
+		FROM wal
+		WHERE next_segno = segno + 1
+		ORDER BY segno DESC
+		LIMIT 1
+	)
+	SELECT wal.name,
+		   archive_a || '/' || wal.name,
+		   archive_b || '/' || wal.name
+	FROM wal, pick
+	WHERE wal.segno BETWEEN pick.start_segno AND pick.start_segno + 1
+	ORDER BY wal.segno;
+
+	IF (SELECT count(*) FROM fb_summary_identity_fixture) <> 2 THEN
+		RAISE EXCEPTION 'failed to prepare two consecutive WAL segments for summary identity fixture';
+	END IF;
+
+	FOR rec IN
+		SELECT seg_name
+		FROM fb_summary_identity_fixture
+		ORDER BY seg_name
+	LOOP
+		EXECUTE format(
+			'COPY (SELECT '''') TO PROGRAM %L',
+			'cp ' || quote_literal(data_dir || '/pg_wal/' || rec.seg_name) || ' ' ||
+			quote_literal(archive_a || '/' || rec.seg_name) ||
+			' && cp ' || quote_literal(data_dir || '/pg_wal/' || rec.seg_name) || ' ' ||
+			quote_literal(archive_b || '/' || rec.seg_name));
+	END LOOP;
+END;
+$$;
+
+SELECT seg_path_a AS target_path_a,
+	   seg_path_b AS target_path_b
+FROM fb_summary_identity_fixture
+ORDER BY seg_name
+LIMIT 1
+\gset
+
+SET pg_flashback.archive_dest = '/tmp/fb_summary_identity_a';
+
+SELECT fb_summary_build_candidate_debug(:'target_path_a') AS build_contract
+\gset
+
+SELECT :'build_contract' LIKE '%summary_exists_after=true%' AS primary_builds_summary;
+
+SELECT fb_summary_path_debug(:'target_path_a') =
+	   fb_summary_path_debug(:'target_path_b')
+	   AS equivalent_archive_paths_share_summary_path;
+
+SET pg_flashback.archive_dest = '/tmp/fb_summary_identity_b';
+
+SELECT substring(fb_summary_candidate_debug(:'target_path_b')
+				 FROM 'summary_exists=(true|false)') = 'true'
+	   AS alternate_archive_path_reuses_summary;

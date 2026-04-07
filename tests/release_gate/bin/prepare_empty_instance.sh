@@ -87,6 +87,8 @@ else
 			"$FB_RELEASE_GATE_PGPORT" \
 			"$FB_RELEASE_GATE_PGUSER" \
 			"$FB_RELEASE_GATE_DBNAME")"
+	fb_release_gate_psql_sql "$FB_RELEASE_GATE_DBNAME" \
+		"CREATE EXTENSION IF NOT EXISTS pg_flashback;"
 fi
 
 env_json="$(fb_release_gate_json_path environment)"

@@ -32,6 +32,15 @@ BEGIN
 	IF to_regprocedure('fb_replay_apply_image_contract_debug()') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_replay_apply_image_contract_debug()';
 	END IF;
+	IF to_regprocedure('fb_replay_nonapply_image_missing_contract_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_replay_nonapply_image_missing_contract_debug()';
+	END IF;
+	IF to_regprocedure('fb_replay_heap_update_same_block_init_contract_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_replay_heap_update_same_block_init_contract_debug()';
+	END IF;
+	IF to_regprocedure('fb_replay_heap_update_block_id_contract_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_replay_heap_update_block_id_contract_debug()';
+	END IF;
 	IF to_regprocedure('fb_wal_nonapply_image_spool_contract_debug()') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_wal_nonapply_image_spool_contract_debug()';
 	END IF;
@@ -88,6 +97,21 @@ RETURNS text
 AS '$libdir/pg_flashback', 'fb_replay_apply_image_contract_debug'
 LANGUAGE C;
 
+CREATE FUNCTION fb_replay_nonapply_image_missing_contract_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_replay_nonapply_image_missing_contract_debug'
+LANGUAGE C;
+
+CREATE FUNCTION fb_replay_heap_update_same_block_init_contract_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_replay_heap_update_same_block_init_contract_debug'
+LANGUAGE C;
+
+CREATE FUNCTION fb_replay_heap_update_block_id_contract_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_replay_heap_update_block_id_contract_debug'
+LANGUAGE C;
+
 CREATE FUNCTION fb_wal_nonapply_image_spool_contract_debug()
 RETURNS text
 AS '$libdir/pg_flashback', 'fb_wal_nonapply_image_spool_contract_debug'
@@ -138,6 +162,25 @@ SELECT fb_replay_apply_image_contract_debug() AS apply_image_contract
 
 SELECT :'apply_image_contract' LIKE '%preserve_existing=false%' AS image_replaces_existing,
 	   :'apply_image_contract' LIKE '%materialize_requires_apply=false%' AS materialize_ignores_apply_flag;
+
+SELECT fb_replay_nonapply_image_missing_contract_debug() AS nonapply_image_missing_contract
+\gset
+
+SELECT :'nonapply_image_missing_contract' LIKE '%ready=false%' AS nonapply_image_not_ready,
+	   :'nonapply_image_missing_contract' LIKE '%notes_missing=true%' AS nonapply_image_notes_missing,
+	   :'nonapply_image_missing_contract' LIKE '%initialized=false%' AS nonapply_image_not_initialized,
+	   :'nonapply_image_missing_contract' LIKE '%anchor_requires_apply=true%' AS anchor_requires_apply;
+
+SELECT fb_replay_heap_update_same_block_init_contract_debug() AS same_block_update_init_contract
+\gset
+
+SELECT :'same_block_update_init_contract' LIKE '%same_block_update_allow_init=true%' AS same_block_update_allows_init,
+	   :'same_block_update_init_contract' LIKE '%same_block_update_ready=true%' AS same_block_update_init_ready;
+
+SELECT fb_replay_heap_update_block_id_contract_debug() AS heap_update_block_id_contract
+\gset
+
+SELECT :'heap_update_block_id_contract' LIKE '%heap_update_block_id_contract=true%' AS heap_update_uses_wal_block_id;
 
 SELECT fb_wal_nonapply_image_spool_contract_debug() AS nonapply_image_spool_contract
 \gset
@@ -218,6 +261,25 @@ SELECT fb_summary_build_available_debug() > 0 AS built_summary;
 
 SELECT fb_summary_block_anchor_debug('fb_replay_target'::regclass) >= 0
 	   AS block_anchor_debug_callable;
+
+DO $$
+DECLARE
+	summary text;
+	tries integer;
+BEGIN
+	FOR tries IN 1..50 LOOP
+		SELECT fb_recordref_debug(
+				   'fb_replay_target'::regclass,
+				   (SELECT target_ts FROM fb_replay_mark)
+			   )
+		  INTO summary;
+		EXIT WHEN coalesce(
+			substring(summary FROM 'summary_payload_locator_records=([0-9]+)')::int,
+			0) > 0;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END;
+$$;
 
 SET pg_flashback.parallel_workers = 2;
 

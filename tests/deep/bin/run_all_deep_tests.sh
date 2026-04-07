@@ -36,8 +36,6 @@ run_main_full_prepare_snapshot() {
 	bash "$(dirname "$0")/load_baseline.sh" --full || return $?
 	fb_deep_psql_sql "CHECKPOINT;" || return $?
 	fb_deep_create_baseline_snapshot || return $?
-	find "$FB_DEEP_ARCHIVE_CLEAN_DIR" -mindepth 1 -delete 2>/dev/null || true
-	fb_deep_log "cleared archive after baseline snapshot prepare: archive_dir=$FB_DEEP_ARCHIVE_CLEAN_DIR"
 }
 
 run_main_full_batch_from_snapshot() {
@@ -46,7 +44,6 @@ run_main_full_batch_from_snapshot() {
 	local start_lsn
 
 	fb_deep_restore_baseline_snapshot || return $?
-	find "$FB_DEEP_ARCHIVE_CLEAN_DIR" -mindepth 1 -delete 2>/dev/null || true
 	start_lsn="$(fb_deep_current_lsn)" || return $?
 	bash "$(dirname "$0")/$batch_script" --full || return $?
 	fb_deep_log_wal_budget_since "$start_lsn" "$round_label"

@@ -56,4 +56,41 @@ if [[ "$completed_batches" != "batch_a,batch_c" ]]; then
 	exit 1
 fi
 
+live_archive_dir="$tmp_root/live_archive"
+fixture_archive_dir="$tmp_root/fixture_archive"
+fake_pgwal_dir="$tmp_root/fake_pg_wal"
+
+FB_DEEP_ROOT_DIR="$tmp_root/cleanup_root"
+FB_DEEP_ARCHIVE_CLEAN_DIR="$live_archive_dir"
+FB_DEEP_ARCHIVE_DIR="$live_archive_dir"
+FB_DEEP_FAKE_PGWAL_DIR="$fake_pgwal_dir"
+mkdir -p "$FB_DEEP_ROOT_DIR" "$live_archive_dir" "$fake_pgwal_dir"
+touch "$FB_DEEP_ROOT_DIR/root.tmp" "$live_archive_dir/keep.seg" "$fake_pgwal_dir/fake.tmp"
+
+fb_deep_cleanup_round_artifacts
+
+[[ ! -e "$FB_DEEP_ROOT_DIR/root.tmp" ]] || {
+	echo "cleanup should remove round root artifacts" >&2
+	exit 1
+}
+[[ ! -e "$FB_DEEP_FAKE_PGWAL_DIR/fake.tmp" ]] || {
+	echo "cleanup should remove fake pg_wal artifacts" >&2
+	exit 1
+}
+[[ -f "$live_archive_dir/keep.seg" ]] || {
+	echo "cleanup should preserve live archive files in full mode" >&2
+	exit 1
+}
+
+FB_DEEP_ARCHIVE_DIR="$fixture_archive_dir"
+mkdir -p "$fixture_archive_dir"
+touch "$fixture_archive_dir/drop.seg"
+
+fb_deep_cleanup_round_artifacts
+
+[[ ! -e "$fixture_archive_dir/drop.seg" ]] || {
+	echo "cleanup should remove non-live archive fixture files" >&2
+	exit 1
+}
+
 echo "PASS: full snapshot resume helpers"

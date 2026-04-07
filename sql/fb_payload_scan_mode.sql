@@ -23,6 +23,9 @@ BEGIN
 	IF to_regprocedure('fb_recordref_debug(regclass, timestamptz)') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_recordref_debug(regclass, timestamptz)';
 	END IF;
+	IF to_regprocedure('fb_summary_payload_locator_plan_debug(regclass, timestamptz)') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_summary_payload_locator_plan_debug(regclass, timestamptz)';
+	END IF;
 END;
 $$;
 
@@ -34,6 +37,12 @@ LANGUAGE C;
 CREATE FUNCTION fb_recordref_debug(regclass, timestamptz)
 RETURNS text
 AS '$libdir/pg_flashback', 'fb_recordref_debug'
+LANGUAGE C
+STRICT;
+
+CREATE FUNCTION fb_summary_payload_locator_plan_debug(regclass, timestamptz)
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_summary_payload_locator_plan_debug'
 LANGUAGE C
 STRICT;
 
@@ -110,3 +119,18 @@ SELECT substring(:'fragmented_summary' FROM 'summary_span_windows=([0-9]+)')::in
 	   AS fragmented_tracks_locator_public_builds,
 	   :'fragmented_summary' LIKE '%payload_scan_mode=locator%'
 	   AS fragmented_prefers_locator;
+
+SELECT fb_summary_payload_locator_plan_debug(
+	'fb_payload_scan_mode_target'::regclass,
+	(SELECT target_ts FROM fb_payload_scan_mode_mark)
+) AS fragmented_payload_plan
+\gset
+
+SELECT substring(:'fragmented_payload_plan' FROM 'success_segments=([0-9]+)')::int > 0
+	   AS fragmented_payload_plan_hits_summary,
+	   substring(:'fragmented_payload_plan' FROM 'fallback_segments=([0-9]+)')::int = 0
+	   AS fragmented_payload_plan_avoids_fallback,
+	   substring(:'fragmented_payload_plan' FROM 'locator_records=([0-9]+)')::int > 0
+	   AS fragmented_payload_plan_returns_locators,
+	   :'fragmented_payload_plan' LIKE '%failed_segments=[]%'
+	   AS fragmented_payload_plan_has_no_failed_samples;

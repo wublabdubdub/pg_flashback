@@ -218,19 +218,7 @@ if [[ -n "$ONLY_STAGE" ]]; then
 fi
 
 cleanup() {
-	local major archive_dir
-
 	"$FB_RELEASE_GATE_BIN_DIR/start_alldbsim.sh" stop >/dev/null 2>&1 || true
-	if [[ "$DRY_RUN" -eq 1 || "${RAN_PREPARE_INSTANCE:-0}" -ne 1 ]]; then
-		return 0
-	fi
-	if ! major="$(fb_release_gate_detect_pg_major 2>/dev/null)"; then
-		return 0
-	fi
-	archive_dir="$(fb_release_gate_archive_dir_from_major "$major")"
-	if [[ -d "$archive_dir" ]]; then
-		find "$archive_dir" -mindepth 1 -delete 2>/dev/null || true
-	fi
 }
 
 trap cleanup EXIT

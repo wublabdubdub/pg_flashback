@@ -685,27 +685,23 @@ fb_bag_emit_residual(FbBagApplyState *state, FbApplyEmit *emit)
 
 	while (state->residual_cursor != NULL)
 	{
-		if (state->residual_repeat > 0)
+		if (state->residual_repeat == 0)
 		{
-			state->residual_repeat--;
-			emit->kind = FB_APPLY_EMIT_TUPLE;
-			emit->tuple = state->residual_cursor->tuple;
-			return true;
-		}
-
-		state->residual_cursor = state->residual_cursor->all_next;
-		while (state->residual_cursor != NULL)
-		{
-			if (state->residual_cursor->delta > 0)
+			if (state->residual_cursor->delta <= 0)
 			{
-				state->residual_repeat = state->residual_cursor->delta - 1;
-				emit->kind = FB_APPLY_EMIT_TUPLE;
-				emit->tuple = state->residual_cursor->tuple;
-				return true;
+				state->residual_cursor = state->residual_cursor->all_next;
+				continue;
 			}
 
-			state->residual_cursor = state->residual_cursor->all_next;
+			state->residual_repeat = state->residual_cursor->delta;
 		}
+
+		state->residual_repeat--;
+		emit->kind = FB_APPLY_EMIT_TUPLE;
+		emit->tuple = state->residual_cursor->tuple;
+		if (state->residual_repeat == 0)
+			state->residual_cursor = state->residual_cursor->all_next;
+		return true;
 	}
 
 	return false;

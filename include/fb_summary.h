@@ -82,7 +82,7 @@ bool fb_summary_segment_lookup_spans_cached(const char *path,
 											int source_kind,
 											const FbRelationInfo *info,
 											FbSummaryQueryCache *cache,
-											FbSummarySpan **spans_out,
+											const FbSummarySpan **spans_out,
 											uint32 *span_count_out);
 bool fb_summary_segment_lookup_xid_outcomes_cached(const char *path,
 												   off_t bytes,
@@ -153,6 +153,7 @@ bool fb_summary_segment_lookup_payload_locators_cached(const char *path,
 													   FbSummaryPayloadLocator **locators_out,
 													   uint32 *locator_count_out);
 uint64 fb_summary_query_cache_payload_locator_public_builds(FbSummaryQueryCache *cache);
+uint64 fb_summary_query_cache_span_public_builds(FbSummaryQueryCache *cache);
 
 bool fb_summary_segment_matches(const char *path,
 								off_t bytes,
@@ -170,7 +171,7 @@ bool fb_summary_segment_lookup_spans(const char *path,
 									 int wal_seg_size,
 									 int source_kind,
 									 const FbRelationInfo *info,
-									 FbSummarySpan **spans_out,
+									 const FbSummarySpan **spans_out,
 									 uint32 *span_count_out);
 bool fb_summary_segment_lookup_xid_outcomes(const char *path,
 											off_t bytes,

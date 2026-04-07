@@ -86,10 +86,17 @@ fb_deep_terminate_db_sessions() {
 	fb_deep_as_18pg_raw "$cmd" >/dev/null 2>&1 || true
 }
 
+fb_deep_live_archive_mode() {
+	[[ "$FB_DEEP_ARCHIVE_DIR" == "$FB_DEEP_ARCHIVE_CLEAN_DIR" ]]
+}
+
 fb_deep_cleanup_round_artifacts() {
-	mkdir -p "$FB_DEEP_ROOT_DIR" "$FB_DEEP_ARCHIVE_CLEAN_DIR" "$FB_DEEP_FAKE_PGWAL_DIR"
+	mkdir -p "$FB_DEEP_ROOT_DIR" "$FB_DEEP_FAKE_PGWAL_DIR"
 	find "$FB_DEEP_ROOT_DIR" -mindepth 1 -delete 2>/dev/null || true
-	find "$FB_DEEP_ARCHIVE_CLEAN_DIR" -mindepth 1 -delete 2>/dev/null || true
+	if ! fb_deep_live_archive_mode; then
+		mkdir -p "$FB_DEEP_ARCHIVE_DIR"
+		find "$FB_DEEP_ARCHIVE_DIR" -mindepth 1 -delete 2>/dev/null || true
+	fi
 	find "$FB_DEEP_FAKE_PGWAL_DIR" -mindepth 1 -delete 2>/dev/null || true
 	mkdir -p "$FB_DEEP_ARCHIVE_DIR" "$FB_DEEP_CKWAL_DIR" "$FB_DEEP_FAKE_PGWAL_DIR"
 }
@@ -542,6 +549,10 @@ fb_deep_run_round_with_retry() {
 
 		fb_deep_cleanup_round_artifacts
 		if [[ "$status" -eq "$FB_DEEP_RETRY_STATUS" ]]; then
+			if fb_deep_live_archive_mode; then
+				fb_deep_log "round=$label requested retry after disk cleanup, but live archive is preserved; stop and clean disk/archive manually before resume"
+				return "$status"
+			fi
 			attempt=$((attempt + 1))
 			fb_deep_log "retrying round=$label after disk cleanup"
 			continue

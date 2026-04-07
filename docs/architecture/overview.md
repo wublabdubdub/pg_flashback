@@ -193,6 +193,18 @@ Custom Scan (FbCountAggScan)
     - 稀疏 locator case 保留 direct read，避免 decode 范围被批量 run 放大
 - 提供查询期 backend-local summary section cache，避免同一查询重复读取相同 summary 文件
 - 供 query prefilter 和后台预建服务共用
+- 当前 `3/9 build record index` 继续收敛方向已固定为：
+  - `summary-span`
+    - 由 query-side per-segment `palloc + copy` 迁移到 cache 期 stable public slice
+    - query 侧只做 segment 去重、裁窗与 merge，不再反复复制 relation spans
+  - `xact-status`
+    - 保留 summary-first
+    - metadata 期额外产出 query-local `xact_summary_log`
+    - query 期先消费 `xact_summary_log`，仅对未解出的 xid 再读 summary
+    - 在 unresolved xid 上优先做精确补洞
+    - 当 relation span 内仍未命中时，允许继续按全局 resolved segments 做
+      `summary exact lookup`，避免少量 unresolved xid 直接退回真实 WAL
+    - 只有精确补洞仍无法回答时，才允许继续回退到原始 WAL
 
 ### `fb_wal` / record materializer
 
@@ -364,6 +376,7 @@ Custom Scan (FbCountAggScan)
 - 顺序扫描目标时间窗
 - 建立 `FbWalRecordIndex`
 - 维护 touched xid / xid status / unsafe window
+- 在 metadata 扫描期顺手产出 query-local `xact_summary_log`
 - 支持 segment prefilter、tail inline、sidecar 相关逻辑
 
 主要输出结构：
@@ -563,6 +576,7 @@ Custom Scan (FbCountAggScan)
 - `using_archive_dest`
 - `ckwal_invoked`
 - `parallel_workers`
+- `xact_summary_spool_hits`
 
 ### `FbRecordRef`
 
@@ -599,6 +613,7 @@ Custom Scan (FbCountAggScan)
 - unsafe reason/scope
 - 各类 target DML 计数
 - xid status hash
+- query-local `xact_summary_log`
 - tail inline 状态
 - spool log 指针
 
@@ -676,6 +691,7 @@ Custom Scan (FbCountAggScan)
 - 顺序扫描 WAL
 - 抽取目标 relation 相关记录
 - 同步事务状态
+- 优先消费 metadata 期写下的 `xact_summary_log`
 - 标记 unsafe window
 
 ### 4. replay + ForwardOp

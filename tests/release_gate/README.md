@@ -115,6 +115,7 @@ bash tests/release_gate/bin/run_release_gate.sh \
 - 清空当前版本归档目录
 - 删除大于 `100MB` 的非模板数据库
 - 重建 `alldb`
+- 在新建 `alldb` 后立即安装 `pg_flashback` 扩展
 - 生成环境摘要 `json/environment.json`
 
 常见用途：
@@ -187,6 +188,7 @@ bash tests/release_gate/bin/run_release_gate.sh \
 - 在正在运行的 `1h` DML 压测窗口内抓 `5` 个随机时间点
 - 导出 target 大表和 2-3 张中表的 truth CSV
 - 生成随机时间点调度表
+- 仅记录 truth snapshot 产物，后续 flashback 校验继续直接使用实例当前 live archive
 
 主要产物：
 
@@ -220,6 +222,7 @@ bash tests/release_gate/bin/run_release_gate.sh \
 
 - 在 `FB_RELEASE_GATE_DML_TABLE_NAME` 上执行定向 DML
 - 对每个场景立即抓 truth snapshot
+- 不再复制额外 WAL fixture；deterministic DML 的复核继续依赖同一套 live archive
 
 当前固定覆盖：
 
@@ -317,13 +320,13 @@ bash tests/release_gate/bin/run_release_gate.sh \
 - `cleanup` 不属于用户可选阶段
 - 总入口退出时仍会：
   - 停掉 `alldbsimulator`
-  - 仅当本次执行实际跑过 `prepare_instance` 时，才尝试清理当前版本归档目录
+  - 不再自动清理当前版本归档目录
 
 这意味着：
 
 - 如果你想从 `capture_random_truth_snapshots` 开始跑，必须先有 `start_dml_pressure` 产出的 `dml_pressure_runtime.json`
 - 如果你想只跑 `render_gate_report`，必须先有 `environment.json` 和 `gate_evaluation.json`
-- 如果你想从 `run_flashback_checks` 开始复用上一轮 truth/WAL，本次退出不会再把上一轮已有 WAL 误删
+- 如果你想从 `run_flashback_checks` 开始复用上一轮 truth/WAL，总入口退出不会再把上一轮已有 WAL 误删
 
 ## `1h` DML 压测的真实规则
 
