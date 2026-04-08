@@ -75,17 +75,34 @@
   - 开源镜像首版仅保留：
     - `Makefile`
     - `README.md`
+    - `LICENSE`
+    - `VERSION`
     - `pg_flashback.control`
     - `include/`
     - `src/`
     - `sql/`
     - `expected/`
-    - 精简后的公开文档
+  - 当前开源发布口径补充为：
+    - 根目录许可证固定为 `Apache-2.0`
+    - 根目录发布版本固定由 `VERSION` 文件声明
+    - 扩展安装版本固定由 `pg_flashback.control` 的 `default_version` 与
+      `sql/pg_flashback--*.sql` / `sql/pg_flashback--*--*.sql` 升级链共同维护
+    - 根目录 `README.md` 固定为面向开源用户的极简入口文档
+    - 只保留：
+      - 核心功能与“为什么 PostgreSQL 自带做不到”
+      - 基础使用方式
+      - 使用前提条件
+      - 几个常用参数的作用与最小用法
+    - README 中 PostgreSQL 版本口径当前按本机已验证的 `PG12-18` 书写
+    - 开源镜像不再携带架构文档、ADR、开发记录或其他研发说明
   - 明确不进入开源镜像：
     - `STATUS.md` / `TODO.md` / `PROJECT.md`
-    - `docs/reports/` / `docs/superpowers/`
-    - `tests/deep/` / `tests/release_gate/`
+    - `docs/`
+    - `tests/`
     - 日志、性能采样、构建产物与其他临时输出
+  - `open_source/` 根目录也不再保留额外说明文件或 manifest：
+    - 当前仅保留真正待发布的 `open_source/pg_flashback/`
+    - 避免把内部同步流程、研发台账路径或 `.codex` 等仓内辅助信息带入开源交付面
   - `open_source/` 目录当前也不纳入本仓库 Git 跟踪：
     - 作为本地开源镜像导出目录保留
     - 由 `scripts/sync_open_source.sh` 按需重建
@@ -108,12 +125,454 @@
 - 当前执行约束补充：
   - 只要出现“WAL 回放失败导致闪回失败”的现场，必须继续追到 root cause 并彻底修复
   - 不接受把问题停留在表层报错变化、提前降级绕过、仅调整缺页判定或仅改错误提示
+  - 只要出现 `3/9 build record index` 性能问题，必须继续追到真实热点与 root cause 并完成修复
+  - 不接受把问题停留在表层阶段名、NOTICE 百分比或单次观测误读上就停止
+  - 若现场显示为 `3/9 30% metadata` / `55% xact-status` / `70%-100% payload`
+    的任一慢点，必须继续用 debug counter、`pg_stat_activity`、`gdb/perf`
+    等证据确认真实耗时归属，再决定修复点
   - 本次 `scenario_oa_12t_50000r.documents @ '2026-04-01 23:15:13'`
     已按同一标准继续追查：
     - 即使 `missing FPI for block 216136` 已不再是表层错误
     - 仍必须继续修到 `84/AE079278 / blk=216125 / failed to replay heap insert` 的真实根因为止
 
 ## 当前进行中
+
+- 已完成修复 `scenario_oa_50t_50000r.documents @ '2026-04-08 13:33:00.700288+00'`
+  的 `3/9 55% xact-status` unresolved tail：
+  - 当前与下午现场的差异已收敛为：
+    - 下午 `summary_xid_fallback=21` 的根因是 stale summary identity，属于 phantom xid
+    - 本次 `summary_xid_fallback=110` 的根因不是 phantom xid，而是命中 segment 上已有旧/无效 summary sidecar，
+      但 query path 只把它当“summary 已存在”，没有在查询时按需重建
+  - 现场已验证：
+    - 样本 xid（如 `16218039`）是真实 top-level committed xid，不是 phantom xid
+    - 命中 commit segment 的旧 sidecar 版本为 `10`
+    - 重建后的 sidecar 版本为 `11`，并且已包含目标 xid outcome
+  - 当前修复已落地：
+    - `src/fb_summary.c`
+      在 `fb_summary_cache_get_or_load()` 中对 invalid/missing candidate 增加 query-side 一次性重建并重试加载
+    - `FB_SUMMARY_VERSION` 前滚到 `11`，使旧 `v10` sidecar 在 query/build 路径上统一失效
+  - 当前复核结果：
+    - `pg_temp.fb_summary_xid_resolution_debug(...)` 返回：
+      - `summary_hits=23352`
+      - `summary_exact_hits=0`
+      - `unresolved_touched=0`
+      - `unresolved_unsafe=0`
+      - `fallback_windows=0`
+    - 实际 live query
+      `select count(*) from pg_flashback(NULL::"scenario_oa_50t_50000r"."documents", '2026-04-08 13:33:00.700288+00')`
+      当前已完整返回：
+      - `3/9 30% metadata` `+848.327 ms`
+      - `3/9 55% xact-status` `+301.502 ms`
+      - `[done] total elapsed 35552.115 ms`
+      - `count = 1950007`
+  - 修复过程中还发现一个独立验证期 crash：
+    - `fb_wal_fill_xact_statuses_serial()` 的 cleanup 会在早退路径上 `hash_destroy(state.assigned_xids)`
+    - 但旧代码直到后段才 `MemSet(&state, 0, sizeof(state))`
+    - 当 unresolved sets 已在 summary 阶段被清空时，会带着未初始化的 `state.assigned_xids` 进入 cleanup，
+      触发 backend `SIGSEGV`
+    - 当前已将 `FbWalSerialXactVisitorState state` 提前零初始化，live count query 不再崩溃
+
+- 当前对外开源发布面已收口到统一口径：
+  - 根目录许可证已固定为 `Apache-2.0`
+  - 当前首个公开发布版本已前滚到 `0.2.0`
+  - 根目录已新增 `VERSION` 作为仓库发布版本源
+  - 扩展升级链已补到 `0.1.1 -> 0.2.0`
+  - 根目录 `README.md` 已收口为通用 PostgreSQL 扩展风格
+  - `scripts/sync_open_source.sh` 已纳入 `LICENSE` / `VERSION`
+  - 开源镜像内公开 Markdown 已切到单文件中英双语
+  - 双语切换方式固定为 `中文 | English` 锚点跳转
+  - 本轮已刷新并复核 `open_source/pg_flashback/`
+
+- 正在收敛 release gate 产物判读与最终报告可读性：
+  - 已确认 `tests/release_gate/bin/nohup.out` 中真正的 correctness 失败
+    只有 `4` 条：
+    - `random_flashback_1.users`
+    - `random_flashback_1.meetings`
+    - `random_flashback_4.users`
+    - `random_flashback_4.approval_tasks`
+  - 当前 `tests/release_gate/output/latest/json/truth_manifest.json`
+    未携带 `target_snapshot` 字段，而当前脚本源码已经会写入该字段并在
+    flashback 执行时注入 `pg_flashback.target_snapshot`
+  - 因此当前 `latest` 产物更像是：
+    - 未按最新 release gate truth/flashback 脚本重新采集并复跑
+    - 或 `output/latest` 仍残留旧版本 truth manifest
+  - 现阶段判断：
+    - 这批 `failed` 记录不能直接视为“当前 HEAD 仍有未知新 bug”
+    - 更接近“未用最新 capture + replay 口径完成复测”
+    - 是否仍残留真实 correctness bug，需在重新采集带
+      `target_snapshot` 的 truth manifest 后复跑确认
+  - 当前同步推进：
+    - 重做 `release_gate_report.md`
+    - 报告统一改为中文
+    - release gate 各阶段产物解耦
+    - 报告中显式拆分：
+      - correctness failure
+      - performance regression
+      - missing golden baseline / 未评估
+      - `target_snapshot` 覆盖率
+      - 测试过程与场景矩阵
+  - 新增执行约束：
+    - release gate 脚本各阶段必须做到“单步可独立重跑”
+    - 任一阶段单独成功执行后：
+      - 不能被旧日志追加污染
+      - 不能错误复用历史 run 的中间产物
+      - 不能让上一步/上一次执行残留改变最终结论
+    - 最终报告必须只反映当前这轮有效产物
+
+- 已建立统一文档
+  [docs/reports/flashback-failure-fix-log.md](/root/pg_flashback/docs/reports/flashback-failure-fix-log.md)
+  用于汇总所有“已修复的闪回失败”案例：
+  - 当前口径固定为：
+    - 只收录已经定位根因并已完成修复的问题
+    - 每条记录固定写：
+      - 时间
+      - 报错现象
+      - 原因
+      - 修复方式
+    - 后续约束固定为：
+      - 每次修复新的 flashback failure / replay failure / flashback crash
+      时，必须同步更新这份台账
+    - 同步更新 `STATUS.md` / `TODO.md`
+
+- 已确认 release gate `random_flashback_4.documents` 的
+  `FATAL: terminating connection due to administrator command`
+  现场不是 `pg_flashback()` 自身把连接打崩：
+  - 该报错口径对应 postmaster / backend 收到外部管理员级终止
+  - 现场没有新增到“query 结束前 backend 进程自崩”的证据
+  - 当前将其与本轮 correctness 修复拆开处理：
+    - 本轮代码修改不围绕“documents crash”展开
+    - 继续把主线收敛在 release gate truth mismatch 的根因修复
+
+- 已确认并修复 release gate `random_flashback_1.users` /
+  `random_flashback_1.meetings` 的 truth mismatch 根因：
+  - 现场表现：
+    - `users` / `meetings` 两条 query case 均能完整跑到
+      `[done] total elapsed ...`
+    - 但最终 correctness 对比仍报
+      `row_count or sha256 mismatch`
+  - 根因已确认：
+    - 根因不是页级回放损坏、tuple decode 丢字段、也不是 reverse op
+      组装错误
+    - release gate truth 是在
+      `repeatable read` 事务里导出的目标时刻 MVCC snapshot
+    - 旧版 `pg_flashback()` 只按 WAL 中记录到的 commit timestamp
+      判断
+      `committed_before_target` / `committed_after_target`
+    - 当某些事务在 target snapshot 时刻仍“对 truth 不可见”，
+      但随后很快提交，且其 WAL commit timestamp 仍早于 `target_ts`
+      时，旧逻辑会把这些事务误判成 `before_target`
+    - 这会把 truth 中本应保留的旧版本错误回滚成更新后的新版本，
+      最终表现为 `users` / `meetings` 的 row hash mismatch
+  - 当前修复已落地：
+    - `src/fb_guc.c` / `include/fb_guc.h`
+      新增用户级 GUC：
+      `pg_flashback.target_snapshot`
+    - `src/fb_wal.c` / `include/fb_wal.h`
+      在 WAL record index 中解析
+      `txid_current_snapshot()::text`
+      的 active xid 列表
+    - 对目标 snapshot 中仍处于 in-progress 的 xid：
+      - 即使其 commit timestamp 排在 `target_ts` 之前
+      - 也不再判为 `committed_before_target`
+      - 若其在 `query_now_ts` 前提交，则按 `committed_after_target`
+        处理
+    - `tests/release_gate/bin/capture_truth_snapshots.sh`
+      现在会把 truth capture 事务的
+      `txid_current_snapshot()::text`
+      一并写入 manifest
+    - `tests/release_gate/bin/run_flashback_matrix.sh`
+      现在会把 manifest 中的 `target_snapshot`
+      通过
+      `PGOPTIONS='-c pg_flashback.target_snapshot=...'`
+      注入 flashback 查询 / COPY / CTAS-create 路径
+  - 当前验证：
+    - 手工对 `users` 失败行注入 target snapshot 后，
+      已恢复 truth 中的旧值
+    - 手工对 `meetings` 失败行注入 target snapshot 后，
+      已恢复 truth 中的旧值
+    - `bash -n tests/release_gate/bin/capture_truth_snapshots.sh`
+      / `bash -n tests/release_gate/bin/run_flashback_matrix.sh`
+      已通过
+  - 下一步：
+    - 重新采集带 `target_snapshot` 的 truth manifest
+    - 再复跑 release gate correctness-only 对比，确认整轮 mismatch 清零
+
+- 已确认并修复 release gate `run_flashback_checks` /
+  `scenario_oa_50t_50000r.leave_requests`
+  中的
+  `failed to replay heap multi insert` 根因：
+  - 现场稳定复现：
+    - `select * from pg_flashback(NULL::"scenario_oa_50t_50000r"."leave_requests", '2026-04-08 01:37:20.067024+00')`
+      曾报
+      `WARNING: will not overwrite a used ItemId`
+      / `ERROR: failed to replay heap multi insert`
+  - 根因已确认：
+    - prune lookahead 的 future constraints 旧逻辑没有覆盖
+      `HEAP2_MULTI_INSERT`，导致 final replay 在带 prune image 的页上
+      漏看“未来目标槽位必须可插入”的约束
+    - 同时 data prune 的 future guard 旧逻辑把
+      future old tuple 过度从 `nowdead/redirected` 中剔除，
+      与当前 `fb_replay_get_old_tuple_from_page()` 已支持
+      `LP_DEAD` / `LP_REDIRECT` 的读取语义不一致
+    - 两者叠加后，final replay 会在某些块上保留错误页状态，
+      最终把后续 multi-insert 的目标 offset 留成“已占用”
+  - 当前修复已落地：
+    - `src/fb_replay.c`
+      为 `FB_WAL_RECORD_HEAP2_MULTI_INSERT`
+      补齐 future compose 与 same-block future support
+    - `src/fb_replay.c`
+      保留 `state->page_lsn > record->end_lsn` 的 warm-state hardening
+    - `src/fb_replay.c`
+      调整 prune future guard：
+      - future old tuple 仅阻止 `nowunused`
+      - future new slot 会把 `nowdead/redirected` 收敛到 `nowunused`
+    - 新增最小回归：
+      `sql/fb_replay_prune_future_state.sql`
+      / `expected/fb_replay_prune_future_state.out`
+      锁住 prune image 后接 `HEAP2_MULTI_INSERT` 的 preserve 判定
+  - 当前验证：
+    - `SELECT fb_replay_prune_image_preserve_next_multi_insert_debug();`
+      返回
+      `prune_image_preserve_next_multi_insert=true`
+    - 串行复核：
+      `set pg_flashback.parallel_workers=0; select count(*) ...leave_requests...`
+      返回 `49887`
+    - 默认并行复核：
+      `select count(*) ...leave_requests...`
+      返回 `49887`
+    - `select * ...leave_requests... order by id limit 5`
+      已稳定返回结果，不再报 `heap multi insert`
+
+- 已完成调整 release gate `run_flashback_checks` 的 correctness 对比时机：
+  - 当前已改为每条 flashback case 在结果 CSV 落盘后立刻对比对应 truth
+  - 不再等全部 flashback case 完成后，才由最终总评阶段第一次输出 correctness 结果
+  - 当前实现保持：
+    - `evaluate_gate` 仍保留最终汇总 verdict
+    - `run_flashback_matrix.sh` 负责单 case 即时 accuracy 输出
+  - 当前验证：
+    - `bash tests/release_gate/bin/selftest.sh`
+      `PASS`
+  - 下一步：
+    - 在真实 `run_release_gate.sh --from run_flashback_checks` 现场继续观察 mismatch case 的即时日志可读性
+
+- 已完成修复 release gate `run_flashback_checks` 在 replay preflight 上
+  因 `pg_flashback.memory_limit` 默认 `1GB` 过小而直接失败的问题：
+  - 2026-04-08 同机复跑首个 case 现场已确认：
+    - `3/9 55% xact-status` 已降到约 `1s`
+    - `3/9 100% payload` 约 `19s~21s`
+    - 随后 replay preflight 报
+      `estimated flashback working set exceeds pg_flashback.memory_limit`
+      （现场 `estimated=1946827608 bytes` / `limit=1073741824 bytes`）
+  - 当前修复口径已落地：
+    - 不改扩展内核默认 `memory_limit`
+    - 在 release gate `run_flashback_checks` 脚本层补一次性自动容错
+    - 命中该特定 preflight 报错时，自动以
+      `pg_flashback.memory_limit='6GB'` 重试同一 flashback case
+  - 当前实现：
+    - `tests/release_gate/bin/run_flashback_matrix.sh`
+      新增针对 flashback psql 命令的 stderr 识别与一次性 6GB 重试
+    - query / COPY / CTAS 三条 flashback 路径都走同一重试入口
+    - 重试命中时会输出显式日志：
+      `flashback case ... hit memory_limit preflight; retrying with pg_flashback.memory_limit=6GB`
+  - 当前验证：
+    - `bash tests/release_gate/bin/selftest.sh`
+      已新增并通过最小 RED：
+      首次 preflight 报错后，会以 `PGOPTIONS=-c pg_flashback.memory_limit=6GB`
+      自动重试
+    - 手工复跑
+      `./tests/release_gate/bin/run_release_gate.sh --from run_flashback_checks`
+      时，首个 query case 已现场确认：
+      - 首次 `1GB` preflight 失败后打印 retry 日志
+      - 随后 `6GB` 重试继续跑过 replay / reverse apply
+      - 最终跑到 `[done] total elapsed 192305.921 ms`
+
+- 已确认并修复 release gate `run_flashback_checks` 首个 case 中
+  `3/9 55% xact-status` 的 residual fallback 根因：
+  - 现场 `fb_summary_xid_resolution_debug()` 打出的 `21` 个 unresolved xid
+    对照当前 archive / `pg_wal` 后，已确认并不存在于当前 WAL 内容中
+  - 根因不是 “summary 索引没命中”，而是 `src/fb_summary.c`
+    当前 summary file identity 过弱：
+    - 旧实现只把 `source_kind + segment_name + file_size`
+      编进 `summary-%hash.meta`
+    - 当 archive 中同名 16MB 段被新内容复用时，旧 summary 会被继续当作
+      当前 WAL 的合法 summary 命中
+    - 于是 query 会从 stale summary 中读到 phantom touched xid，
+      导致 `summary_xid_fallback` 非零，并白白退回真实 WAL fallback
+  - 2026-04-08 已把 summary identity/hash 升级为同时绑定：
+    - `source_kind`
+    - `segment_name`
+    - `file_size`
+    - `st_mtime`
+    - `st_ctime`
+    - WAL long header `xlp_sysid`
+  - 同机复测：
+    - 新 hash 生效后，`pg_flashback_summary_progress`
+      一度从 `100%` 掉到 `25.44%`，证明旧 summary 已被判失效
+    - 重建 summary 后，同一 case
+      `scenario_oa_50t_50000r.documents @ '2026-04-08 00:38:25.357868+00'`
+      的 `fb_recordref_debug()` 已变成：
+      - `summary_xid_fallback=0`
+      - `xact_fallback_windows=0`
+      - `xact_fallback_covered_segments=0`
+      - `summary_payload_locator_fallback_segments=0`
+    - 手工复跑
+      `./tests/release_gate/bin/run_release_gate.sh --from run_flashback_checks`
+      首个 case 现在稳定表现为：
+      - `3/9 30% metadata` 约 `1.3s~1.6s`
+      - `3/9 55% xact-status` 约 `0.99s~1.14s`
+      - 已不再出现此前 `27s+ / 44s+` 的 xact fallback 慢路径
+  - 当前 release gate 首个 case 的新 blocker 已转为独立问题：
+    - `payload` 约 `17s~19s`
+    - 随后在 replay preflight 报
+      `estimated flashback working set exceeds pg_flashback.memory_limit`
+
+- 已确认并修复 `random_flashback_1.users` /
+  release gate `run_flashback_checks` 中的
+  `failed to replay heap update` 根因：
+  - 现场稳定复现：
+    - `scenario_oa_50t_50000r.users @ '2026-04-08 00:38:25.357868+00'`
+      报
+      `lsn=BA/4472E390 ... failed to replay heap update`
+  - 根因已确认：
+    - final replay 会复用 warm pass 产出的 block state
+    - `BA/3E107190` 这条带 FPI 的 `HEAP2_PRUNE`
+      在 final pass 上被
+      `fb_replay_prune_image_should_preserve_page()` 错误 short-circuit
+    - 旧逻辑的 prune lookahead 只累计“未来 old tuple / new slot”，
+      没有把后续 `PRUNE_VACUUM_CLEANUP` 释放出来的 slot
+      反向折算回 lookahead
+    - 于是 lookahead 误判 prune image 上的 dead slot `2/3/4`
+      “未来仍不可插”，把更早 prune image 误判成 `image_ok=false`
+    - final replay 最终保留了更早于 prune image 的 pre-cleanup 页状态
+      （`maxoff=7` / `heap_free≈840`），而没有切回 prune image
+      （`maxoff=5` / `heap_free≈6608`）
+    - 后续 `BA/3F119810` cleanup 与 `BA/4472E390` update
+      都建立在错误页基线上，最终在 `PageAddItem()` 报错
+  - 当前修复已落地：
+    - `src/fb_replay.c`
+      为 `FB_WAL_RECORD_HEAP2_PRUNE` 的 future compose
+      增加“后续 `nowunused` 会释放 future insert slot”语义
+    - `src/fb_replay.c`
+      同时补一层额外 hardening：
+      若 `state->page_lsn > record->end_lsn`，直接禁止 preserve
+      更晚 warm state
+    - 新增独立回归 `fb_replay_prune_future_state`
+  - 当前验证：
+    - `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_replay_prune_future_state'`
+      `All 1 tests passed.`
+    - 同一 `users` live case
+      `scenario_oa_50t_50000r.users @ '2026-04-08 00:38:25.357868+00'`
+      复跑已完整通过：
+      - `[done] total elapsed 5980.581 ms`
+      - `count = 50015`
+
+- 已调整 release gate `run_flashback_checks` 的 flashback 脚本默认口径：
+  - `tests/release_gate/bin/run_flashback_matrix.sh`
+    现对每条 flashback 命令默认注入：
+    - `PGOPTIONS='-c pg_flashback.memory_limit=6GB'`
+  - `tests/release_gate/bin/common.sh`
+    当前默认已改成：
+    - `FB_RELEASE_GATE_WARMUP_RUNS=0`
+    - `FB_RELEASE_GATE_MEASURED_RUNS=1`
+    - 即同一条 flashback case 默认只执行 `1` 次，不再按旧口径执行 `3` 次
+  - 当前不再依赖“先按 1GB 试跑，再命中特定 preflight 报错后重试 6GB”
+    才拿到 6GB
+  - query / COPY / CTAS-create 三条 flashback 路径现在都会在执行前打印实际 SQL：
+    - 日志格式：
+      `flashback sql [scenario:table:path:runN] ...`
+  - 当前验证：
+    - `bash tests/release_gate/bin/selftest.sh`
+      已通过，覆盖：
+      - 默认 `PGOPTIONS=-c pg_flashback.memory_limit=6GB`
+      - query/copy/ctas-create 三类 flashback SQL 日志输出
+      - 默认不会再出现 `run2` / `run3`
+
+- 已确认并修复 release gate `users` case /
+  `fb_summary_segment_lookup_payload_locators_cached()` 中的
+  `ERROR: pfree called with invalid pointer` 根因：
+  - 现场调用栈已确认炸点在：
+    - `src/fb_summary.c`
+      `fb_summary_segment_lookup_payload_locators_cached()`
+      尾部的 `pfree(positions)`
+  - 根因已确认：
+    - 该函数第一轮只用 `match_count` 统计“`slice_count > 0` 的匹配 relation”
+    - 但旧第二轮实现会在拿到当前 `slice_count` 之前，
+      先把输出位置绑定到
+      `matched_slices[slice_index]` /
+      `matched_counts[slice_index]`
+    - 当“最后一个正样本之后”仍存在
+      `slice_count = 0` 的匹配 relation 时，
+      会在 `slice_index == match_count` 上发生越界写
+    - 被写坏的正是后续 scratch chunk 的 header，
+      最终在函数尾部 `pfree(positions)` 报 invalid pointer
+  - 当前修复已落地：
+    - `src/fb_summary.c`
+      改成先取临时 `slice/slice_count`，确认 `slice_count > 0`
+      后才写入 scratch arrays
+    - 同时删除旧的 `positions` k-way merge，
+      改成“安全收集正样本 -> 统一拼接 -> sort + deduplicate”
+      的 merge 口径
+    - 新增最小回归 `fb_summary_payload_locator_merge`
+      锁住“正样本后跟零样本”的 multi-match locator merge 场景
+  - 当前验证：
+    - `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_summary_payload_locator_merge'`
+      `All 1 tests passed.`
+    - live 现场复跑：
+      `copy (select * from pg_flashback(NULL::scenario_oa_50t_50000r.users, '2026-04-08 00:38:25.357868+00') order by id) to stdout`
+      当前已完整跑通，`[done] total elapsed 17181.644 ms`
+      且不再报 invalid `pfree`
+
+- 已继续深入追查 release gate `run_flashback_checks` 的 `3/9 xact-status`
+  尾部慢路径，当前现场已补充到：
+  - 2026-04-08 同机手工复跑
+    `./tests/release_gate/bin/run_release_gate.sh --from run_flashback_checks`
+    时，首个 case 仍稳定表现为：
+    - `3/9 30% metadata` 约 `11.4s`
+    - `3/9 55% xact-status` 约 `44.7s`
+    - `3/9 70% -> 100% payload` 约 `27.9s`
+  - 同一 case
+    `scenario_oa_50t_50000r.documents @ '2026-04-08 00:38:25.357868+00'`
+    的 `fb_recordref_debug()` 当前已确认：
+    - `summary_xid_hits=27366`
+    - `summary_xid_fallback=21`
+    - `summary_xid_exact_hits=0`
+    - `summary_xid_exact_segments_read=2087`
+    - `xact_fallback_windows=7`
+    - `xact_fallback_covered_segments=860`
+    - `xact_summary_spool_records=0`
+    - `xact_summary_spool_hits=0`
+  - 这说明当前现场不是“summary 完全没用上”，而是：
+    - relation span / xid summary 已经命中大头
+    - 但仍有 `21` 个 xid 在两轮 summary exact lookup 后依旧 unresolved
+    - 于是 backend 继续掉回真实 WAL fallback，拖慢 `3/9 55%`
+  - 当前已排除的方向：
+    - `pg_flashback_summary_progress` 当前显示
+      `missing_segments=0`
+      / `last_query_summary_ready=t`
+      / `last_query_summary_span_fallback_segments=0`
+      / `last_query_metadata_fallback_segments=0`
+    - 当前不是“summary service 常规缺覆盖”导致的普遍降级
+    - 手工构造的“大量 savepoint / 96 subxact” probe 当前可由
+      `xact_summary_log` 解出，未直接复现 release gate 的
+      `summary_xid_fallback=21`
+  - 当前进一步收敛出的可疑点：
+    - `summary` 侧 relation touched xid 与 query 侧 WAL 实扫 touched xid
+      的口径不一致：
+      - `src/fb_summary.c` 当前对 relation touched xid 先取
+        `fb_summary_record_xid()`，优先折叠到 `top_xid`
+      - `src/fb_wal.c` 当前 `fb_mark_record_xids_touched()` 仍会把
+        `raw xid + top_xid` 都放进 touched 集
+    - 该不一致尚未证明就是 release gate `21 xid` 的唯一根因，
+      但已经确认是现有 summary/xact 口径中的真实缺口
+    - regression-only 诊断函数
+      `fb_summary_xid_resolution_debug(...)`
+      当前在大现场上还会稳定 backend `SIGSEGV`
+      （`dynahash.c:963`），导致 unresolved xid 样本暂时无法直接打印
+  - 当前修复主线已调整为：
+    - 先修复 xid tracking / debug 诊断口径不一致
+    - 再继续追具体 unresolved xid 样本
+    - 最终补齐 summary 生成侧可能遗漏的 xid outcome 场景，
+      直到 release gate 现场不再为少量 unresolved xid 回退 WAL
 
 - 已完成修复无主键 bag residual 历史行首条丢失的问题：
   - 2026-04-07 本机 PG18 / `alldb` 用户现场已复现：

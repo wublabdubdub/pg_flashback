@@ -308,6 +308,66 @@ SELECT (regexp_match(:'abort_subxact_summary_resolution', 'summary_hits=([0-9]+)
 	   (regexp_match(:'abort_subxact_summary_resolution', 'fallback_windows=([0-9]+)'))[1]::integer = 0
 	   AS abort_subxact_summary_avoids_fallback_windows;
 
+DROP TABLE IF EXISTS fb_recordref_overflow_subxact_target;
+DROP TABLE IF EXISTS fb_recordref_overflow_subxact_mark;
+
+CREATE TABLE fb_recordref_overflow_subxact_target (
+	id integer PRIMARY KEY,
+	payload integer
+);
+
+CHECKPOINT;
+
+INSERT INTO fb_recordref_overflow_subxact_target VALUES (1, 10);
+
+CREATE TABLE fb_recordref_overflow_subxact_mark (
+	target_ts timestamptz NOT NULL
+);
+
+INSERT INTO fb_recordref_overflow_subxact_mark VALUES (clock_timestamp());
+
+DO $$
+BEGIN
+	PERFORM pg_sleep(1.1);
+END;
+$$;
+
+BEGIN;
+\o /dev/null
+SELECT format(
+		   'SAVEPOINT fb_recordref_overflow_subxact_s%1$s; ' ||
+		   'INSERT INTO fb_recordref_overflow_subxact_target VALUES (%2$s, %2$s); ' ||
+		   'RELEASE SAVEPOINT fb_recordref_overflow_subxact_s%1$s;',
+		   gs,
+		   gs + 1)
+FROM generate_series(1, 128) AS gs
+\gexec
+\o
+COMMIT;
+
+DO $$
+BEGIN
+	PERFORM pg_switch_wal();
+	PERFORM pg_switch_wal();
+	PERFORM fb_summary_build_available_debug();
+END;
+$$;
+
+SET pg_flashback.parallel_workers = 4;
+
+SELECT fb_summary_xid_resolution_debug(
+	'fb_recordref_overflow_subxact_target'::regclass,
+	(SELECT target_ts FROM fb_recordref_overflow_subxact_mark)
+) AS overflow_subxact_summary_resolution
+\gset
+
+SELECT (regexp_match(:'overflow_subxact_summary_resolution', 'summary_hits=([0-9]+)'))[1]::integer > 0
+	   AS overflow_subxact_summary_uses_xid_outcomes,
+	   (regexp_match(:'overflow_subxact_summary_resolution', 'unresolved_touched=([0-9]+)'))[1]::integer = 0
+	   AS overflow_subxact_summary_resolves_all_touched_xids,
+	   (regexp_match(:'overflow_subxact_summary_resolution', 'fallback_windows=([0-9]+)'))[1]::integer = 0
+	   AS overflow_subxact_summary_avoids_fallback_windows;
+
 CREATE TABLE fb_recordref_unsafe (
 	id integer PRIMARY KEY,
 	payload integer

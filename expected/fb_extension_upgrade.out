@@ -21,8 +21,8 @@ SELECT to_regprocedure('pg_flashback(text,text,text)') IS NOT NULL AS has_old_en
  t             | t
 (1 row)
 
-ALTER EXTENSION pg_flashback UPDATE TO '0.1.1';
-SELECT extversion = '0.1.1' AS at_new_version
+ALTER EXTENSION pg_flashback UPDATE TO '0.2.0';
+SELECT extversion = '0.2.0' AS at_new_version
 FROM pg_extension
 WHERE extname = 'pg_flashback';
  at_new_version 
@@ -67,4 +67,3 @@ ORDER BY id;
   1 | before
   2 | before
 (2 rows)
-

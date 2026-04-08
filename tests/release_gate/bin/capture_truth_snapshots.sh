@@ -40,6 +40,34 @@ dml_log="$(fb_release_gate_text_path dml_snapshot_capture)"
 runtime_file="$(fb_release_gate_json_path dml_pressure_runtime)"
 scenario_matrix_file="$FB_RELEASE_GATE_CONFIG_DIR/scenario_matrix.json"
 
+reset_stage_outputs() {
+	local path
+
+	case "$MODE" in
+		random)
+			for path in "$random_log" "$truth_random_manifest" "$schedule_file"; do
+				: > "$path"
+				chmod 0666 "$path" 2>/dev/null || true
+			done
+			;;
+		dml)
+			for path in "$dml_log" "$truth_dml_manifest"; do
+				: > "$path"
+				chmod 0666 "$path" 2>/dev/null || true
+			done
+			;;
+		all)
+			for path in "$random_log" "$dml_log" "$truth_random_manifest" "$truth_dml_manifest" "$schedule_file"; do
+				: > "$path"
+				chmod 0666 "$path" 2>/dev/null || true
+			done
+			;;
+		*)
+			fb_release_gate_fail "unsupported mode for reset_stage_outputs: $MODE"
+			;;
+	esac
+}
+
 run_existing_table_import() {
 	local table_name="$1"
 	local rows_to_import="$2"
@@ -72,6 +100,7 @@ capture_bundle() {
 	local script_file
 	local capture_output
 	local capture_ts=""
+	local capture_snapshot=""
 	local table_name
 	local csv_path
 	local qualified_table
@@ -86,6 +115,7 @@ capture_bundle() {
 		echo '\set ON_ERROR_STOP on'
 		echo 'begin isolation level repeatable read;'
 		echo "select to_char(transaction_timestamp() at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US+00') as capture_ts \\gset"
+		echo "select txid_current_snapshot()::text as capture_snapshot \\gset"
 		for table_name in "${tables[@]}"; do
 			qualified_table="$(fb_release_gate_sql_qualified_name "$schema_name" "$table_name")"
 			order_by="$(fb_release_gate_table_pk_order "$FB_RELEASE_GATE_DBNAME" "$schema_name" "$table_name")"
@@ -98,14 +128,20 @@ capture_bundle() {
 		done
 		echo 'commit;'
 		echo '\echo capture_ts=:capture_ts'
+		echo '\echo capture_snapshot=:capture_snapshot'
 	} > "$script_file"
 
 	capture_output="$(fb_release_gate_psql_file "$FB_RELEASE_GATE_DBNAME" "$script_file")"
 	rm -f "$script_file"
-	printf '%s\n' "$capture_output" >> "$random_log"
-	printf '%s\n' "$capture_output" >> "$dml_log"
+	if [[ "$scenario_id" == random_flashback_* ]]; then
+		printf '%s\n' "$capture_output" >> "$random_log"
+	else
+		printf '%s\n' "$capture_output" >> "$dml_log"
+	fi
 	capture_ts="$(printf '%s\n' "$capture_output" | awk -F= '/^capture_ts=/{print $2; exit}')"
+	capture_snapshot="$(printf '%s\n' "$capture_output" | awk -F= '/^capture_snapshot=/{print $2; exit}')"
 	[[ -n "$capture_ts" ]] || fb_release_gate_fail "could not parse capture_ts for scenario ${scenario_id}"
+	[[ -n "$capture_snapshot" ]] || fb_release_gate_fail "could not parse capture_snapshot for scenario ${scenario_id}"
 
 	for table_name in "${tables[@]}"; do
 		csv_path="$(fb_release_gate_output_path "csv/truth/${scenario_id}__${table_name}.csv")"
@@ -119,6 +155,7 @@ capture_bundle() {
 		item_json="$(jq -cn \
 			--arg scenario_id "$scenario_id" \
 			--arg target_ts "$capture_ts" \
+			--arg target_snapshot "$capture_snapshot" \
 			--arg schema_name "$schema_name" \
 			--arg table_name "$table_name" \
 			--arg qualified_name "${schema_name}.${table_name}" \
@@ -127,7 +164,7 @@ capture_bundle() {
 			--arg table_class "$table_class" \
 			--arg mode "$MODE" \
 			--argjson row_count "$row_count" \
-			'{scenario_id:$scenario_id, target_ts:$target_ts, schema_name:$schema_name, table_name:$table_name, qualified_name:$qualified_name, csv_path:$csv_path, sha256:$sha256, row_count:$row_count, table_class:$table_class, capture_mode:$mode}')"
+			'{scenario_id:$scenario_id, target_ts:$target_ts, target_snapshot:$target_snapshot, schema_name:$schema_name, table_name:$table_name, qualified_name:$qualified_name, csv_path:$csv_path, sha256:$sha256, row_count:$row_count, table_class:$table_class, capture_mode:$mode}')"
 		if [[ "$scenario_id" == random_flashback_* ]]; then
 			fb_release_gate_manifest_append "$truth_random_manifest" "$item_json"
 		else
@@ -289,6 +326,7 @@ commit;
 
 [[ -f "$truth_random_manifest" ]] || fb_release_gate_manifest_init "$truth_random_manifest"
 [[ -f "$truth_dml_manifest" ]] || fb_release_gate_manifest_init "$truth_dml_manifest"
+reset_stage_outputs
 
 case "$MODE" in
 	random)

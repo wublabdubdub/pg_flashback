@@ -28,8 +28,10 @@ PG_FUNCTION_INFO_V1(fb_replay_heap_update_same_block_init_contract_debug);
 PG_FUNCTION_INFO_V1(fb_replay_heap_update_block_id_contract_debug);
 PG_FUNCTION_INFO_V1(fb_replay_prune_image_short_circuit_debug);
 PG_FUNCTION_INFO_V1(fb_replay_prune_image_preserve_next_insert_debug);
+PG_FUNCTION_INFO_V1(fb_replay_prune_image_preserve_next_multi_insert_debug);
 PG_FUNCTION_INFO_V1(fb_replay_prune_image_preserve_dead_old_tuple_debug);
 PG_FUNCTION_INFO_V1(fb_replay_prune_image_reject_used_insert_slot_debug);
+PG_FUNCTION_INFO_V1(fb_replay_prune_image_reject_future_warm_state_debug);
 PG_FUNCTION_INFO_V1(fb_replay_prune_compose_future_constraints_debug);
 PG_FUNCTION_INFO_V1(fb_replay_prune_lookahead_snapshot_isolation_debug);
 
@@ -260,6 +262,17 @@ fb_replay_future_block_record_remove_old(FbReplayFutureBlockRecord *future,
 
 	future->old_tuple_offsets =
 		bms_del_member(future->old_tuple_offsets, (int) offnum);
+}
+
+static void
+fb_replay_future_block_record_remove_new(FbReplayFutureBlockRecord *future,
+										  OffsetNumber offnum)
+{
+	if (future == NULL || offnum < FirstOffsetNumber)
+		return;
+
+	future->new_tuple_slot_offsets =
+		bms_del_member(future->new_tuple_slot_offsets, (int) offnum);
 }
 
 static int
@@ -2108,6 +2121,30 @@ fb_replay_future_block_record_compose(const FbRecordRef *record,
 			fb_replay_future_block_record_add_new(before, xlrec->offnum);
 			return true;
 		}
+		case FB_WAL_RECORD_HEAP2_MULTI_INSERT:
+		{
+			xl_heap_multi_insert *xlrec =
+				(xl_heap_multi_insert *) record->main_data;
+
+			if (fb_wal_record_block_materializes_page(record, block_index))
+			{
+				fb_replay_future_block_record_set_materializes(before);
+				return true;
+			}
+
+			for (int tuple_index = 0; tuple_index < xlrec->ntuples; tuple_index++)
+			{
+				OffsetNumber offnum;
+
+				if (record->init_page)
+					offnum = FirstOffsetNumber + tuple_index;
+				else
+					offnum = xlrec->offsets[tuple_index];
+				fb_replay_future_block_record_remove_old(before, offnum);
+				fb_replay_future_block_record_add_new(before, offnum);
+			}
+			return true;
+		}
 		case FB_WAL_RECORD_HEAP_UPDATE:
 		case FB_WAL_RECORD_HEAP_HOT_UPDATE:
 		{
@@ -2217,6 +2254,54 @@ fb_replay_future_block_record_compose(const FbRecordRef *record,
 			fb_replay_future_block_record_add_old(before, xlrec->offnum);
 			return true;
 		}
+		case FB_WAL_RECORD_HEAP2_PRUNE:
+		{
+#if PG_VERSION_NUM >= 170000
+			xl_heap_prune xlrec;
+
+			if (record->main_data == NULL ||
+				record->main_data_len < SizeOfHeapPrune ||
+				!record->blocks[block_index].has_data ||
+				record->blocks[block_index].data_len == 0)
+				return true;
+
+			memcpy(&xlrec, record->main_data, SizeOfHeapPrune);
+			if ((xlrec.flags & XLHP_HAS_NOW_UNUSED_ITEMS) != 0)
+			{
+				OffsetNumber redirected_buf[MaxHeapTuplesPerPage * 2];
+				OffsetNumber nowdead_buf[MaxHeapTuplesPerPage];
+				OffsetNumber nowunused_buf[MaxHeapTuplesPerPage];
+				OffsetNumber *redirected = redirected_buf;
+				OffsetNumber *nowdead = nowdead_buf;
+				OffsetNumber *nowunused = nowunused_buf;
+				OffsetNumber *frz_offsets = NULL;
+				xlhp_freeze_plan *plans = NULL;
+				int nredirected = 0;
+				int ndead = 0;
+				int nunused = 0;
+				int nplans = 0;
+				int i;
+
+				heap_xlog_deserialize_prune_and_freeze(
+					record->blocks[block_index].data,
+					xlrec.flags,
+					&nplans,
+					&plans,
+					&frz_offsets,
+					&nredirected,
+					&redirected,
+					&ndead,
+					&nowdead,
+					&nunused,
+					&nowunused);
+
+				for (i = 0; i < nunused; i++)
+					(void) fb_replay_future_block_record_remove_new(before,
+														  nowunused[i]);
+			}
+#endif
+			return true;
+		}
 		case FB_WAL_RECORD_XLOG_FPI:
 		case FB_WAL_RECORD_XLOG_FPI_FOR_HINT:
 			if (fb_wal_record_block_materializes_page(record, block_index))
@@ -2287,6 +2372,38 @@ fb_replay_page_supports_future_same_block_record(const FbRecordRef *record,
 			if (fb_wal_record_block_materializes_page(record, match_index))
 				return true;
 			return fb_replay_page_has_insert_room(page, xlrec->offnum);
+		}
+		case FB_WAL_RECORD_HEAP2_MULTI_INSERT:
+		{
+			xl_heap_multi_insert *xlrec =
+				(xl_heap_multi_insert *) record->main_data;
+			int match_index = -1;
+
+			for (int block_index = 0; block_index < record->block_count; block_index++)
+			{
+				if (!fb_replay_block_ref_matches_key(&record->blocks[block_index], key))
+					continue;
+				match_index = block_index;
+				break;
+			}
+			if (match_index < 0)
+				return true;
+			if (relevant != NULL)
+				*relevant = true;
+			if (fb_wal_record_block_materializes_page(record, match_index))
+				return true;
+			for (int tuple_index = 0; tuple_index < xlrec->ntuples; tuple_index++)
+			{
+				OffsetNumber offnum;
+
+				if (record->init_page)
+					offnum = FirstOffsetNumber + tuple_index;
+				else
+					offnum = xlrec->offsets[tuple_index];
+				if (!fb_replay_page_has_insert_room(page, offnum))
+					return false;
+			}
+			return true;
 		}
 		case FB_WAL_RECORD_HEAP_UPDATE:
 		case FB_WAL_RECORD_HEAP_HOT_UPDATE:
@@ -2508,21 +2625,6 @@ fb_replay_build_prune_lookahead(const FbWalRecordIndex *index,
 					entry->record_index = record_index;
 				fb_replay_future_block_record_clone(&entry->future,
 													 &future_entry->future);
-				if (FB_LOCATOR_RELNUMBER(record.blocks[0].locator) == 16395737 &&
-					(record.blocks[0].blkno == 1084494 ||
-					 record.blocks[0].blkno == 1084485 ||
-					 record.blocks[0].blkno == 1084491 ||
-					 record.blocks[0].blkno == 38724))
-					elog(WARNING,
-						 "fb_debug build prune blk=%u recidx=%u lsn=%X/%08X copied old_count=%d old_first=%u new_count=%d new_first=%u materializes=%s",
-						 record.blocks[0].blkno,
-						 record_index,
-						 LSN_FORMAT_ARGS(record.lsn),
-						 fb_replay_future_block_record_old_count(&entry->future),
-						 fb_replay_future_block_record_first_old(&entry->future),
-						 fb_replay_future_block_record_new_count(&entry->future),
-						 fb_replay_future_block_record_first_new(&entry->future),
-						 entry->future.materializes_page ? "true" : "false");
 			}
 		}
 
@@ -2547,23 +2649,6 @@ fb_replay_build_prune_lookahead(const FbWalRecordIndex *index,
 												   found ? &future_entry->future : NULL,
 												   &future_entry->future))
 				continue;
-			if (FB_LOCATOR_RELNUMBER(record.blocks[block_index].locator) == 16395737 &&
-				(record.blocks[block_index].blkno == 1084494 ||
-				 record.blocks[block_index].blkno == 1084485 ||
-				 record.blocks[block_index].blkno == 1084491 ||
-				 record.blocks[block_index].blkno == 38724))
-				elog(WARNING,
-					 "fb_debug build future blk=%u recidx=%u lsn=%X/%08X kind=%u block_index=%d old_count=%d old_first=%u new_count=%d new_first=%u materializes=%s",
-					 record.blocks[block_index].blkno,
-					 record_index,
-					 LSN_FORMAT_ARGS(record.lsn),
-					 (unsigned int) record.kind,
-					 block_index,
-					 fb_replay_future_block_record_old_count(&future_entry->future),
-					 fb_replay_future_block_record_first_old(&future_entry->future),
-					 fb_replay_future_block_record_new_count(&future_entry->future),
-					 fb_replay_future_block_record_first_new(&future_entry->future),
-					 future_entry->future.materializes_page ? "true" : "false");
 		}
 	}
 	fb_wal_record_cursor_close(cursor);
@@ -2587,46 +2672,25 @@ fb_replay_prune_image_should_preserve_page(const FbRecordRef *record,
 		control->prune_lookahead == NULL)
 		return false;
 
+	/*
+	 * Final replay reuses the warm store. If the current page state already
+	 * comes from a later WAL record, preserving it across an older prune image
+	 * would collapse history and skip the image-derived free space/base state.
+	 */
+	if (!XLogRecPtrIsInvalid(state->page_lsn) &&
+		state->page_lsn > record->end_lsn)
+		return false;
+
 	block_ref = &record->blocks[0];
 	if (!fb_record_block_has_applicable_image(block_ref) ||
 		block_ref->image == NULL ||
 		(block_ref->has_data && block_ref->data_len > 0))
 		return false;
-	if (FB_LOCATOR_RELNUMBER(block_ref->locator) == 16395737 &&
-		(block_ref->blkno == 1084494 ||
-		 block_ref->blkno == 1084485 ||
-		 block_ref->blkno == 1084491 ||
-		 block_ref->blkno == 38724))
-		elog(WARNING,
-			 "fb_debug preserve gate blk=%u lsn=%X/%08X recidx=%u state_maxoff=%u image_maxoff=%u state_lp4=%s image_lp4=%s",
-			 block_ref->blkno,
-			 LSN_FORMAT_ARGS(record->lsn),
-			 control->record_index,
-			 (unsigned int) PageGetMaxOffsetNumber((Page) state->page),
-			 (unsigned int) PageGetMaxOffsetNumber((Page) block_ref->image),
-			 fb_replay_debug_lp_state((Page) state->page, 4),
-			 fb_replay_debug_lp_state((Page) block_ref->image, 4));
 
 	entry = (FbReplayPruneLookaheadEntry *) hash_search(control->prune_lookahead,
 														&control->record_index,
 														HASH_FIND,
 														NULL);
-	if (FB_LOCATOR_RELNUMBER(block_ref->locator) == 16395737 &&
-		(block_ref->blkno == 1084494 ||
-		 block_ref->blkno == 1084485 ||
-		 block_ref->blkno == 1084491 ||
-		 block_ref->blkno == 38724))
-		elog(WARNING,
-			 "fb_debug preserve lookup blk=%u lsn=%X/%08X recidx=%u found=%s old_count=%d old_first=%u new_count=%d new_first=%u materializes=%s",
-			 block_ref->blkno,
-			 LSN_FORMAT_ARGS(record->lsn),
-			 control->record_index,
-			 entry != NULL ? "true" : "false",
-			 (entry != NULL) ? fb_replay_future_block_record_old_count(&entry->future) : 0,
-			 (entry != NULL) ? fb_replay_future_block_record_first_old(&entry->future) : InvalidOffsetNumber,
-			 (entry != NULL) ? fb_replay_future_block_record_new_count(&entry->future) : 0,
-			 (entry != NULL) ? fb_replay_future_block_record_first_new(&entry->future) : InvalidOffsetNumber,
-			 (entry != NULL && entry->future.materializes_page) ? "true" : "false");
 	if (entry == NULL)
 		return false;
 
@@ -2634,22 +2698,84 @@ fb_replay_prune_image_should_preserve_page(const FbRecordRef *record,
 															 &entry->future);
 	image_ok = fb_replay_page_supports_future_block_record((Page) block_ref->image,
 														   &entry->future);
-	if (FB_LOCATOR_RELNUMBER(block_ref->locator) == 16395737 &&
-		(block_ref->blkno == 1084494 ||
-		 block_ref->blkno == 1084485 ||
-		 block_ref->blkno == 1084491 ||
-		 block_ref->blkno == 38724))
-		elog(WARNING,
-			 "fb_debug preserve decide blk=%u lsn=%X/%08X current_ok=%s image_ok=%s current_lp1=%s image_lp1=%s current_lp4=%s image_lp4=%s",
-			 block_ref->blkno,
-			 LSN_FORMAT_ARGS(record->lsn),
-			 current_ok ? "true" : "false",
-			 image_ok ? "true" : "false",
-			 fb_replay_debug_lp_state((Page) state->page, FirstOffsetNumber),
-			 fb_replay_debug_lp_state((Page) block_ref->image, FirstOffsetNumber),
-			 fb_replay_debug_lp_state((Page) state->page, 4),
-			 fb_replay_debug_lp_state((Page) block_ref->image, 4));
 	return current_ok && !image_ok;
+}
+
+static void
+fb_replay_prune_remove_offset(OffsetNumber *offsets,
+							  int *count,
+							  OffsetNumber offnum)
+{
+	int i;
+
+	if (offsets == NULL || count == NULL || *count <= 0)
+		return;
+
+	for (i = 0; i < *count; i++)
+	{
+		if (offsets[i] != offnum)
+			continue;
+		memmove(&offsets[i], &offsets[i + 1],
+				sizeof(OffsetNumber) * (*count - i - 1));
+		(*count)--;
+		return;
+	}
+}
+
+static bool
+fb_replay_prune_has_offset(const OffsetNumber *offsets,
+						   int count,
+						   OffsetNumber offnum)
+{
+	int i;
+
+	if (offsets == NULL || count <= 0)
+		return false;
+
+	for (i = 0; i < count; i++)
+	{
+		if (offsets[i] == offnum)
+			return true;
+	}
+
+	return false;
+}
+
+static void
+fb_replay_prune_add_nowunused(OffsetNumber *nowunused,
+							  int *nunused,
+							  OffsetNumber offnum)
+{
+	if (nowunused == NULL || nunused == NULL || offnum < FirstOffsetNumber)
+		return;
+	if (fb_replay_prune_has_offset(nowunused, *nunused, offnum))
+		return;
+
+	nowunused[*nunused] = offnum;
+	(*nunused)++;
+}
+
+static bool
+fb_replay_prune_remove_redirect(OffsetNumber *redirected,
+								int *nredirected,
+								OffsetNumber offnum)
+{
+	int i;
+
+	if (redirected == NULL || nredirected == NULL || *nredirected <= 0)
+		return false;
+
+	for (i = 0; i < (*nredirected * 2); i += 2)
+	{
+		if (redirected[i] != offnum)
+			continue;
+		memmove(&redirected[i], &redirected[i + 2],
+				sizeof(OffsetNumber) * (*nredirected * 2 - i - 2));
+		(*nredirected)--;
+		return true;
+	}
+
+	return false;
 }
 
 static void
@@ -2679,67 +2805,32 @@ fb_replay_prune_apply_future_guard(const FbReplayControl *control,
 	while ((i = bms_next_member(entry->future.old_tuple_offsets, i)) >= 0)
 	{
 		OffsetNumber offnum = (OffsetNumber) i;
-		int j;
 
-		for (j = 0; j < *ndead; j++)
-		{
-			if (nowdead[j] != offnum)
-				continue;
-			memmove(&nowdead[j], &nowdead[j + 1],
-					sizeof(OffsetNumber) * (*ndead - j - 1));
-			(*ndead)--;
-			break;
-		}
-		for (j = 0; j < *nunused; j++)
-		{
-			if (nowunused[j] != offnum)
-				continue;
-			memmove(&nowunused[j], &nowunused[j + 1],
-					sizeof(OffsetNumber) * (*nunused - j - 1));
-			(*nunused)--;
-			break;
-		}
-		for (j = 0; j < (*nredirected * 2); j += 2)
-		{
-			if (redirected[j] != offnum)
-				continue;
-			memmove(&redirected[j], &redirected[j + 2],
-					sizeof(OffsetNumber) * (*nredirected * 2 - j - 2));
-			(*nredirected)--;
-			break;
-		}
+		/*
+		 * Future old-tuple lookups already accept LP_DEAD and redirected line
+		 * pointers. Only suppress transitions that would discard the tuple
+		 * payload entirely.
+		 */
+		fb_replay_prune_remove_offset(nowunused, nunused, offnum);
 	}
 
 	i = -1;
 	while ((i = bms_next_member(entry->future.new_tuple_slot_offsets, i)) >= 0)
 	{
 		OffsetNumber offnum = (OffsetNumber) i;
-		bool already_unused = false;
-		int j;
+		bool removed_dead;
+		bool removed_redirect;
 
-		for (j = 0; j < *nunused; j++)
-		{
-			if (nowunused[j] == offnum)
-			{
-				already_unused = true;
-				break;
-			}
-		}
-
-		for (j = 0; j < *ndead; j++)
-		{
-			if (nowdead[j] != offnum)
-				continue;
-			memmove(&nowdead[j], &nowdead[j + 1],
-					sizeof(OffsetNumber) * (*ndead - j - 1));
-			(*ndead)--;
-			if (!already_unused)
-			{
-				nowunused[*nunused] = offnum;
-				(*nunused)++;
-			}
-			break;
-		}
+		removed_dead = fb_replay_prune_has_offset(nowdead, *ndead, offnum);
+		if (removed_dead)
+			fb_replay_prune_remove_offset(nowdead, ndead, offnum);
+		removed_redirect = fb_replay_prune_remove_redirect(redirected,
+														 nredirected,
+														 offnum);
+		if (!removed_dead && !removed_redirect &&
+			!fb_replay_prune_has_offset(nowunused, *nunused, offnum))
+			continue;
+		fb_replay_prune_add_nowunused(nowunused, nunused, offnum);
 	}
 }
 
@@ -2821,7 +2912,6 @@ fb_replay_heap_insert(const FbRelationInfo *info,
 	if (FB_LOCATOR_RELNUMBER(block_ref->locator) == 16395804 &&
 		block_ref->blkno == 26273)
 		fb_replay_debug_log_toast26273_page("insert before", record->lsn, page);
-
 	ItemPointerSetBlockNumber(&target_tid, block_ref->blkno);
 	ItemPointerSetOffsetNumber(&target_tid, xlrec->offnum);
 
@@ -2930,7 +3020,6 @@ fb_replay_heap_insert(const FbRelationInfo *info,
 			 fb_replay_debug_lp_state(page, 2),
 			 fb_replay_debug_lp_state(page, 3),
 			 fb_replay_debug_lp_state(page, 4));
-
 	state->page_lsn = record->end_lsn;
 	result->records_replayed++;
 	if (record->committed_after_target && block_ref->is_main_relation &&
@@ -3043,7 +3132,6 @@ fb_replay_heap_delete(const FbRelationInfo *info,
 	if (FB_LOCATOR_RELNUMBER(block_ref->locator) == 16395737 &&
 		block_ref->blkno == 38724)
 		fb_replay_debug_log_documents38724_page("delete before", record->lsn, page);
-
 	if (source != NULL && tupdesc != NULL &&
 		record->committed_after_target && block_ref->is_main_relation)
 		old_tuple = fb_copy_page_old_tuple(page, block_ref->blkno, xlrec->offnum);
@@ -3201,7 +3289,6 @@ fb_replay_heap_update(const FbRelationInfo *info,
 			(FbRecordBlockRef *) &record->blocks[1] : new_block_ref;
 	if (new_block_ref == NULL || old_block_ref == NULL)
 		elog(ERROR, "heap update record missing block references");
-
 	old_block_index = (old_block_ref->block_id == 1) ? 1 :
 		(old_block_ref == new_block_ref ? 0 : 1);
 	new_block_index = 0;
@@ -3421,12 +3508,11 @@ fb_replay_heap_update(const FbRelationInfo *info,
 		HeapTupleHeaderSetCmin(htup, FirstCommandId);
 		HeapTupleHeaderSetXmax(htup, xlrec->new_xmax);
 		htup->t_ctid = newtid;
-
 			if (PageAddItem(newpage, (Item) htup, newlen, offnum, true, true) == InvalidOffsetNumber)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("failed to replay heap update"),
-						 errdetail("lsn=%X/%08X newblk=%u oldblk=%u sameblk=%s off=%u maxoff=%u lp=%s page_lsn=%X/%08X image=%s apply_image=%s data=%s init_page=%s flags=0x%02X",
+						 errdetail("lsn=%X/%08X newblk=%u oldblk=%u sameblk=%s off=%u maxoff=%u lp=%s page_lsn=%X/%08X image=%s apply_image=%s data=%s init_page=%s flags=0x%02X prefixlen=%u suffixlen=%u oldtup_len=%u datalen=%u newlen=%u lower=%u upper=%u exact_free=%u heap_free=%u lp1=%s/%u lp2=%s/%u lp3=%s/%u lp4=%s/%u",
 								   LSN_FORMAT_ARGS(record->lsn),
 								   new_block_ref->blkno,
 								   old_block_ref->blkno,
@@ -3439,7 +3525,32 @@ fb_replay_heap_update(const FbRelationInfo *info,
 								   new_block_ref->apply_image ? "true" : "false",
 								   new_block_ref->has_data ? "true" : "false",
 								   record->init_page ? "true" : "false",
-								   xlrec->flags)));
+								   xlrec->flags,
+								   (unsigned int) prefixlen,
+								   (unsigned int) suffixlen,
+								   (unsigned int) oldtup_len,
+								   (unsigned int) datalen,
+								   (unsigned int) newlen,
+								   (unsigned int) ((PageHeader) newpage)->pd_lower,
+								   (unsigned int) ((PageHeader) newpage)->pd_upper,
+								   (unsigned int) PageGetExactFreeSpace(newpage),
+								   (unsigned int) PageGetHeapFreeSpace(newpage),
+								   fb_replay_debug_lp_state(newpage, 1),
+								   PageGetMaxOffsetNumber(newpage) >= 1 &&
+								   ItemIdHasStorage(PageGetItemId(newpage, 1)) ?
+								   (unsigned int) ItemIdGetLength(PageGetItemId(newpage, 1)) : 0,
+								   fb_replay_debug_lp_state(newpage, 2),
+								   PageGetMaxOffsetNumber(newpage) >= 2 &&
+								   ItemIdHasStorage(PageGetItemId(newpage, 2)) ?
+								   (unsigned int) ItemIdGetLength(PageGetItemId(newpage, 2)) : 0,
+								   fb_replay_debug_lp_state(newpage, 3),
+								   PageGetMaxOffsetNumber(newpage) >= 3 &&
+								   ItemIdHasStorage(PageGetItemId(newpage, 3)) ?
+								   (unsigned int) ItemIdGetLength(PageGetItemId(newpage, 3)) : 0,
+								   fb_replay_debug_lp_state(newpage, 4),
+								   PageGetMaxOffsetNumber(newpage) >= 4 &&
+								   ItemIdHasStorage(PageGetItemId(newpage, 4)) ?
+								   (unsigned int) ItemIdGetLength(PageGetItemId(newpage, 4)) : 0)));
 
 		if (xlrec->flags & XLH_UPDATE_NEW_ALL_VISIBLE_CLEARED)
 			PageClearAllVisible(newpage);
@@ -3473,6 +3584,22 @@ fb_replay_heap_update(const FbRelationInfo *info,
 			fb_append_forward_update(info, tupdesc, toast_store, record,
 									 old_tuple, new_tuple, result, source,
 									 pending_ops);
+		else
+			elog(WARNING,
+				 "fb_debug missing forward update tuple lsn=%X/%08X oldblk=%u newblk=%u old_off=%u new_off=%u old_tuple=%s new_tuple=%s old_lp=%s new_lp=%s old_page_lsn=%X/%08X new_page_lsn=%X/%08X flags=0x%02X hot=%s",
+				 LSN_FORMAT_ARGS(record->lsn),
+				 old_block_ref->blkno,
+				 new_block_ref->blkno,
+				 xlrec->old_offnum,
+				 xlrec->new_offnum,
+				 old_tuple != NULL ? "present" : "missing",
+				 new_tuple != NULL ? "present" : "missing",
+				 fb_replay_debug_lp_state(oldpage, xlrec->old_offnum),
+				 fb_replay_debug_lp_state(newpage, xlrec->new_offnum),
+				 LSN_FORMAT_ARGS(old_state->page_lsn),
+				 LSN_FORMAT_ARGS(new_state->page_lsn),
+				 xlrec->flags,
+				 hot_update ? "true" : "false");
 	}
 	if (new_block_ref->is_toast_relation && toast_store != NULL && toast_tupdesc != NULL)
 	{
@@ -3581,18 +3708,6 @@ fb_replay_heap2_prune(const FbRecordRef *record,
 	if (image_applies)
 	{
 		state = fb_replay_find_existing_block(store, block_ref);
-		if (FB_LOCATOR_RELNUMBER(block_ref->locator) == 16395737 &&
-			(block_ref->blkno == 1084494 ||
-			 block_ref->blkno == 1084485 ||
-			 block_ref->blkno == 1084491 ||
-			 block_ref->blkno == 38724))
-			elog(WARNING,
-				 "fb_debug prune caller blk=%u lsn=%X/%08X recidx=%u state_found=%s state_init=%s",
-				 block_ref->blkno,
-				 LSN_FORMAT_ARGS(record->lsn),
-				 (control != NULL) ? control->record_index : 0,
-				 state != NULL ? "true" : "false",
-				 (state != NULL && state->initialized) ? "true" : "false");
 		if (fb_replay_prune_image_should_preserve_page(record, state, control))
 		{
 			state->page_lsn = record->end_lsn;
@@ -3708,7 +3823,6 @@ fb_replay_heap2_prune(const FbRecordRef *record,
 				 nunused,
 				 ndead > 0 ? nowdead[0] : InvalidOffsetNumber,
 				 nunused > 0 ? nowunused[0] : InvalidOffsetNumber);
-
 		if (nredirected > 0 || ndead > 0 || nunused > 0)
 		{
 			fb_page_prune_execute(page,
@@ -4130,11 +4244,102 @@ fb_replay_heap2_multi_insert(const FbRelationInfo *info,
 			if (!fb_replay_expand_unused_slots(page, offnum))
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("failed to prepare heap multi insert line pointers")));
+						 errmsg("failed to prepare heap multi insert line pointers"),
+						 errdetail("phase=%s recidx=%u lsn=%X/%08X rel=%u/%u/%u blk=%u off=%u tuple_index=%d image=%s apply_image=%s data=%s init_page=%s maxoff=%u page_lsn=%X/%08X lp=%s lower=%u upper=%u exact_free=%u heap_free=%u",
+								   control != NULL &&
+								   control->phase == FB_REPLAY_PHASE_FINAL ? "final" :
+								   control != NULL &&
+								   control->phase == FB_REPLAY_PHASE_WARM ? "warm" :
+								   control != NULL &&
+								   control->phase == FB_REPLAY_PHASE_DISCOVER ? "discover" :
+								   "unknown",
+								   control != NULL ? control->record_index : 0,
+								   LSN_FORMAT_ARGS(record->lsn),
+								   FB_LOCATOR_SPCOID(block_ref->locator),
+								   FB_LOCATOR_DBOID(block_ref->locator),
+								   FB_LOCATOR_RELNUMBER(block_ref->locator),
+								   block_ref->blkno,
+								   offnum,
+								   i,
+								   block_ref->has_image ? "true" : "false",
+								   block_ref->apply_image ? "true" : "false",
+								   block_ref->has_data ? "true" : "false",
+								   record->init_page ? "true" : "false",
+								   (unsigned int) PageGetMaxOffsetNumber(page),
+								   LSN_FORMAT_ARGS(state->page_lsn),
+								   fb_replay_debug_lp_state(page, offnum),
+								   (unsigned int) ((PageHeader) page)->pd_lower,
+								   (unsigned int) ((PageHeader) page)->pd_upper,
+								   (unsigned int) PageGetExactFreeSpace(page),
+								   (unsigned int) PageGetHeapFreeSpace(page))));
+			if (PageGetMaxOffsetNumber(page) >= offnum &&
+				(ItemIdIsUsed(PageGetItemId(page, offnum)) ||
+				 ItemIdHasStorage(PageGetItemId(page, offnum))))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("heap multi insert target slot already used"),
+						 errdetail("phase=%s recidx=%u lsn=%X/%08X rel=%u/%u/%u blk=%u off=%u tuple_index=%d image=%s apply_image=%s data=%s init_page=%s maxoff=%u page_lsn=%X/%08X lp=%s used=%s has_storage=%s lower=%u upper=%u exact_free=%u heap_free=%u",
+								   control != NULL &&
+								   control->phase == FB_REPLAY_PHASE_FINAL ? "final" :
+								   control != NULL &&
+								   control->phase == FB_REPLAY_PHASE_WARM ? "warm" :
+								   control != NULL &&
+								   control->phase == FB_REPLAY_PHASE_DISCOVER ? "discover" :
+								   "unknown",
+								   control != NULL ? control->record_index : 0,
+								   LSN_FORMAT_ARGS(record->lsn),
+								   FB_LOCATOR_SPCOID(block_ref->locator),
+								   FB_LOCATOR_DBOID(block_ref->locator),
+								   FB_LOCATOR_RELNUMBER(block_ref->locator),
+								   block_ref->blkno,
+								   offnum,
+								   i,
+								   block_ref->has_image ? "true" : "false",
+								   block_ref->apply_image ? "true" : "false",
+								   block_ref->has_data ? "true" : "false",
+								   record->init_page ? "true" : "false",
+								   (unsigned int) PageGetMaxOffsetNumber(page),
+								   LSN_FORMAT_ARGS(state->page_lsn),
+								   fb_replay_debug_lp_state(page, offnum),
+								   ItemIdIsUsed(PageGetItemId(page, offnum)) ? "true" : "false",
+								   ItemIdHasStorage(PageGetItemId(page, offnum)) ? "true" : "false",
+								   (unsigned int) ((PageHeader) page)->pd_lower,
+								   (unsigned int) ((PageHeader) page)->pd_upper,
+								   (unsigned int) PageGetExactFreeSpace(page),
+								   (unsigned int) PageGetHeapFreeSpace(page))));
 			if (PageAddItem(page, (Item) htup, newlen, offnum, true, true) == InvalidOffsetNumber)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("failed to replay heap multi insert")));
+						 errmsg("failed to replay heap multi insert"),
+						 errdetail("phase=%s recidx=%u lsn=%X/%08X rel=%u/%u/%u blk=%u off=%u tuple_index=%d image=%s apply_image=%s data=%s init_page=%s maxoff=%u has_item=%s page_lsn=%X/%08X lp=%s lower=%u upper=%u exact_free=%u heap_free=%u",
+								   control != NULL &&
+								   control->phase == FB_REPLAY_PHASE_FINAL ? "final" :
+								   control != NULL &&
+								   control->phase == FB_REPLAY_PHASE_WARM ? "warm" :
+								   control != NULL &&
+								   control->phase == FB_REPLAY_PHASE_DISCOVER ? "discover" :
+								   "unknown",
+								   control != NULL ? control->record_index : 0,
+								   LSN_FORMAT_ARGS(record->lsn),
+								   FB_LOCATOR_SPCOID(block_ref->locator),
+								   FB_LOCATOR_DBOID(block_ref->locator),
+								   FB_LOCATOR_RELNUMBER(block_ref->locator),
+								   block_ref->blkno,
+								   offnum,
+								   i,
+								   block_ref->has_image ? "true" : "false",
+								   block_ref->apply_image ? "true" : "false",
+								   block_ref->has_data ? "true" : "false",
+								   record->init_page ? "true" : "false",
+								   (unsigned int) PageGetMaxOffsetNumber(page),
+								   (PageGetMaxOffsetNumber(page) >= offnum &&
+									ItemIdIsUsed(PageGetItemId(page, offnum))) ? "true" : "false",
+								   LSN_FORMAT_ARGS(state->page_lsn),
+								   fb_replay_debug_lp_state(page, offnum),
+								   (unsigned int) ((PageHeader) page)->pd_lower,
+								   (unsigned int) ((PageHeader) page)->pd_upper,
+								   (unsigned int) PageGetExactFreeSpace(page),
+								   (unsigned int) PageGetHeapFreeSpace(page))));
 		}
 
 			if (block_ref->is_toast_relation && toast_store != NULL && toast_tupdesc != NULL)
@@ -5075,6 +5280,52 @@ fb_replay_prune_image_preserve_next_insert_debug(PG_FUNCTION_ARGS)
 }
 
 Datum
+fb_replay_prune_image_preserve_next_multi_insert_debug(PG_FUNCTION_ARGS)
+{
+	struct
+	{
+		xl_heap_multi_insert header;
+		OffsetNumber offsets[1];
+	} xlwrap;
+	FbReplayBlockKey key;
+	FbRecordRef next_record;
+	char current_page[BLCKSZ];
+	char image_page[BLCKSZ];
+	bool preserve;
+
+	MemSet(&key, 0, sizeof(key));
+	MemSet(&next_record, 0, sizeof(next_record));
+	MemSet(&xlwrap, 0, sizeof(xlwrap));
+
+	key.forknum = MAIN_FORKNUM;
+	key.blkno = 42;
+
+	fb_replay_debug_seed_page((Page) current_page, key.blkno, 4);
+	fb_replay_debug_seed_page((Page) image_page, key.blkno, 4);
+	ItemIdSetUnused(PageGetItemId((Page) current_page, 3));
+
+	next_record.kind = FB_WAL_RECORD_HEAP2_MULTI_INSERT;
+	next_record.block_count = 1;
+	next_record.main_data = (char *) &xlwrap.header;
+	next_record.main_data_len = SizeOfHeapMultiInsert + sizeof(OffsetNumber);
+	next_record.blocks[0].in_use = true;
+	next_record.blocks[0].locator = key.locator;
+	next_record.blocks[0].forknum = key.forknum;
+	next_record.blocks[0].blkno = key.blkno;
+	xlwrap.header.ntuples = 1;
+	xlwrap.offsets[0] = 3;
+
+	preserve = fb_replay_prune_image_should_preserve_for_next_record(&key,
+																	 (Page) current_page,
+																 (Page) image_page,
+																 &next_record);
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+		"prune_image_preserve_next_multi_insert=%s",
+		preserve ? "true" : "false")));
+}
+
+Datum
 fb_replay_prune_image_preserve_dead_old_tuple_debug(PG_FUNCTION_ARGS)
 {
 	FbReplayBlockKey key;
@@ -5153,6 +5404,144 @@ fb_replay_prune_image_reject_used_insert_slot_debug(PG_FUNCTION_ARGS)
 
 	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
 		"prune_image_reject_used_insert_slot=%s",
+		(!preserve) ? "true" : "false")));
+}
+
+Datum
+fb_replay_prune_image_reject_future_warm_state_debug(PG_FUNCTION_ARGS)
+{
+	FbReplayBlockKey key;
+	FbRecordRef insert2;
+	FbRecordRef insert3;
+	FbRecordRef insert4;
+	FbRecordRef cleanup;
+	FbRecordRef record;
+	FbReplayBlockState state;
+	FbReplayControl control;
+	FbReplayPruneLookaheadEntry *entry;
+	FbReplayFutureBlockRecord future;
+	char current_page[BLCKSZ];
+	char image_page[BLCKSZ];
+	char prune_data[offsetof(xlhp_prune_items, data) + sizeof(OffsetNumber) * 4];
+	xl_heap_insert insert2_xlrec;
+	xl_heap_insert insert3_xlrec;
+	xl_heap_insert insert4_xlrec;
+	xl_heap_prune cleanup_xlrec;
+	xlhp_prune_items *unused_items = (xlhp_prune_items *) prune_data;
+	bool found;
+	bool preserve;
+
+	MemSet(&key, 0, sizeof(key));
+	MemSet(&insert2, 0, sizeof(insert2));
+	MemSet(&insert3, 0, sizeof(insert3));
+	MemSet(&insert4, 0, sizeof(insert4));
+	MemSet(&cleanup, 0, sizeof(cleanup));
+	MemSet(&record, 0, sizeof(record));
+	MemSet(&state, 0, sizeof(state));
+	MemSet(&control, 0, sizeof(control));
+	MemSet(&future, 0, sizeof(future));
+	MemSet(&insert2_xlrec, 0, sizeof(insert2_xlrec));
+	MemSet(&insert3_xlrec, 0, sizeof(insert3_xlrec));
+	MemSet(&insert4_xlrec, 0, sizeof(insert4_xlrec));
+	MemSet(&cleanup_xlrec, 0, sizeof(cleanup_xlrec));
+	MemSet(prune_data, 0, sizeof(prune_data));
+
+	key.forknum = MAIN_FORKNUM;
+	key.blkno = 42;
+
+	fb_replay_debug_seed_page((Page) current_page, key.blkno, 6);
+	fb_replay_debug_seed_page((Page) image_page, key.blkno, 5);
+	ItemIdSetUnused(PageGetItemId((Page) current_page, 2));
+	ItemIdSetUnused(PageGetItemId((Page) current_page, 3));
+	ItemIdSetUnused(PageGetItemId((Page) current_page, 4));
+	ItemIdMarkDead(PageGetItemId((Page) image_page, 2));
+	ItemIdMarkDead(PageGetItemId((Page) image_page, 3));
+	ItemIdMarkDead(PageGetItemId((Page) image_page, 4));
+	ItemIdMarkDead(PageGetItemId((Page) image_page, 5));
+
+	insert2.kind = FB_WAL_RECORD_HEAP_INSERT;
+	insert2.block_count = 1;
+	insert2.blocks[0].in_use = true;
+	insert2.blocks[0].locator = key.locator;
+	insert2.blocks[0].forknum = key.forknum;
+	insert2.blocks[0].blkno = key.blkno;
+	insert2.main_data = (char *) &insert2_xlrec;
+	insert2.main_data_len = SizeOfHeapInsert;
+	insert2_xlrec.offnum = 2;
+
+	insert3 = insert2;
+	insert3.main_data = (char *) &insert3_xlrec;
+	insert3_xlrec.offnum = 3;
+
+	insert4 = insert2;
+	insert4.main_data = (char *) &insert4_xlrec;
+	insert4_xlrec.offnum = 4;
+
+	cleanup.kind = FB_WAL_RECORD_HEAP2_PRUNE;
+	cleanup.block_count = 1;
+	cleanup.blocks[0].in_use = true;
+	cleanup.blocks[0].locator = key.locator;
+	cleanup.blocks[0].forknum = key.forknum;
+	cleanup.blocks[0].blkno = key.blkno;
+	cleanup.blocks[0].has_data = true;
+	cleanup.blocks[0].data = prune_data;
+	cleanup.blocks[0].data_len = sizeof(prune_data);
+	cleanup.main_data = (char *) &cleanup_xlrec;
+	cleanup.main_data_len = SizeOfHeapPrune;
+	cleanup_xlrec.flags = XLHP_HAS_NOW_UNUSED_ITEMS;
+	unused_items->ntargets = 4;
+	unused_items->data[0] = 2;
+	unused_items->data[1] = 3;
+	unused_items->data[2] = 4;
+	unused_items->data[3] = 5;
+
+	fb_replay_future_block_record_compose(&insert4, 0, NULL, &future);
+	fb_replay_future_block_record_compose(&insert3, 0, &future, &future);
+	fb_replay_future_block_record_compose(&insert2, 0, &future, &future);
+	fb_replay_future_block_record_compose(&cleanup, 0, &future, &future);
+
+	record.kind = FB_WAL_RECORD_HEAP2_PRUNE;
+	record.lsn = InvalidXLogRecPtr + 32;
+	record.end_lsn = InvalidXLogRecPtr + 48;
+	record.block_count = 1;
+	record.blocks[0].in_use = true;
+	record.blocks[0].locator = key.locator;
+	record.blocks[0].forknum = key.forknum;
+	record.blocks[0].blkno = key.blkno;
+	record.blocks[0].has_image = true;
+	record.blocks[0].apply_image = true;
+	record.blocks[0].image = image_page;
+
+	state.key = key;
+	state.initialized = true;
+	memcpy(state.page, current_page, BLCKSZ);
+	state.page_lsn = InvalidXLogRecPtr + 16;
+
+	control.phase = FB_REPLAY_PHASE_FINAL;
+	control.record_index = 7;
+	control.prune_lookahead = fb_replay_create_prune_lookahead_hash();
+
+	entry = (FbReplayPruneLookaheadEntry *) hash_search(control.prune_lookahead,
+														&control.record_index,
+														HASH_ENTER,
+														&found);
+	if (found)
+		elog(ERROR, "unexpected existing prune lookahead debug entry");
+	entry->record_index = control.record_index;
+	entry->future = future;
+
+	preserve = fb_replay_prune_image_should_preserve_page(&record,
+															  &state,
+															  &control);
+
+	if (entry->future.old_tuple_offsets != NULL)
+		bms_free(entry->future.old_tuple_offsets);
+	if (entry->future.new_tuple_slot_offsets != NULL)
+		bms_free(entry->future.new_tuple_slot_offsets);
+	hash_destroy(control.prune_lookahead);
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+		"prune_image_reject_future_warm_state=%s",
 		(!preserve) ? "true" : "false")));
 }
 
@@ -5254,9 +5643,10 @@ fb_replay_prune_compose_future_constraints_debug(PG_FUNCTION_ARGS)
 		fb_replay_future_block_record_first_old(&future) == 3 &&
 		fb_replay_future_block_record_new_count(&future) == 1 &&
 		fb_replay_future_block_record_first_new(&future) == 4 &&
-		ndead == 2 &&
+		ndead == 3 &&
 		nowdead_buf[0] == 1 &&
 		nowdead_buf[1] == 2 &&
+		nowdead_buf[2] == 3 &&
 		nunused == 1 &&
 		nowunused_buf[0] == 4;
 

@@ -1,4 +1,8 @@
-# 错误模型
+# 错误模型 / Error Model
+
+[中文](#中文) | [English](#english)
+
+## 中文
 
 本文描述当前代码对“不能安全返回历史结果”的处理原则。这里说的“错误模型”不是泛泛而谈，而是对应当前主链里哪些条件会在什么层直接报错，以及为什么不能降级。
 
@@ -346,3 +350,21 @@ TOAST relation 当前已经放宽一层：
 
 当前错误模型的核心不是“尽量多返回”，而是“宁可失败，也不能错”。
 只要无法证明结果正确，当前代码就会在最接近问题发生处直接报错，并尽量把 relation、scope、xid、commit time、lsn 这些诊断信息带出来。
+
+## English
+
+This document explains how `pg_flashback` behaves when it cannot safely prove a
+correct historical result.
+
+Key rules:
+
+- The extension uses a strict fail-fast model rather than best-effort output.
+- It errors for invalid targets, unsupported relations, future timestamps, and
+  missing runtime prerequisites.
+- It rejects incomplete WAL windows and unsupported boundaries such as DDL,
+  rewrite, truncate, relfilenode changes, or unsafe storage events.
+- It also fails when page replay, TOAST reconstruction, or apply/result
+  emission cannot preserve correctness.
+
+The core principle is simple: if correctness cannot be proved, the query must
+fail instead of returning a partial or possibly wrong result.

@@ -35,6 +35,7 @@ const char *fb_get_archive_dir(void);
  */
 
 const char *fb_get_archive_dest(void);
+const char *fb_get_target_snapshot_text(void);
 /*
  * fb_get_effective_archive_dir
  *    GUC API.

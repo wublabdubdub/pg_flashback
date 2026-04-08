@@ -12,6 +12,54 @@
 
 ## 本轮已完成
 
+- [x] 按对外开源发布口径补齐许可证与 README
+  - 根目录新增 `Apache-2.0` 许可证文件 `LICENSE`
+  - 根目录新增发布版本文件 `VERSION`，当前版本为 `0.2.0`
+  - 扩展安装版本已前滚到 `0.2.0`
+  - 已补齐 `sql/pg_flashback--0.2.0.sql`
+    与 `sql/pg_flashback--0.1.1--0.2.0.sql`
+  - 根目录 `README.md` 已收口为面向开源用户的极简入口文档
+  - README 当前只保留：
+    - 核心功能与“为什么 PostgreSQL 自带做不到”
+    - 基础调用方式
+    - 使用前提条件
+    - 几个常用参数的作用与最小用法
+  - README 中 PostgreSQL 版本口径当前按本机已验证的 `PG12-18` 书写
+  - `scripts/sync_open_source.sh` 已把 `LICENSE` / `VERSION` 纳入镜像白名单
+- [x] 开源项目公开 Markdown 切到单文件中英双语
+  - 范围包括：
+    - `open_source/pg_flashback/README.md`
+  - 双语切换固定为 `中文 | English` 锚点跳转
+  - 当前开源导出面已进一步收口：
+    - `open_source/` 根目录不再保留内部说明文件或 manifest
+    - `open_source/pg_flashback/` 不再携带 `docs/`、`tests/`、研发记录或 AI 开发痕迹
+- [x] 修复 release gate truth 使用 MVCC snapshot、而 flashback 仅按 commit timestamp 判定可见性的 correctness 缺口
+  - 根因已确认：
+    - `capture_truth_snapshots.sh` 在 `repeatable read` 事务里导出的 truth，
+      本质上对应“目标时刻的 MVCC snapshot 可见性”
+    - 旧版 `pg_flashback()` 只看 WAL commit timestamp，
+      会把“target snapshot 时仍 in-progress，但随后提交且 commit_ts 仍早于 target_ts”的事务
+      误判为 `committed_before_target`
+    - 这会把 truth 中本应保留的旧版本错误替换成新版本，
+      最终表现为 release gate `users` / `meetings`
+      的 `row_count / sha256 mismatch`
+  - 当前修复已落地：
+    - 新增 GUC `pg_flashback.target_snapshot`
+    - WAL record index 现会解析 `txid_current_snapshot()::text`
+      的 active xid 列表，并把这些 xid 视为 target 时刻“仍未提交”
+    - `tests/release_gate/bin/capture_truth_snapshots.sh`
+      现会把 `target_snapshot` 写入 truth manifest
+    - `tests/release_gate/bin/run_flashback_matrix.sh`
+      现会把 `target_snapshot` 注入 query / COPY / CTAS-create
+      的 flashback 命令
+  - 当前已验证：
+    - 手工对 `random_flashback_1.users` 失败行注入 snapshot 后，
+      已恢复 truth 值
+    - 手工对 `random_flashback_1.meetings` 失败行注入 snapshot 后，
+      已恢复 truth 值
+    - `bash -n tests/release_gate/bin/capture_truth_snapshots.sh`
+      / `bash -n tests/release_gate/bin/run_flashback_matrix.sh`
+      已通过
 - [x] 修复无主键 bag residual 历史行首条丢失的问题
   - 根因已确认：
     - `fb_bag_apply_finish_scan()` 会把 `residual_cursor` 初始化到
@@ -69,6 +117,91 @@
       `All 1 tests passed.`
     - `fb_replay_debug` no-count 场景恢复 `errors=0`
     - 同 session `count(*) -> full replay` 的实际结果集行数仍为 `20000`
+- [x] 修复 prune lookahead 漏算 cleanup slot release 导致的 `failed to replay heap update`
+  - 根因已确认：
+    - final replay 会复用 warm pass 的 block state
+    - `fb_replay` 的 prune lookahead 旧逻辑
+      没有把后续 `PRUNE_VACUUM_CLEANUP` 释放出来的 slot
+      反向折算回 future constraints
+    - 于是 `users blk 10095` 上更早 prune image
+      被误判成 future insert slot 不可用，final replay 错保留
+      pre-cleanup 页状态
+    - 后续在
+      `BA/4472E390` 报 `failed to replay heap update`
+  - 当前修复已落地：
+    - `src/fb_replay.c` 为 `FB_WAL_RECORD_HEAP2_PRUNE`
+      新增 future compose 的 slot-release 语义
+    - `src/fb_replay.c` 额外补
+      `state->page_lsn > record->end_lsn` hardening guard
+    - 新增独立回归 `fb_replay_prune_future_state`
+  - 当前已验证：
+    - `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_replay_prune_future_state'`
+      `All 1 tests passed.`
+    - `scenario_oa_50t_50000r.users @ '2026-04-08 00:38:25.357868+00'`
+      已完整返回 `count = 50015`
+- [x] 修复 prune future constraints / future guard 漏判导致的 `failed to replay heap multi insert`
+  - 根因已确认：
+    - `FB_WAL_RECORD_HEAP2_MULTI_INSERT` 旧逻辑未进入 prune lookahead 的
+      future constraints
+    - data prune future guard 又把 future old tuple 过度从
+      `nowdead/redirected` 中剔除，与当前 dead/redirect 可追踪语义不一致
+  - 当前修复已落地：
+    - `src/fb_replay.c` 为 `HEAP2_MULTI_INSERT`
+      补 future compose / same-block future support
+    - `src/fb_replay.c` 调整 prune future guard，只屏蔽会真正破坏
+      future old/new 约束的 `nowunused` / `nowdead` / `redirected`
+    - `fb_replay_prune_future_state`
+      新增 multi-insert preserve 最小回归
+  - 当前已验证：
+    - `SELECT fb_replay_prune_image_preserve_next_multi_insert_debug();`
+      返回 `prune_image_preserve_next_multi_insert=true`
+    - `scenario_oa_50t_50000r.leave_requests @ '2026-04-08 01:37:20.067024+00'`
+      串行与默认并行都已返回 `count = 49887`
+- [x] 建立统一“闪回失败修复台账”
+  - 新文档：
+    - `docs/reports/flashback-failure-fix-log.md`
+  - 当前约束已固定：
+    - 只收录“已定位根因并已完成修复”的 flashback failure
+    - 每条记录固定为：
+      - 时间
+      - 报错现象
+      - 原因
+      - 修复方式
+    - 后续每次修复新的闪回失败，都必须同步更新该文档
+- [x] 调整 release gate `run_flashback_checks` 的 flashback 默认脚本口径
+  - 当前修复已落地：
+    - `tests/release_gate/bin/run_flashback_matrix.sh`
+      现对每条 flashback 默认设置
+      `PGOPTIONS='-c pg_flashback.memory_limit=6GB'`
+    - `tests/release_gate/bin/common.sh`
+      当前默认改成
+      `FB_RELEASE_GATE_WARMUP_RUNS=0`
+      / `FB_RELEASE_GATE_MEASURED_RUNS=1`
+      ，同一条 flashback case 默认只执行 `1` 次
+    - 同脚本现会打印每条 query/copy/ctas-create 的实际 flashback SQL
+  - 当前已验证：
+    - `bash tests/release_gate/bin/selftest.sh`
+      `PASS`
+
+## 当前进行中
+
+- [ ] 重做 release gate 最终报告，提升中文可读性并反映测试过程
+  - 目标：
+    - 报告统一改成中文
+    - 显式展示阶段过程、随机 snapshot / DML snapshot / flashback 执行矩阵
+    - 将 `correctness` / `performance` / `missing golden baseline`
+      分离展示
+    - 增加 `target_snapshot` 覆盖率提示，帮助识别“是否使用最新 truth capture 口径”
+    - 保证各阶段脚本彻底解耦，单步成功执行不会被历史产物污染
+  - 当前已确认：
+    - `tests/release_gate/output/latest/json/golden/pg18` 等价物仍为空基线，
+      不能把“缺性能基线”继续渲染成“性能失败”
+    - `output/latest/json/truth_manifest.json`
+      当前不含 `target_snapshot`
+    - `nohup.out` 中真正的 correctness mismatch 只有 `4` 条，
+      其余大量 `FAIL` 来自报告把“未评估 / 缺基线”混成失败
+    - `random_snapshot_capture.log` / `dml_snapshot_capture.log`
+      当前按追加写入，已出现跨多轮 run 混杂
 - [x] 修复“较早 prefix gap 误杀较新连续 suffix”的 WAL resolver 问题
   - resolver 不再因旧 prefix 上的不可恢复 gap 在 `2/9` 直接报 `missing segment`
   - 当前改为保留最新端连续 suffix；只有 suffix 自身不连续时才继续报 WAL 不完整
@@ -127,6 +260,10 @@
     - `fb_summary_service` 回归新增“删除 WAL 后删除对应 summary 文件”断言并通过
 
 ## 当前待办
+  - [x] 调整 release gate `run_flashback_checks`：
+    - 每条 flashback case 的 CSV 产出后立即对比 truth accuracy
+    - 在 `run_flashback_matrix.sh` 即时输出 correctness 结果
+    - 保留 `evaluate_gate.sh` 的最终汇总职责
   - [ ] 彻底收敛 release gate `run_flashback_checks` 的 `3/9 build record index`
   - [x] 先补最小 RED / 观测，锁住 `summary-span` 与 `xact-status` 的新 counters
   - [x] 将 `summary-span` 从“query 时现拷 spans”升级成 cache 期 stable public slice
@@ -170,19 +307,90 @@
       - [ ] 在修复 archive source identity 后，复跑 release gate 现场，
         继续确认 `summary_payload_locator_public_builds` 与 `3/9 payload`
         是否同步收敛
+  - [x] 继续追并修掉 `summary_xid_fallback=21` 的 residual xid outcome 缺口
+    - [x] 现场已确认不是“summary 完全未命中”
+    - [x] 现场已确认 `summary_xid_hits=27366`，但仍有
+          `summary_xid_fallback=21`
+    - [x] 现场已确认当前 release gate case 中
+          `xact_summary_spool_records=0`
+          / `xact_summary_spool_hits=0`
+    - [x] 修复 `fb_summary_xid_resolution_debug(...)` 大 case backend 崩溃，
+          恢复 unresolved xid 样本诊断
+    - [x] 用 unresolved xid 样本对账 summary outcome / WAL，
+          已确认 phantom xid 不存在于当前 archive / `pg_wal`
+    - [x] 修复 summary file identity/hash 过弱的问题，
+          阻断 stale summary 复用：
+      - [x] `src/fb_summary.c` identity 现已绑定
+            `source_kind + segment_name + file_size + st_mtime + st_ctime + xlp_sysid`
+      - [x] 新 hash 生效后已强制当前稳定窗 summary 重建
+    - [x] 复跑 release gate 首个 query case，
+          已确认不再因 residual xid 掉回 WAL fallback：
+      - [x] `summary_xid_fallback=0`
+      - [x] `xact_fallback_windows=0`
+      - [x] `3/9 55% xact-status` 已收敛到约 `1s`
   - [ ] 完成 correctness-only 口径的 release gate truth 对比
     - [x] `random_flashback_1.documents @ 2026-04-07 04:41:28.555065+00`
           已对上 truth：
           `sha256 = 4edde6e0b1e1ee94e1f9e2de12856bb1a50a85e73431dcbceae16a8e18117e0c`
           / `row_count = 1949969`
-    - [ ] 修掉
+    - [x] 已确认
+          `random_flashback_1.users` /
+          `random_flashback_1.meetings`
+          的 mismatch 根因是“truth snapshot 可见性”和
+          “仅按 commit timestamp 判定”之间的口径缺口，
+          不是 replay 内核损坏
+    - [x] `capture_truth_snapshots.sh`
+          现会记录 `txid_current_snapshot()::text`
+          到 truth manifest 的 `target_snapshot`
+    - [x] `run_flashback_matrix.sh`
+          现会把 `target_snapshot`
+          通过 `PGOPTIONS=-c pg_flashback.target_snapshot=...`
+          注入 flashback query / COPY / CTAS-create
+    - [ ] 用新 manifest 重新采集 truth 并复跑 correctness-only 对比，
+          确认 `users` / `meetings` mismatch 清零
+    - [x] 同一 `users` case 上的
+          `failed to replay heap update`
+          已定位并修掉：
+          - 根因是 prune lookahead 未折算后续 cleanup 的 slot release，
+            导致更早 prune image 被误判成 future insert 不可用
+          - 当前已由 `fb_replay_prune_future_state` 锁住
+    - [x] 修掉
           `random_flashback_1.users @ 2026-04-07 04:41:28.555065+00`
           在现有 `meta/summary` 下的
           `ERROR: pfree called with invalid pointer ...`
+          - 根因已确认：
+            `fb_summary_segment_lookup_payload_locators_cached()`
+            第二轮收集 multi-match payload locator slice 时，
+            会在确认 `slice_count` 之前先写
+            `matched_slices[slice_index]` /
+            `matched_counts[slice_index]`
+          - 当最后一个正样本后面仍有 `slice_count = 0`
+            的匹配 relation 时，会按
+            `slice_index == match_count`
+            越界写坏 scratch chunk header，
+            最终在尾部 `pfree(positions)` 报 invalid pointer
+          - 当前修复已落地：
+            - 改成“先拿临时 `slice_count`，确认非零后再写 scratch arrays”
+            - 删除旧 `positions` merge，改成
+              append + sort + deduplicate
+            - 新增回归 `fb_summary_payload_locator_merge`
+          - 当前已验证：
+            - `make ... installcheck REGRESS='fb_summary_payload_locator_merge'`
+              `All 1 tests passed.`
+            - live `users` COPY case 已完整跑通，不再报 invalid `pfree`
     - [ ] 解释并修掉同一 `users` case 在移空 `meta/summary` 后的
           `ERROR: too many shared backtracking rounds while resolving missing FPI`
     - [ ] 在上述 blocker 清掉后，继续把 `run_flashback_checks -> evaluate_gate`
           的 truth compare 跑完
+  - [x] 修复 release gate `run_flashback_checks` 在 preflight
+        `memory_limit` 报错后必须人工调参重跑的问题
+    - [x] 补 shell 级最小 RED，锁住“首次报
+          estimated flashback working set exceeds pg_flashback.memory_limit
+          后，会自动以 `pg_flashback.memory_limit='6GB'` 重试一次”
+    - [x] 调整 `tests/release_gate/bin/run_flashback_matrix.sh`，
+          仅对该特定 preflight 报错启用一次性 6GB 重试
+    - [x] 复跑 release gate `--from run_flashback_checks`，
+          确认首个 case 不再停在 `memory_limit` preflight
 - [x] 删除 release gate 的 frozen WAL fixture 路径，恢复直接使用 live archive
   - [x] 补 shell 级最小 RED，锁住 `run_flashback_matrix.sh` 不再切 frozen `archive_dest`
   - [x] 删除 `capture_truth_snapshots.sh` / `run_flashback_matrix.sh` / `create_flashback_ctas.sql` 中的 frozen WAL 复制与覆盖逻辑
@@ -402,6 +610,41 @@
   - 不以表层报错变化、降级绕过、缺页判定止血或错误文案调整视为完成
   - 本次 `scenario_oa_12t_50000r.documents @ '2026-04-01 23:15:13'`
     必须继续修到 `84/AE079278 / blk=216125 / failed to replay heap insert` 的真实根因为止
+- [x] 将“`3/9 build record index` 性能问题必须继续追根因并修复”固化为当前主线执行约束
+  - 不把表层 NOTICE 子相位直接当成最终结论
+  - 必须继续用 debug counter、`pg_stat_activity`、`gdb/perf` 等证据确认真实热点归属
+  - 不接受停在“summary 没起作用”或“看起来卡在 metadata/xact-status/payload”这类表层判断
+- [x] 修复 `scenario_oa_50t_50000r.documents @ '2026-04-08 13:33:00.700288+00'`
+      的 `summary_xid_fallback=110`
+  - 根因已确认：
+    - 下午 `summary_xid_fallback=21` 是 stale summary identity，属于 phantom xid
+    - 本次不是 phantom xid；样本 xid（如 `16218039`）是真实 committed xid
+    - 真正问题是命中 segment 的旧/无效 summary sidecar 已存在，但 query path 没有在查询时按需重建
+  - 当前修复已落地：
+    - `src/fb_summary.c`
+      的 `fb_summary_cache_get_or_load()` 对 invalid/missing candidate
+      增加 query-side rebuild + reload
+    - `FB_SUMMARY_VERSION` 已前滚到 `11`，旧 `v10` sidecar 当前会统一失效
+  - 当前验证：
+    - `pg_temp.fb_summary_xid_resolution_debug(...)` 返回：
+      - `summary_hits=23352`
+      - `summary_exact_hits=0`
+      - `unresolved_touched=0`
+      - `unresolved_unsafe=0`
+      - `fallback_windows=0`
+    - live query `count(*) from pg_flashback(...)` 当前完整返回
+      且 `3/9 55% xact-status` 已降到 `+301.502 ms`
+- [x] 修复验证期引入的 `fb_wal_fill_xact_statuses_serial()` cleanup crash
+  - 根因已确认：
+    - `FbWalSerialXactVisitorState state` 旧代码在多个 `goto cleanup` 之前未初始化
+    - 当 unresolved xid 在 summary 阶段已全部清空时，cleanup 会对未初始化的
+      `state.assigned_xids` 执行 `hash_destroy()`，导致 backend `SIGSEGV`
+  - 当前修复已落地：
+    - `src/fb_wal.c`
+      将 `MemSet(&state, 0, sizeof(state))` 前移到函数入口
+  - 当前验证：
+    - 同一 live query 当前可完整执行到 `[done] total elapsed 35552.115 ms`
+      并返回 `count = 1950007`
 - [ ] 修复 `apply_image=false` 仍被当成页基线/页覆盖的 replay bug
   - 当前 live 复现场景：
     - `scenario_oa_12t_50000r.documents @ '2026-04-01 22:10:13'`
@@ -495,13 +738,14 @@
     - `scripts/sync_open_source.sh`
   - 已明确开源镜像首版排除：
     - `STATUS.md` / `TODO.md` / `PROJECT.md`
-    - `docs/reports/` / `docs/superpowers/`
-    - `tests/deep/` / `tests/release_gate/`
+    - `docs/`
+    - `tests/`
     - 日志、构建产物、性能采样和其他临时输出
 
 - [ ] 每次对外同步 GitHub 前执行并复核开源镜像刷新
   - 统一执行 `bash scripts/sync_open_source.sh`
   - 复核 `open_source/pg_flashback/` 中未混入内部资料或构建产物
+  - 当前复核范围补充包含 `LICENSE`
 - [x] 将 `open_source/` 排除出当前仓库 Git 跟踪
   - 根仓库 `.gitignore` 已加入 `open_source/`
   - 开源镜像目录继续作为本地导出目录按需重建

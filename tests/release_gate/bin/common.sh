@@ -43,8 +43,8 @@ FB_RELEASE_GATE_TARGET_SIZE_BYTES="${FB_RELEASE_GATE_TARGET_SIZE_BYTES:-53687091
 FB_RELEASE_GATE_TARGET_GROW_ROWS_PER_BATCH="${FB_RELEASE_GATE_TARGET_GROW_ROWS_PER_BATCH:-100000}"
 FB_RELEASE_GATE_RANDOM_SNAPSHOT_COUNT="${FB_RELEASE_GATE_RANDOM_SNAPSHOT_COUNT:-5}"
 FB_RELEASE_GATE_RANDOM_SNAPSHOT_MARGIN_SEC="${FB_RELEASE_GATE_RANDOM_SNAPSHOT_MARGIN_SEC:-300}"
-FB_RELEASE_GATE_WARMUP_RUNS="${FB_RELEASE_GATE_WARMUP_RUNS:-1}"
-FB_RELEASE_GATE_MEASURED_RUNS="${FB_RELEASE_GATE_MEASURED_RUNS:-2}"
+FB_RELEASE_GATE_WARMUP_RUNS="${FB_RELEASE_GATE_WARMUP_RUNS:-0}"
+FB_RELEASE_GATE_MEASURED_RUNS="${FB_RELEASE_GATE_MEASURED_RUNS:-1}"
 FB_RELEASE_GATE_RANDOM_SEED="${FB_RELEASE_GATE_RANDOM_SEED:-20260403}"
 
 fb_release_gate_log() {
@@ -393,6 +393,62 @@ fb_release_gate_csv_row_count() {
 		return 0
 	fi
 	tail -n +2 "$path" | wc -l | awk '{print $1}'
+}
+
+fb_release_gate_find_truth_entry() {
+	local truth_manifest="$1"
+	local truth_scenario_id="$2"
+	local table_name="$3"
+
+	jq -c \
+		--arg scenario_id "$truth_scenario_id" \
+		--arg table_name "$table_name" \
+		'.[] | select(.scenario_id == $scenario_id and .table_name == $table_name)' \
+		"$truth_manifest" | head -n 1
+}
+
+fb_release_gate_eval_correctness_json() {
+	local scenario_id="$1"
+	local truth_manifest="$2"
+	local truth_scenario_id="$3"
+	local table_name="$4"
+	local result_sha256="$5"
+	local result_row_count="${6:-0}"
+	local result_csv_path="${7:-}"
+	local truth_entry
+	local correctness_status="pass"
+	local reason=""
+	local truth_sha256=""
+	local truth_row_count="0"
+	local truth_csv_path=""
+	local diff_path=""
+
+	truth_entry="$(fb_release_gate_find_truth_entry "$truth_manifest" "$truth_scenario_id" "$table_name")"
+	if [[ -z "$truth_entry" ]]; then
+		correctness_status="infra_fail"
+		reason="missing truth snapshot"
+	else
+		truth_sha256="$(printf '%s' "$truth_entry" | jq -r '.sha256')"
+		truth_row_count="$(printf '%s' "$truth_entry" | jq -r '.row_count')"
+		truth_csv_path="$(printf '%s' "$truth_entry" | jq -r '.csv_path // empty')"
+		if [[ "$truth_sha256" != "$result_sha256" || "$truth_row_count" != "$result_row_count" ]]; then
+			correctness_status="fail"
+			reason="row_count or sha256 mismatch"
+			if [[ -n "$truth_csv_path" && -n "$result_csv_path" && -f "$truth_csv_path" && -f "$result_csv_path" ]]; then
+				diff_path="$(fb_release_gate_output_path "logs/diff_${scenario_id}__${table_name}.diff")"
+				diff -u "$truth_csv_path" "$result_csv_path" > "$diff_path" 2>&1 || true
+				chmod 0666 "$diff_path" 2>/dev/null || true
+			fi
+		fi
+	fi
+
+	jq -cn \
+		--arg correctness_status "$correctness_status" \
+		--arg reason "$reason" \
+		--arg diff_path "$diff_path" \
+		--arg truth_sha256 "$truth_sha256" \
+		--argjson truth_row_count "${truth_row_count:-0}" \
+		'{correctness_status:$correctness_status, reason:$reason, diff_path:$diff_path, truth_sha256:$truth_sha256, truth_row_count:$truth_row_count}'
 }
 
 fb_release_gate_table_pk_order() {

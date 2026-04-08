@@ -245,6 +245,7 @@ bash tests/release_gate/bin/run_release_gate.sh \
 作用：
 
 - 基于 `truth_manifest` 执行 flashback 验证
+- 每条 flashback case 在结果 CSV 落盘后立即对比对应 truth accuracy 并输出
 - 覆盖三条用户路径：
   - `SELECT * FROM pg_flashback(...)`
   - `COPY (SELECT * FROM pg_flashback(...)) TO ...`
@@ -255,6 +256,7 @@ bash tests/release_gate/bin/run_release_gate.sh \
 - `json/flashback_results.json`
 - `csv/flashback/*.csv`
 - `csv/materialized/*.csv`
+- 即时 accuracy 日志
 
 依赖：
 
@@ -264,7 +266,7 @@ bash tests/release_gate/bin/run_release_gate.sh \
 
 作用：
 
-- 对比 flashback 输出和 truth snapshot
+- 汇总 flashback 输出和 truth snapshot 的 correctness 结果
 - 对比当前耗时和 golden baseline
 - 生成最终 gate verdict
 
@@ -272,6 +274,14 @@ bash tests/release_gate/bin/run_release_gate.sh \
 
 - `json/gate_evaluation.json`
 - 失败时附带 `logs/diff_*.diff`
+
+当前判读口径补充：
+
+- `correctness` 与 `performance` 分开统计
+- `missing golden baseline` 记为“未评估”，不再伪装成“性能失败”
+- 若 correctness 有失败，性能状态记为 `skipped`
+- 若 correctness / performance 都无失败，但仍存在 `missing golden baseline`，
+  最终 verdict 记为 `INCOMPLETE`
 
 依赖：
 
@@ -283,7 +293,14 @@ bash tests/release_gate/bin/run_release_gate.sh \
 
 作用：
 
-- 根据环境摘要和 gate 结果渲染 Markdown 报告
+- 根据环境摘要、truth manifest、gate 结果渲染中文 Markdown 报告
+- 报告当前固定展示：
+  - 一页结论
+  - 测试过程
+  - 场景执行矩阵
+  - 正确性失败明细
+  - 未评估与阻塞项
+  - `target_snapshot` 覆盖率提示
 
 主要产物：
 
@@ -318,6 +335,14 @@ bash tests/release_gate/bin/run_release_gate.sh \
 - 从中间阶段启动时，不会自动补前置产物
 - 依赖缺失就直接报错，这是刻意设计
 - `cleanup` 不属于用户可选阶段
+- 各阶段必须只信任并覆盖自己的产物：
+  - 重新执行 random truth capture 时，会重置该阶段自己的
+    manifest / schedule / log
+  - 重新执行 dml truth capture 时，会重置该阶段自己的
+    manifest / log
+  - 重新执行 flashback checks 时，会重置 `flashback_results.json`
+    并清理旧 `diff_*.diff`
+  - 最终报告只按当前轮有效 manifest / evaluation 渲染，不读历史追加日志
 - 总入口退出时仍会：
   - 停掉 `alldbsimulator`
   - 不再自动清理当前版本归档目录
@@ -375,6 +400,10 @@ bash tests/release_gate/bin/run_release_gate.sh \
 
 - release gate 统一日志前缀固定带时间戳
 - 便于串联阶段编排、DML 窗口、快照采集和异常退出现场
+- `run_flashback_checks` 当前默认每条 flashback 只执行 `1` 次：
+  - 默认值是 `FB_RELEASE_GATE_WARMUP_RUNS=0`
+  - 默认值是 `FB_RELEASE_GATE_MEASURED_RUNS=1`
+  - 如需临时恢复多次执行，只能显式覆盖这两个环境变量
 
 ## 产物目录
 

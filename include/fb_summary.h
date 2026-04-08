@@ -44,6 +44,12 @@ typedef struct FbSummaryXidOutcome
 	XLogRecPtr commit_lsn;
 } FbSummaryXidOutcome;
 
+typedef struct FbSummaryXidAssignment
+{
+	TransactionId subxid;
+	TransactionId top_xid;
+} FbSummaryXidAssignment;
+
 typedef struct FbSummaryUnsafeFact
 {
 	uint8 reason;
@@ -112,6 +118,15 @@ bool fb_summary_segment_lookup_xid_outcome_slice_cached(const char *path,
 														FbSummaryQueryCache *cache,
 														const FbSummaryXidOutcome **outcomes_out,
 														uint32 *outcome_count_out);
+bool fb_summary_segment_lookup_xid_assignment_slice_cached(const char *path,
+														   off_t bytes,
+														   TimeLineID timeline_id,
+														   XLogSegNo segno,
+														   int wal_seg_size,
+														   int source_kind,
+														   FbSummaryQueryCache *cache,
+														   const FbSummaryXidAssignment **assignments_out,
+														   uint32 *assignment_count_out);
 bool fb_summary_segment_lookup_touched_xids_cached(const char *path,
 												   off_t bytes,
 												   TimeLineID timeline_id,

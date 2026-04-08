@@ -1,4 +1,8 @@
-# WAL 来源解析
+# WAL 来源解析 / WAL Source Resolution
+
+[中文](#中文) | [English](#english)
+
+## 中文
 
 本文只讲当前代码里的 WAL resolver，不再沿用“用户手填一个目录，所有 WAL 都从那里读”的旧口径。
 
@@ -235,3 +239,20 @@ resolver 的职责不是直接读 record，而是准备好：
 ```text
 archive 是主来源，pg_wal 是 recent tail 补源，recovered_wal 是被纠正/恢复后的可信回灌区，三者由统一 resolver 决定如何拼成可扫描窗口
 ```
+
+## English
+
+This document explains how `pg_flashback` resolves WAL sources for one query.
+
+Key points:
+
+- The resolver can combine archive storage, `pg_wal`, and
+  `DataDir/pg_flashback/recovered_wal`.
+- Archive resolution prefers `pg_flashback.archive_dest`, then
+  `pg_flashback.archive_dir`, then safe local `archive_command` autodiscovery.
+- If both archive and `pg_wal` contain the same segment, archive wins.
+- `pg_wal` only serves as the recent tail beyond archive coverage.
+- Missing or mismatched segments are handled through `recovered_wal`.
+
+In short, archive is the primary source, `pg_wal` is the recent-tail fallback,
+and `recovered_wal` stores corrected segments selected by the same resolver.

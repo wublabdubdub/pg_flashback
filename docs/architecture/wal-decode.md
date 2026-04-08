@@ -1,4 +1,8 @@
-# WAL 解码层
+# WAL 解码层 / WAL Decode Layer
+
+[中文](#中文) | [English](#english)
+
+## 中文
 
 这里的“WAL 解码层”不是逻辑复制意义上的 decode，而是 `pg_flashback` 当前为了历史查询所做的结构化扫描与索引构建。
 
@@ -352,3 +356,22 @@ WAL 层当前只做三件大事：
 ```text
 把“这一时间窗里和目标 relation 有关、并且足以驱动页级重放”的 WAL 事实提纯出来，交给 replay
 ```
+
+## English
+
+This document describes the WAL scan and indexing layer used by
+`pg_flashback`.
+
+Key points:
+
+- The WAL layer does not generate SQL or final user rows.
+- It prepares scan context, builds `RecordRef` indexes, resolves xid outcomes,
+  detects unsafe windows, and retains replay-relevant facts.
+- `fb_wal_prepare_scan_context()` resolves sources and anchor boundaries.
+- `fb_wal_build_record_index()` performs the sequential scan and builds the
+  relation-scoped index.
+- `FbWalRecordCursor` provides ordered access for replay and deferred payload
+  materialization.
+
+The WAL layer is a structured fact-extraction stage for replay, not a generic
+SQL text generator.

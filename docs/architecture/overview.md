@@ -1,4 +1,8 @@
-# 总体架构
+# 总体架构 / Architecture Overview
+
+[中文](#中文) | [English](#english)
+
+## 中文
 
 本文描述当前仓库主线代码的真实结构，不覆盖已经删除的“结果表物化 / 并行结果表写入”旧模型，也不把尚未完成的设计稿当成现状。
 
@@ -786,3 +790,23 @@ Custom Scan (FbCountAggScan)
 9. `docs/architecture/reverse-op-stream.md`
 10. `docs/architecture/源码级维护手册.md`
 11. `docs/architecture/调试与验证手册.md`
+
+## English
+
+This document describes the current production architecture of
+`pg_flashback`.
+
+Key points:
+
+- The public entry is `pg_flashback(anyelement, text)`.
+- The main pipeline is `relation gate -> WAL index -> checkpoint/FPI/block
+  redo -> ForwardOp -> ReverseOpSource -> keyed/bag apply -> SRF rows`.
+- `FROM pg_flashback(...)` is executed through a stack of custom scan nodes
+  rather than PostgreSQL's default `FunctionScan`.
+- Count-only queries can use a dedicated fast path without materializing the
+  full historical row stream.
+- The architecture also includes runtime directories, WAL source resolution,
+  summary sidecars, replay stages, reverse-op generation, and keyed/bag apply.
+
+In short, `pg_flashback` is a replay-driven streaming query engine rather than
+a result-table materialization workflow.

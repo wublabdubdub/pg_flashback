@@ -133,6 +133,7 @@ typedef struct FbWalScanContext
 	uint32 summary_xid_hits;
 	uint32 summary_xid_exact_hits;
 	uint32 summary_xid_fallback;
+	uint32 summary_xid_missing_segments;
 	uint32 summary_xid_segments_read;
 	uint32 summary_xid_exact_segments_read;
 	uint32 xact_summary_spool_hits;
@@ -147,6 +148,7 @@ typedef struct FbWalScanContext
 	uint32 visited_segment_count;
 	FbSpoolSession *spool_session;
 	FbSummaryQueryCache *summary_cache;
+	bool *summary_xid_missing_segment_map;
 } FbWalScanContext;
 
 typedef enum FbWalRecordKind
@@ -298,6 +300,7 @@ typedef struct FbWalRecordIndex
 	bool tail_inline_payload;
 	XLogRecPtr tail_cutover_lsn;
 	HTAB *xid_statuses;
+	HTAB *target_snapshot_xids;
 	FbSpoolSession *spool_session;
 	FbSpoolLog *record_log;
 	FbSpoolLog *record_tail_log;

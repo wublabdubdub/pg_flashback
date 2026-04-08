@@ -15,9 +15,9 @@ WHERE extname = 'pg_flashback';
 SELECT to_regprocedure('pg_flashback(text,text,text)') IS NOT NULL AS has_old_entry,
 	   to_regprocedure('pg_flashback(anyelement,text)') IS NULL AS no_new_entry;
 
-ALTER EXTENSION pg_flashback UPDATE TO '0.1.1';
+ALTER EXTENSION pg_flashback UPDATE TO '0.2.0';
 
-SELECT extversion = '0.1.1' AS at_new_version
+SELECT extversion = '0.2.0' AS at_new_version
 FROM pg_extension
 WHERE extname = 'pg_flashback';
 

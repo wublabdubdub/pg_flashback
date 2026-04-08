@@ -1,4 +1,8 @@
-# 行身份与无主键语义
+# 行身份与无主键语义 / Row Identity And Keyless Semantics
+
+[中文](#中文) | [English](#english)
+
+## 中文
 
 `pg_flashback` 当前支持两类结果语义：
 
@@ -292,3 +296,21 @@ mode=bag has_toast=false
 - 有主键或稳定唯一键：按 keyed 精确恢复逻辑行
 - 没有稳定键：按 bag 恢复结果集内容和重复次数
 - 当前 apply 的核心优化，不是“更聪明地扫当前表”，而是“只跟踪变化 key / 变化 row identity”
+
+## English
+
+This document explains how `pg_flashback` chooses between keyed and bag
+semantics.
+
+Key points:
+
+- Mode selection is done during relation inspection and stored in
+  `FbRelationInfo`.
+- Tables with a primary key or a qualifying stable unique index use `keyed`
+  mode.
+- Tables without a stable key use `bag` mode.
+- `keyed` mode reconstructs exact logical rows by changed keys.
+- `bag` mode restores row content and duplicate counts without preserving
+  physical identity.
+- The main optimization is to track only changed identities instead of copying
+  the full current table into memory.

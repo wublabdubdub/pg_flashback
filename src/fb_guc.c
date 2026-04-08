@@ -25,6 +25,7 @@
 
 static char *fb_archive_dir = NULL;
 static char *fb_archive_dest = NULL;
+static char *fb_target_snapshot = NULL;
 static char *fb_debug_pg_wal_dir = NULL;
 static char *fb_memory_limit_setting = NULL;
 static char *fb_spill_mode_setting = NULL;
@@ -118,6 +119,17 @@ _PG_init(void)
 							   NULL,
 							   PGC_USERSET,
 							   0,
+							   NULL,
+							   NULL,
+							   NULL);
+
+	DefineCustomStringVariable("pg_flashback.target_snapshot",
+							   "Optional MVCC snapshot text used to refine target visibility.",
+							   "When set to txid_current_snapshot() text, pg_flashback treats XIDs listed as in-progress at the target as after-target even if their WAL commit timestamp sorts earlier.",
+							   &fb_target_snapshot,
+							   NULL,
+							   PGC_USERSET,
+							   GUC_NOT_IN_SAMPLE,
 							   NULL,
 							   NULL,
 							   NULL);
@@ -289,6 +301,12 @@ const char *
 fb_get_archive_dest(void)
 {
 	return fb_archive_dest;
+}
+
+const char *
+fb_get_target_snapshot_text(void)
+{
+	return fb_target_snapshot;
 }
 
 /*

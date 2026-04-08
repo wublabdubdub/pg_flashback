@@ -10,7 +10,7 @@ SET pg_flashback.show_progress = off;
 SELECT fb_version();
  fb_version 
 ------------
- 0.1.0-dev
+ 0.2.0
 (1 row)
 
 CREATE TABLE fb_smoke_tbl (id integer PRIMARY KEY, v text);
@@ -30,4 +30,3 @@ FROM pg_flashback(NULL::public.fb_smoke_tbl, now()::text);
  id | v 
 ----+---
 (0 rows)
-

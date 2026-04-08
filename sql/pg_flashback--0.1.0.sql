@@ -17,7 +17,7 @@ LANGUAGE C
 STRICT;
 
 COMMENT ON FUNCTION fb_version() IS
-'Return current pg_flashback development version.';
+'Return current pg_flashback extension version.';
 
 COMMENT ON FUNCTION fb_check_relation(regclass) IS
 'Inspect current scaffold mode selection for a relation.';

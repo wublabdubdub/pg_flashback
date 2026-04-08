@@ -71,6 +71,8 @@ PG_FUNCTION_INFO_V1(fb_check_relation);
 PG_FUNCTION_INFO_V1(fb_archive_resolve_debug);
 PG_FUNCTION_INFO_V1(fb_apply_debug);
 PG_FUNCTION_INFO_V1(fb_keyed_key_debug);
+PG_FUNCTION_INFO_V1(fb_reverse_key_ops_debug);
+PG_FUNCTION_INFO_V1(fb_reverse_record_ops_debug);
 PG_FUNCTION_INFO_V1(fb_prepare_wal_scan_debug);
 PG_FUNCTION_INFO_V1(fb_replay_debug);
 PG_FUNCTION_INFO_V1(fb_recordref_debug);
@@ -126,6 +128,61 @@ fb_relation_tupledesc(Oid relid)
 	relation_close(rel, AccessShareLock);
 
 	return tupdesc;
+}
+
+static bool
+fb_entry_tuple_matches_int8_key(TupleDesc tupdesc,
+								   HeapTuple tuple,
+								   int64 key,
+								   Datum *value_out,
+								   bool *isnull_out)
+{
+	Datum value;
+	bool isnull = true;
+
+	if (value_out != NULL)
+		*value_out = (Datum) 0;
+	if (isnull_out != NULL)
+		*isnull_out = true;
+	if (tupdesc == NULL || tuple == NULL)
+		return false;
+
+	value = heap_getattr(tuple, 1, tupdesc, &isnull);
+	if (value_out != NULL)
+		*value_out = value;
+	if (isnull_out != NULL)
+		*isnull_out = isnull;
+	if (isnull)
+		return false;
+
+	return DatumGetInt64(value) == key;
+}
+
+static char *
+fb_entry_debug_attr_text(TupleDesc tupdesc, HeapTuple tuple, AttrNumber attnum)
+{
+	Datum value;
+	bool isnull = true;
+	Oid typoutput;
+	bool typisvarlena;
+	char *value_text;
+
+	if (tuple == NULL)
+		return pstrdup("NULL");
+	if (attnum <= 0 || attnum > tupdesc->natts)
+		return pstrdup("<invalid-attnum>");
+	if (TupleDescAttr(tupdesc, attnum - 1)->attisdropped)
+		return pstrdup("<dropped>");
+
+	value = heap_getattr(tuple, attnum, tupdesc, &isnull);
+	if (isnull)
+		return pstrdup("NULL");
+
+	getTypeOutputInfo(TupleDescAttr(tupdesc, attnum - 1)->atttypid,
+					  &typoutput,
+					  &typisvarlena);
+	value_text = OidOutputFunctionCall(typoutput, value);
+	return value_text;
 }
 
 /*
@@ -767,7 +824,7 @@ fb_flashback_query_abort(FbFlashbackQueryState *state)
 Datum
 fb_version(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_TEXT_P(cstring_to_text("0.1.0-dev"));
+	PG_RETURN_TEXT_P(cstring_to_text(FB_EXTENSION_VERSION));
 }
 
 /*
@@ -1108,10 +1165,16 @@ fb_recordref_lsn_debug(PG_FUNCTION_ARGS)
 				continue;
 
 			appendStringInfo(&buf,
-							 "record_index=%u lsn=%X/%08X kind=%s init=%s block_count=%d",
+							 "record_index=%u lsn=%X/%08X kind=%s xid=%u commit_ts=%lld commit_lsn=%X/%08X after_target=%s before_target=%s aborted=%s init=%s block_count=%d",
 							 record_index,
 							 LSN_FORMAT_ARGS(record.lsn),
 							 fb_record_kind_name(record.kind),
+							 record.xid,
+							 (long long) record.commit_ts,
+							 LSN_FORMAT_ARGS(record.commit_lsn),
+							 record.committed_after_target ? "true" : "false",
+							 record.committed_before_target ? "true" : "false",
+							 record.aborted ? "true" : "false",
 							 record.init_page ? "true" : "false",
 							 record.block_count);
 			for (block_index = 0; block_index < record.block_count; block_index++)
@@ -1390,6 +1453,205 @@ fb_keyed_key_debug(PG_FUNCTION_ARGS)
 			fb_keyed_apply_end(keyed_state);
 		if (state != NULL)
 			fb_flashback_query_abort(state);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+Datum
+fb_reverse_key_ops_debug(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	int64 key = PG_GETARG_INT64(2);
+	int32 attnum = PG_GETARG_INT32(3);
+	FbFlashbackReverseBuildState reverse_state;
+	FbReverseOpReader *reader = NULL;
+	FbReverseOp op;
+	StringInfoData buf;
+	uint64 match_count = 0;
+
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+	MemSet(&reverse_state, 0, sizeof(reverse_state));
+
+	PG_TRY();
+	{
+		text *target_ts_text = cstring_to_text(
+			DatumGetCString(DirectFunctionCall1(timestamptz_out,
+												TimestampTzGetDatum(target_ts))));
+
+		fb_flashback_build_reverse_state(relid,
+										 target_ts_text,
+										 false,
+										 &reverse_state);
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "key=%lld attnum=%d",
+						 (long long) key,
+						 (int) attnum);
+
+		reader = fb_reverse_reader_open(reverse_state.reverse);
+		while (fb_reverse_reader_next(reader, &op))
+		{
+			bool old_match;
+			bool new_match;
+
+			old_match = fb_entry_tuple_matches_int8_key(reverse_state.tupdesc,
+														 op.old_row.tuple,
+														 key,
+														 NULL,
+														 NULL);
+			new_match = fb_entry_tuple_matches_int8_key(reverse_state.tupdesc,
+														 op.new_row.tuple,
+														 key,
+														 NULL,
+														 NULL);
+			if (!old_match && !new_match)
+				continue;
+
+			match_count++;
+			appendStringInfo(&buf,
+							 " | #%llu type=%s record_lsn=%X/%08X commit_lsn=%X/%08X old_match=%s new_match=%s old_att=%s new_att=%s",
+							 (unsigned long long) match_count,
+							 op.type == FB_REVERSE_ADD ? "add" :
+							 (op.type == FB_REVERSE_REMOVE ? "remove" : "replace"),
+							 LSN_FORMAT_ARGS(op.record_lsn),
+							 LSN_FORMAT_ARGS(op.commit_lsn),
+							 old_match ? "true" : "false",
+							 new_match ? "true" : "false",
+							 fb_entry_debug_attr_text(reverse_state.tupdesc,
+													  op.old_row.tuple,
+													  (AttrNumber) attnum),
+							 fb_entry_debug_attr_text(reverse_state.tupdesc,
+													  op.new_row.tuple,
+													  (AttrNumber) attnum));
+		}
+
+		appendStringInfo(&buf,
+						 " | total_matches=%llu",
+						 (unsigned long long) match_count);
+
+		if (reader != NULL)
+		{
+			fb_reverse_reader_close(reader);
+			reader = NULL;
+		}
+		fb_flashback_release_reverse_state(&reverse_state);
+		fb_progress_finish();
+		PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+	}
+	PG_CATCH();
+	{
+		if (reader != NULL)
+			fb_reverse_reader_close(reader);
+		fb_flashback_release_reverse_state(&reverse_state);
+		fb_progress_abort();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+Datum
+fb_reverse_record_ops_debug(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	text *lsn_text = PG_GETARG_TEXT_PP(2);
+	int32 attnum = PG_GETARG_INT32(3);
+	FbFlashbackReverseBuildState reverse_state;
+	FbReverseOpReader *reader = NULL;
+	FbReverseOp op;
+	StringInfoData buf;
+	unsigned int lsn_hi;
+	unsigned int lsn_lo;
+	XLogRecPtr target_lsn;
+	char *lsn_cstr;
+	uint64 match_count = 0;
+
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+	MemSet(&reverse_state, 0, sizeof(reverse_state));
+
+	lsn_cstr = text_to_cstring(lsn_text);
+	if (sscanf(lsn_cstr, "%X/%X", &lsn_hi, &lsn_lo) != 2)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid LSN text: %s", lsn_cstr)));
+	target_lsn = ((uint64) lsn_hi << 32) | lsn_lo;
+
+	PG_TRY();
+	{
+		text *target_ts_text = cstring_to_text(
+			DatumGetCString(DirectFunctionCall1(timestamptz_out,
+												TimestampTzGetDatum(target_ts))));
+		bool old_id_isnull = true;
+		bool new_id_isnull = true;
+
+		fb_flashback_build_reverse_state(relid,
+										 target_ts_text,
+										 false,
+										 &reverse_state);
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "record_lsn=%X/%08X attnum=%d",
+						 LSN_FORMAT_ARGS(target_lsn),
+						 (int) attnum);
+
+		reader = fb_reverse_reader_open(reverse_state.reverse);
+		while (fb_reverse_reader_next(reader, &op))
+		{
+			if (op.record_lsn != target_lsn)
+				continue;
+
+			match_count++;
+			appendStringInfo(&buf,
+							 " | #%llu type=%s old_id=%s new_id=%s old_att=%s new_att=%s",
+							 (unsigned long long) match_count,
+							 op.type == FB_REVERSE_ADD ? "add" :
+							 (op.type == FB_REVERSE_REMOVE ? "remove" : "replace"),
+							 op.old_row.tuple == NULL ? "NULL" :
+							 psprintf("%lld",
+									  (long long) DatumGetInt64(
+										  heap_getattr(op.old_row.tuple,
+													   1,
+													   reverse_state.tupdesc,
+													   &old_id_isnull))),
+							 op.new_row.tuple == NULL ? "NULL" :
+							 psprintf("%lld",
+									  (long long) DatumGetInt64(
+										  heap_getattr(op.new_row.tuple,
+													   1,
+													   reverse_state.tupdesc,
+													   &new_id_isnull))),
+							 fb_entry_debug_attr_text(reverse_state.tupdesc,
+													  op.old_row.tuple,
+													  (AttrNumber) attnum),
+							 fb_entry_debug_attr_text(reverse_state.tupdesc,
+													  op.new_row.tuple,
+													  (AttrNumber) attnum));
+		}
+
+		appendStringInfo(&buf,
+						 " | total_matches=%llu",
+						 (unsigned long long) match_count);
+
+		if (reader != NULL)
+		{
+			fb_reverse_reader_close(reader);
+			reader = NULL;
+		}
+		fb_flashback_release_reverse_state(&reverse_state);
+		fb_progress_finish();
+		PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+	}
+	PG_CATCH();
+	{
+		if (reader != NULL)
+			fb_reverse_reader_close(reader);
+		fb_flashback_release_reverse_state(&reverse_state);
+		fb_progress_abort();
 		PG_RE_THROW();
 	}
 	PG_END_TRY();

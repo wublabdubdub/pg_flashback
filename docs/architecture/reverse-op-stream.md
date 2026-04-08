@@ -1,4 +1,8 @@
-# 反向操作流
+# 反向操作流 / Reverse Op Stream
+
+[中文](#中文) | [English](#english)
+
+## 中文
 
 `pg_flashback` 当前对用户暴露的是“历史结果集查询”，但实现中真正把 replay 和 apply 连起来的中间层，不是整张历史表快照，而是反向操作流。
 
@@ -262,3 +266,21 @@ row_identity -> delta
 ```text
 replay 负责把页变回去，reverse-op 负责把“怎么改行”表达清楚，apply 负责把这些变化真正映射到当前结果集
 ```
+
+## English
+
+This document explains the reverse-op layer that bridges physical page replay
+and logical result reconstruction.
+
+Key points:
+
+- Replay can recover page state, but apply needs row-level actions.
+- `FbForwardOp` represents the logical change extracted from replayed WAL.
+- `FbReverseOp` converts that change into the inverse action consumed by apply.
+- The reverse-op source preserves ordering and row images so apply can restore
+  the historical result correctly.
+- Keyed and bag modes consume the same reverse-op stream with different
+  semantics.
+
+The shortest mental model is: replay rebuilds pages, reverse-op describes row
+changes, and apply maps those changes onto the final result set.

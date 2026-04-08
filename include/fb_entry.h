@@ -6,6 +6,8 @@
 #ifndef FB_ENTRY_H
 #define FB_ENTRY_H
 
+#define FB_EXTENSION_VERSION "0.2.0"
+
 #include "fb_common.h"
 #include "fb_reverse_ops.h"
 #include "fb_spool.h"

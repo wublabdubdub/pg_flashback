@@ -113,14 +113,94 @@ mkdir -p "$render_output_dir/json" "$render_output_dir/reports"
 cat > "$render_output_dir/json/gate_evaluation.json" <<'EOF'
 {
   "pg_major": "18",
-  "verdict": "PASS",
+  "verdict": "INCOMPLETE",
   "golden_file": "/tmp/fake-golden.json",
   "summary": {
-    "total": 0,
-    "correctness_failures": 0,
-    "performance_failures": 0
+    "total": 3,
+    "correctness_passed": 2,
+    "correctness_failures": 1,
+    "correctness_infra_failures": 0,
+    "performance_failures": 0,
+    "performance_regressions": 0,
+    "performance_infra_failures": 0,
+    "performance_skipped": 1,
+    "performance_missing_baseline": 2
   },
-  "results": []
+  "truth_summary": {
+    "entries": 2,
+    "target_snapshot_entries": 1
+  },
+  "golden_summary": {
+    "entries": 0
+  },
+  "results": [
+    {
+      "scenario_id": "random_flashback_1",
+      "truth_scenario_id": "random_flashback_1",
+      "schema_name": "scenario_oa_50t_50000r",
+      "table_name": "users",
+      "target_ts": "2026-04-08 00:38:25.357868+00",
+      "path_kind": "query",
+      "baseline_key": "query:random_flashback_1:scenario_oa_50t_50000r.users",
+      "correctness_status": "fail",
+      "correctness_reason": "row_count or sha256 mismatch",
+      "performance_status": "skipped",
+      "performance_reason": "correctness failed",
+      "diff_path": "/tmp/diff_users.diff",
+      "result_sha256": "result_users",
+      "truth_sha256": "truth_users",
+      "result_row_count": 50015,
+      "truth_row_count": 50015,
+      "gate_elapsed_ms": 18380,
+      "baseline_elapsed_ms": 0,
+      "ratio_threshold": 0.2,
+      "absolute_threshold_ms": 30000
+    },
+    {
+      "scenario_id": "random_flashback_1",
+      "truth_scenario_id": "random_flashback_1",
+      "schema_name": "scenario_oa_50t_50000r",
+      "table_name": "documents",
+      "target_ts": "2026-04-08 00:38:25.357868+00",
+      "path_kind": "query",
+      "baseline_key": "query:random_flashback_1:scenario_oa_50t_50000r.documents",
+      "correctness_status": "pass",
+      "correctness_reason": "",
+      "performance_status": "missing_baseline",
+      "performance_reason": "missing golden baseline",
+      "diff_path": "",
+      "result_sha256": "result_documents",
+      "truth_sha256": "truth_documents",
+      "result_row_count": 1949993,
+      "truth_row_count": 1949993,
+      "gate_elapsed_ms": 461652,
+      "baseline_elapsed_ms": 0,
+      "ratio_threshold": 0.2,
+      "absolute_threshold_ms": 30000
+    },
+    {
+      "scenario_id": "copy_to_flashback",
+      "truth_scenario_id": "random_flashback_1",
+      "schema_name": "scenario_oa_50t_50000r",
+      "table_name": "documents",
+      "target_ts": "2026-04-08 00:38:25.357868+00",
+      "path_kind": "copy",
+      "baseline_key": "copy:copy_to_flashback:scenario_oa_50t_50000r.documents",
+      "correctness_status": "pass",
+      "correctness_reason": "",
+      "performance_status": "missing_baseline",
+      "performance_reason": "missing golden baseline",
+      "diff_path": "",
+      "result_sha256": "result_copy",
+      "truth_sha256": "truth_documents",
+      "result_row_count": 1949993,
+      "truth_row_count": 1949993,
+      "gate_elapsed_ms": 329027,
+      "baseline_elapsed_ms": 0,
+      "ratio_threshold": 0.2,
+      "absolute_threshold_ms": 30000
+    }
+  ]
 }
 EOF
 
@@ -130,6 +210,44 @@ cat > "$render_output_dir/json/environment.json" <<'EOF'
   "archive_mode": "on",
   "archive_command": "cp %p /walstorage/18waldata/%f"
 }
+EOF
+
+cat > "$render_output_dir/json/truth_manifest.json" <<'EOF'
+[
+  {
+    "scenario_id": "random_flashback_1",
+    "target_ts": "2026-04-08 00:38:25.357868+00",
+    "target_snapshot": "100:101:",
+    "schema_name": "scenario_oa_50t_50000r",
+    "table_name": "users",
+    "csv_path": "/tmp/truth_users.csv",
+    "sha256": "truth_users",
+    "row_count": 50015,
+    "table_class": "medium",
+    "capture_mode": "random"
+  },
+  {
+    "scenario_id": "random_flashback_1",
+    "target_ts": "2026-04-08 00:38:25.357868+00",
+    "schema_name": "scenario_oa_50t_50000r",
+    "table_name": "documents",
+    "csv_path": "/tmp/truth_documents.csv",
+    "sha256": "truth_documents",
+    "row_count": 1949993,
+    "table_class": "large_5gb_target",
+    "capture_mode": "random"
+  }
+]
+EOF
+
+cat > "$render_output_dir/json/random_snapshot_schedule.json" <<'EOF'
+[
+  {
+    "scenario_id": "random_flashback_1",
+    "scheduled_ts": "2026-04-08 00:38:24+00",
+    "offset_sec": 419
+  }
+]
 EOF
 
 list_log="$tmp_dir/list_stages.log"
@@ -148,6 +266,12 @@ FB_RELEASE_GATE_OUTPUT_DIR="$render_output_dir" \
 FB_RELEASE_GATE_PSQL="/bin/true" \
 bash "$RUN_SH" --only render_gate_report >"$only_log" 2>&1 || fail "--only render_gate_report should succeed"
 [[ -f "$render_output_dir/reports/release_gate_report.md" ]] || fail "missing rendered report for --only render_gate_report"
+assert_file_contains "$render_output_dir/reports/release_gate_report.md" "# Release Gate 最终报告"
+assert_file_contains "$render_output_dir/reports/release_gate_report.md" "## 一页结论"
+assert_file_contains "$render_output_dir/reports/release_gate_report.md" "## 测试过程"
+assert_file_contains "$render_output_dir/reports/release_gate_report.md" "## 正确性失败明细"
+assert_file_contains "$render_output_dir/reports/release_gate_report.md" "target_snapshot 覆盖率"
+assert_file_contains "$render_output_dir/reports/release_gate_report.md" "缺少 golden baseline"
 assert_file_contains "$only_log" "render_gate_report"
 assert_file_matches "$only_log" '^\[release_gate\]\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}( [+-][0-9]{4})?\]'
 
@@ -176,6 +300,22 @@ FB_RELEASE_GATE_ARCHIVE_ROOT="$fake_archive_root" \
 FB_RELEASE_GATE_PSQL="$fake_bin_dir/psql" \
 bash "$RUN_SH" --only render_gate_report >"$mid_stage_log" 2>&1 || fail "mid-stage render_gate_report should succeed"
 [[ -f "$fake_archive_dir/keep.seg" ]] || fail "mid-stage run should not delete existing archive files"
+
+snapshot_output_dir="$tmp_dir/snapshot_output"
+mkdir -p "$snapshot_output_dir/logs" "$snapshot_output_dir/json"
+printf '%s\n' 'STALE_RANDOM_LOG' > "$snapshot_output_dir/logs/random_snapshot_capture.log"
+cat > "$snapshot_output_dir/json/dml_pressure_runtime.json" <<'EOF'
+{
+  "pressure_start_ts": "2026-04-08 00:31:25+00",
+  "duration_sec": 3600,
+  "job_id": "dry-run-job"
+}
+EOF
+FB_RELEASE_GATE_OUTPUT_DIR="$snapshot_output_dir" \
+bash "$SNAPSHOT_SH" --dry-run --mode random >"$tmp_dir/capture_random_dry.log" 2>&1 || fail "capture_truth_snapshots --dry-run --mode random should succeed"
+if grep -Fq 'STALE_RANDOM_LOG' "$snapshot_output_dir/logs/random_snapshot_capture.log"; then
+	fail "capture_truth_snapshots should reset random_snapshot_capture.log before each run"
+fi
 
 prepare_test_repo="$tmp_dir/repo"
 prepare_test_root="$prepare_test_repo/tests/release_gate"
@@ -338,7 +478,7 @@ cat > "$matrix_output_dir/json/truth_manifest.json" <<'EOF'
     "table_name": "documents",
     "qualified_name": "scenario_oa_50t_50000r.documents",
     "csv_path": "/tmp/fake.csv",
-    "sha256": "fake",
+    "sha256": "7cde7fb64fd82bd152710cf238e017b9ab46c0592483edc067ba4f6c75fac108",
     "row_count": 1,
     "table_class": "large_5gb_target",
     "capture_mode": "all"
@@ -351,7 +491,7 @@ mkdir -p "$matrix_fake_bin_dir"
 cat > "$matrix_fake_bin_dir/psql" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-printf 'psql %s\n' "\$*" >> "$matrix_log"
+printf 'PGOPTIONS=%s psql %s\n' "\${PGOPTIONS-}" "\$*" >> "$matrix_log"
 if [[ "\$*" == *"show server_version_num;"* ]]; then
 	printf '%s\n' 180000
 	exit 0
@@ -359,6 +499,16 @@ fi
 if [[ "\$*" == *"string_agg(format('%I', a.attname), ', ' order by key_ord.ord)"* ]]; then
 	printf '%s\n' 'id'
 	exit 0
+fi
+if [[ "\$*" == *"pg_flashback("* || "\$*" == *"create_flashback_ctas.sql"* ]]; then
+	if [[ "\${PGOPTIONS-}" != "-c pg_flashback.memory_limit=6GB" ]]; then
+		cat >&2 <<'ERR'
+ERROR:  estimated flashback working set exceeds pg_flashback.memory_limit
+DETAIL:  estimated=1946827608 bytes limit=1073741824 bytes (1 GB) mode=auto phase=preflight
+HINT:  Increase pg_flashback.memory_limit, or set pg_flashback.spill_mode = 'disk' to allow spill.
+ERR
+		exit 1
+	fi
 fi
 printf 'id\n1\n'
 EOF
@@ -368,8 +518,6 @@ FB_RELEASE_GATE_OUTPUT_DIR="$matrix_output_dir" \
 FB_RELEASE_GATE_ARCHIVE_ROOT="$matrix_archive_root" \
 FB_RELEASE_GATE_PSQL="$matrix_fake_bin_dir/psql" \
 FB_RELEASE_GATE_OS_USER="$(id -un)" \
-FB_RELEASE_GATE_WARMUP_RUNS=0 \
-FB_RELEASE_GATE_MEASURED_RUNS=1 \
 bash "$matrix_test_root/bin/run_flashback_matrix.sh" >"$tmp_dir/matrix_run.log" 2>&1 || \
 	fail "run_flashback_matrix should succeed with fake psql"
 
@@ -381,6 +529,33 @@ if grep -Fq 'pg_switch_wal()' "$matrix_log"; then
 fi
 if grep -Fq 'archive_dest=' "$matrix_log"; then
 	fail "CTAS path should not pass archive_dest variable"
+fi
+if ! grep -Fq "PGOPTIONS=-c pg_flashback.memory_limit=6GB" "$matrix_log"; then
+	fail "run_flashback_matrix should default every flashback command to 6GB"
+fi
+if ! grep -Fq "flashback sql [random_flashback_1:documents:query:run1]" "$tmp_dir/matrix_run.log"; then
+	fail "run_flashback_matrix should log query flashback SQL"
+fi
+if ! grep -Fq "flashback sql [copy_to_flashback:documents:copy:run1]" "$tmp_dir/matrix_run.log"; then
+	fail "run_flashback_matrix should log copy flashback SQL"
+fi
+if ! grep -Fq "flashback sql [ctas_flashback:documents:ctas-create:run1]" "$tmp_dir/matrix_run.log"; then
+	fail "run_flashback_matrix should log CTAS flashback SQL"
+fi
+if ! grep -Fq "accuracy [random_flashback_1:documents:query] pass" "$tmp_dir/matrix_run.log"; then
+	fail "run_flashback_matrix should compare query accuracy immediately after CSV output"
+fi
+if ! grep -Fq "accuracy [copy_to_flashback:documents:copy] pass" "$tmp_dir/matrix_run.log"; then
+	fail "run_flashback_matrix should compare copy accuracy immediately after CSV output"
+fi
+if ! grep -Fq "accuracy [ctas_flashback:documents:ctas] pass" "$tmp_dir/matrix_run.log"; then
+	fail "run_flashback_matrix should compare CTAS accuracy immediately after CSV output"
+fi
+if grep -Fq ':run2]' "$tmp_dir/matrix_run.log"; then
+	fail "run_flashback_matrix should default each flashback case to a single execution"
+fi
+if grep -Fq ':run3]' "$tmp_dir/matrix_run.log"; then
+	fail "run_flashback_matrix should not emit a third execution for the same flashback case"
 fi
 
 echo "[release_gate:selftest] PASS"
