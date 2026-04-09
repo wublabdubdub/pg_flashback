@@ -12,3 +12,4 @@ regression.diffs
 tmp_check/
 .worktrees/
 open_source/
+summaryd/pg_flashback-summaryd

@@ -1,0 +1,118 @@
+DO $$
+BEGIN
+	IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_flashback') THEN
+		EXECUTE 'DROP EXTENSION pg_flashback CASCADE';
+	END IF;
+END;
+$$;
+
+CREATE EXTENSION pg_flashback;
+
+SET TIME ZONE 'UTC';
+
+DO $$
+BEGIN
+	EXECUTE format('SET pg_flashback.archive_dir = %L',
+				   current_setting('data_directory') || '/pg_wal');
+END;
+$$;
+
+DO $$
+DECLARE
+	data_dir text := current_setting('data_directory');
+BEGIN
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'mkdir -p ' || quote_literal(data_dir || '/pg_flashback/meta/summaryd') ||
+		' ' || quote_literal(data_dir || '/pg_flashback/runtime/summary-hints') ||
+		' && rm -f ' || quote_literal(data_dir || '/pg_flashback/meta/summaryd/state.json') ||
+		' ' || quote_literal(data_dir || '/pg_flashback/meta/summaryd/debug.json') ||
+		' ' || quote_literal(data_dir || '/pg_flashback/runtime/summary-hints/last-query.json'));
+END;
+$$;
+
+DO $$
+DECLARE
+	data_dir text := current_setting('data_directory');
+	now_ts text := clock_timestamp()::text;
+	window_start_ts text := (clock_timestamp() - interval '2 minutes')::text;
+	state_json text;
+	debug_json text;
+	hint_json text := '{"observed_at":"2026-04-09 12:34:56+00","summary_span_fallback_segments":3,"metadata_fallback_segments":4}';
+BEGIN
+	state_json :=
+		'{"service_enabled":true,"daemon_pid":12345,"registered_workers":1,"active_workers":1,' ||
+		'"queue_capacity":0,"hot_window":32,"pending_hot":0,"pending_cold":0,' ||
+		'"running_hot":0,"running_cold":0,"snapshot_timeline_id":0,' ||
+		'"snapshot_oldest_segno":0,"snapshot_newest_segno":0,' ||
+		'"snapshot_hot_candidates":0,"snapshot_cold_candidates":0,' ||
+		'"scan_count":11,"enqueue_count":0,"build_count":22,"cleanup_count":33,' ||
+		'"last_scan_at":"' || now_ts || '",' ||
+		'"throughput_window_started_at":"' || window_start_ts || '",' ||
+		'"last_build_at":"' || now_ts || '",' ||
+		'"throughput_window_builds":22,"last_error":""}';
+	debug_json :=
+		'{"service_enabled":true,"daemon_pid":54321,"registered_workers":7,"active_workers":6,' ||
+		'"queue_capacity":64,"hot_window":55,"pending_hot":4,"pending_cold":5,' ||
+		'"running_hot":2,"running_cold":3,"snapshot_timeline_id":0,' ||
+		'"snapshot_oldest_segno":0,"snapshot_newest_segno":0,' ||
+		'"snapshot_hot_candidates":0,"snapshot_cold_candidates":0,' ||
+		'"scan_count":99,"enqueue_count":44,"build_count":88,"cleanup_count":77,' ||
+		'"last_scan_at":"' || now_ts || '",' ||
+		'"throughput_window_started_at":"' || window_start_ts || '",' ||
+		'"last_build_at":"' || now_ts || '",' ||
+		'"throughput_window_builds":88,"last_error":"none"}';
+
+	EXECUTE format('COPY (SELECT %L) TO %L',
+				   state_json,
+				   data_dir || '/pg_flashback/meta/summaryd/state.json');
+	EXECUTE format('COPY (SELECT %L) TO %L',
+				   debug_json,
+				   data_dir || '/pg_flashback/meta/summaryd/debug.json');
+	EXECUTE format('COPY (SELECT %L) TO %L',
+				   hint_json,
+				   data_dir || '/pg_flashback/runtime/summary-hints/last-query.json');
+END;
+$$;
+
+SELECT service_enabled,
+	   last_query_observed_at = '2026-04-09 12:34:56+00'::timestamptz AS last_query_ts_ok,
+	   last_query_summary_ready = false AS last_query_ready_ok,
+	   last_query_summary_span_fallback_segments = 3 AS span_fallback_ok,
+	   last_query_metadata_fallback_segments = 4 AS metadata_fallback_ok,
+	   estimated_completion_at IS NOT NULL AS eta_present
+FROM pg_flashback_summary_progress;
+
+SELECT service_enabled,
+	   launcher_pid = 54321 AS daemon_pid_ok,
+	   registered_workers = 7 AS registered_workers_ok,
+	   active_workers = 6 AS active_workers_ok,
+	   scan_count = 99 AS scan_count_ok,
+	   build_count = 88 AS build_count_ok,
+	   cleanup_count = 77 AS cleanup_count_ok,
+	   last_scan_at IS NOT NULL AS last_scan_at_ok
+FROM pg_flashback_summary_service_debug;
+
+DO $$
+DECLARE
+	data_dir text := current_setting('data_directory');
+	state_json text :=
+		'{"service_enabled":true,"daemon_pid":12345,"registered_workers":1,"active_workers":1,' ||
+		'"queue_capacity":0,"hot_window":32,"pending_hot":0,"pending_cold":0,' ||
+		'"running_hot":0,"running_cold":0,"snapshot_timeline_id":0,' ||
+		'"snapshot_oldest_segno":0,"snapshot_newest_segno":0,' ||
+		'"snapshot_hot_candidates":0,"snapshot_cold_candidates":0,' ||
+		'"scan_count":11,"enqueue_count":0,"build_count":0,"cleanup_count":33,' ||
+		'"last_scan_at":"' || clock_timestamp()::text || '",' ||
+		'"throughput_window_started_at":"","last_build_at":"","throughput_window_builds":0,' ||
+		'"last_error":""}';
+BEGIN
+	EXECUTE format('COPY (SELECT %L) TO %L',
+				   state_json,
+				   data_dir || '/pg_flashback/meta/summaryd/state.json');
+END;
+$$;
+
+SELECT service_enabled,
+	   estimated_completion_at IS NULL AS eta_absent_without_rate_window
+FROM pg_flashback_summary_progress;

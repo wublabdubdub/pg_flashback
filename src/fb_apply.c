@@ -29,6 +29,7 @@
 
 #include "fb_apply.h"
 #include "fb_catalog.h"
+#include "fb_compat.h"
 #include "fb_guc.h"
 #include "fb_progress.h"
 #include "fb_spool.h"
@@ -842,11 +843,10 @@ fb_apply_parallel_worker_do(dsm_segment *seg,
 					if (tuple_to_write != NULL)
 					{
 						fb_apply_serialize_tuple(&tuple_buf, tuple_to_write);
-						if (shm_mq_send(tuple_handle,
-										tuple_buf.len,
-										tuple_buf.data,
-										false,
-										false) == SHM_MQ_DETACHED)
+						if (fb_shm_mq_send_compat(tuple_handle,
+												  tuple_buf.len,
+												  tuple_buf.data,
+												  false) == SHM_MQ_DETACHED)
 							break;
 						task->row_count++;
 						if (emit.kind == FB_APPLY_EMIT_SLOT)
@@ -869,11 +869,10 @@ fb_apply_parallel_worker_do(dsm_segment *seg,
 				if (tuple_to_write != NULL)
 				{
 					fb_apply_serialize_tuple(&tuple_buf, tuple_to_write);
-					if (shm_mq_send(tuple_handle,
-									tuple_buf.len,
-									tuple_buf.data,
-									false,
-									false) == SHM_MQ_DETACHED)
+					if (fb_shm_mq_send_compat(tuple_handle,
+											  tuple_buf.len,
+											  tuple_buf.data,
+											  false) == SHM_MQ_DETACHED)
 						break;
 					task->row_count++;
 					if (emit.kind == FB_APPLY_EMIT_SLOT)
@@ -1518,12 +1517,11 @@ fb_apply_fast_path_init(FbApplyContext *ctx)
 		fast->residual_count = residual_count;
 		if (fast->spec.ordered_output)
 			fb_apply_sort_residual_items(fast);
-		fast->index_scan = index_beginscan(ctx->rel,
-										   fast->index_rel,
-										   GetActiveSnapshot(),
-										   NULL,
-										   (fast->spec.mode == FB_FAST_PATH_KEY_RANGE) ? 2 : 0,
-										   0);
+		fast->index_scan = fb_index_beginscan_compat(ctx->rel,
+													 fast->index_rel,
+													 GetActiveSnapshot(),
+													 (fast->spec.mode == FB_FAST_PATH_KEY_RANGE) ? 2 : 0,
+													 0);
 		if (fast->spec.mode == FB_FAST_PATH_KEY_RANGE)
 		{
 			Oid strategy_op;
@@ -1621,12 +1619,11 @@ fb_apply_fast_path_init(FbApplyContext *ctx)
 					BTEqualStrategyNumber,
 					eqproc,
 					(Datum) 0);
-		fast->index_scan = index_beginscan(ctx->rel,
-										   fast->index_rel,
-										   GetActiveSnapshot(),
-										   NULL,
-										   1,
-										   0);
+		fast->index_scan = fb_index_beginscan_compat(ctx->rel,
+													 fast->index_rel,
+													 GetActiveSnapshot(),
+													 1,
+													 0);
 		fast->scankey_count = 1;
 		fast->scankeys_ready = true;
 	}

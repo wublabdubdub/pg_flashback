@@ -40,5 +40,4 @@
 ## Phase 6: Compatibility
 
 - 从 PG18 基线抽兼容层
-- 扩到 PG10-18
-
+- 扩到 PG14-18

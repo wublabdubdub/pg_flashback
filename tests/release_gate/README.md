@@ -1,18 +1,14 @@
 # Release Gate
 
-`tests/release_gate/` 用于 `pg_flashback` 的发布前阻断式功能/性能验证，不属于 `make installcheck` 常规回归。
+`tests/release_gate/` 用于 `pg_flashback` 的发布前阻断式功能验证与单次耗时记录，不属于 `make installcheck` 常规回归。
 
 当前固定范围：
 
 - PostgreSQL：`PG14-18`
 - 测试库：`alldb`
-- 归档根目录：`/walstorage`
-- 按版本归档子目录：
-  - `PG14 -> /walstorage/14waldata`
-  - `PG15 -> /walstorage/15waldata`
-  - `PG16 -> /walstorage/16waldata`
-  - `PG17 -> /walstorage/17waldata`
-  - `PG18 -> /walstorage/18waldata`
+- 归档目录：默认优先取 `/home/<major>pg/wal_arch` 的 realpath
+- 当未发现对应 `wal_arch` 链接时，才回退到
+  `FB_RELEASE_GATE_ARCHIVE_ROOT/<major>waldata`
 
 ## 目录与入口
 
@@ -34,25 +30,32 @@
 
 - 可用 PostgreSQL 实例已启动
 - 当前实例 `archive_mode` 已开启
-- 当前实例 `archive_command` 实际落点就是本版本对应的 `/walstorage/<major>waldata`
+- 当前实例 `archive_command` 实际落点必须与脚本解析出的当前版本归档目录一致
 - `/root/alldbsimulator/bin/alldbsim` 可执行
 - `jq`、`curl`、`sha256sum`、`awk` 可用
 - `FB_RELEASE_GATE_PSQL`、`createdb`、`dropdb` 可连到目标实例
 
 当前默认连接口径来自 [release_gate.conf](/root/pg_flashback/tests/release_gate/config/release_gate.conf) 和 [common.sh](/root/pg_flashback/tests/release_gate/bin/common.sh)：
 
-- `FB_RELEASE_GATE_PSQL=/home/18pg/local/bin/psql`
-- `FB_RELEASE_GATE_CREATEDB=/home/18pg/local/bin/createdb`
-- `FB_RELEASE_GATE_DROPDB=/home/18pg/local/bin/dropdb`
-- `FB_RELEASE_GATE_PGPORT=5832`
-- `FB_RELEASE_GATE_PGUSER=18pg`
+- `FB_RELEASE_GATE_PG_MAJOR=14`
+- `FB_RELEASE_GATE_PSQL=/home/14pg/local/bin/psql`
+- `FB_RELEASE_GATE_CREATEDB=/home/14pg/local/bin/createdb`
+- `FB_RELEASE_GATE_DROPDB=/home/14pg/local/bin/dropdb`
+- `FB_RELEASE_GATE_PGPORT=5432`
+- `FB_RELEASE_GATE_PGUSER=14pg`
 - `FB_RELEASE_GATE_DBNAME=alldb`
-- `FB_RELEASE_GATE_OS_USER=18pg`
+- `FB_RELEASE_GATE_OS_USER=14pg`
 - `FB_RELEASE_GATE_TARGET_TABLE_NAME=documents`
 - `FB_RELEASE_GATE_DML_TABLE_NAME=leave_requests`
 - `FB_RELEASE_GATE_SIM_DML_DURATION_SEC=3600`
 - `FB_RELEASE_GATE_SIM_DML_WORKERS=20`
 - `FB_RELEASE_GATE_SIM_DML_RATE_LIMIT_OPS=2000`
+
+若要切换到其它主版本，最小覆盖集通常只需要：
+
+- `FB_RELEASE_GATE_PG_MAJOR=<14|15|16|17|18>`
+- 必要时再单独覆盖 `FB_RELEASE_GATE_PGPORT` / `FB_RELEASE_GATE_PSQL` / `FB_RELEASE_GATE_CREATEDB` / `FB_RELEASE_GATE_DROPDB`
+- 若不想走 `/home/<major>pg/wal_arch` 自动发现，可额外覆盖 `FB_RELEASE_GATE_ARCHIVE_ROOT`
 
 需要临时覆盖时，直接在命令前加环境变量，例如：
 
@@ -267,7 +270,7 @@ bash tests/release_gate/bin/run_release_gate.sh \
 作用：
 
 - 汇总 flashback 输出和 truth snapshot 的 correctness 结果
-- 对比当前耗时和 golden baseline
+- 汇总每个 case 的单次执行耗时
 - 生成最终 gate verdict
 
 主要产物：
@@ -277,17 +280,14 @@ bash tests/release_gate/bin/run_release_gate.sh \
 
 当前判读口径补充：
 
-- `correctness` 与 `performance` 分开统计
-- `missing golden baseline` 记为“未评估”，不再伪装成“性能失败”
-- 若 correctness 有失败，性能状态记为 `skipped`
-- 若 correctness / performance 都无失败，但仍存在 `missing golden baseline`，
-  最终 verdict 记为 `INCOMPLETE`
+- gate verdict 只由 `correctness` 决定
+- `gate_elapsed_ms` / `measured_elapsed_ms` 只用于记录本轮单次执行时间
+- 不再做 golden baseline 对比，也不再做性能回归判定
 
 依赖：
 
 - 必须已有 `json/flashback_results.json`
 - 必须已有 `json/truth_manifest.json`
-- 必须有对应版本的 `golden/pg<major>.json`
 
 ### `render_gate_report`
 
@@ -299,7 +299,7 @@ bash tests/release_gate/bin/run_release_gate.sh \
   - 测试过程
   - 场景执行矩阵
   - 正确性失败明细
-  - 未评估与阻塞项
+  - 单次耗时记录口径
   - `target_snapshot` 覆盖率提示
 
 主要产物：
@@ -490,6 +490,6 @@ bash tests/release_gate/bin/selftest.sh
 
 ## 当前已知限制
 
-- 若本机 `archive_command` 不指向 `/walstorage/<major>waldata`，总入口 real run 会被环境 gate 拦住
+- 若本机 `archive_command` 不指向脚本解析出的当前版本归档目录，总入口 real run 会被环境 gate 拦住
 - 从中间阶段启动时不会自动恢复缺失上下文
 - 当前 `1h` 压测本体只覆盖基础三类 DML；批量 `10k` 和 mixed case 仍在定向快照阶段单独构造

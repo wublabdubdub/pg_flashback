@@ -13,6 +13,7 @@ REQUIRED_PATHS=(
   "LICENSE"
   "VERSION"
   "pg_flashback.control"
+  "summaryd"
   "include"
   "src"
   "sql"
@@ -28,6 +29,7 @@ PUBLIC_FILES=(
 )
 
 PUBLIC_DIRS=(
+  "summaryd"
   "include"
   "src"
   "sql"
@@ -86,6 +88,7 @@ verify_excluded_paths() {
   for relpath in "${EXCLUDED_PATHS[@]}"; do
     [[ ! -e "${DEST_ROOT}/${relpath}" ]] || fail "excluded path leaked into mirror: ${relpath}"
   done
+  [[ ! -e "${DEST_ROOT}/summaryd/pg_flashback-summaryd" ]] || fail "built daemon binary leaked into mirror"
 }
 
 verify_required_outputs() {
@@ -96,6 +99,7 @@ verify_required_outputs() {
     "LICENSE"
     "VERSION"
     "pg_flashback.control"
+    "summaryd"
     "include"
     "src"
     "sql"
@@ -125,6 +129,7 @@ main() {
   done
 
   find "${DEST_ROOT}/src" -type f \( -name '*.o' -o -name '*.so' -o -name '*.bc' \) -delete
+  rm -f "${DEST_ROOT}/summaryd/pg_flashback-summaryd"
 
   write_mirror_gitignore
 

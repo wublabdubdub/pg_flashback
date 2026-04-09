@@ -5,6 +5,7 @@
 
 #include "postgres.h"
 
+#include "access/commit_ts.h"
 #include "access/genam.h"
 #include "access/relation.h"
 #include "catalog/catalog.h"
@@ -14,6 +15,7 @@
 #include "utils/relcache.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 
 #include "fb_catalog.h"
 #include "fb_error.h"
@@ -104,6 +106,31 @@ fb_catalog_require_supported_relation(Relation rel)
 
 	if (rel->rd_rel->relkind != RELKIND_RELATION)
 		fb_raise_unsupported_relation("this relation kind");
+}
+
+bool
+fb_catalog_relation_creation_precedes_target(Oid relid, TimestampTz target_ts)
+{
+	HeapTuple tuple;
+	TransactionId xmin;
+	TimestampTz commit_ts = 0;
+	RepOriginId origin_id = InvalidRepOriginId;
+	bool found = false;
+
+	if (!OidIsValid(relid) || target_ts == 0 || !track_commit_timestamp)
+		return false;
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tuple))
+		return false;
+
+	xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+	if (TransactionIdIsValid(xmin))
+		found = TransactionIdGetCommitTsData(xmin, &commit_ts, &origin_id);
+
+	ReleaseSysCache(tuple);
+
+	return found && commit_ts != 0 && commit_ts <= target_ts;
 }
 
 /*

@@ -337,8 +337,8 @@ WAL 层当前只做三件大事：
 
 当前更准确的说法是：
 
-- 构建目标支持口径已扩展到 `PG10-18`
-- 本机实际验证矩阵是 `PG12-18`
+- 构建目标支持口径已扩展到 `PG14-18`
+- 本机实际验证矩阵是 `PG14-18`
 - resolver 已经是 `archive_dest + archive_command autodiscovery + pg_wal + recovered_wal`
 - 索引层已经持有面向 replay 的 payload / block ref / xid state
 

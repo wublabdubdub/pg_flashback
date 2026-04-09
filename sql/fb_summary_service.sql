@@ -14,6 +14,18 @@ END;
 $$;
 
 DO $$
+DECLARE
+	data_dir text := current_setting('data_directory');
+BEGIN
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'rm -f ' || quote_literal(data_dir || '/pg_flashback/meta/summaryd/state.json') ||
+		' ' || quote_literal(data_dir || '/pg_flashback/meta/summaryd/debug.json') ||
+		' ' || quote_literal(data_dir || '/pg_flashback/runtime/summary-hints/last-query.json'));
+END;
+$$;
+
+DO $$
 BEGIN
 	IF to_regprocedure('fb_summary_service_plan_debug()') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_summary_service_plan_debug()';
@@ -313,6 +325,67 @@ SELECT missing_segments = 1 AS tracks_deleted_wal_gap,
 	   AS oldest_gap_matches_deleted,
 	   progress_pct < 100.0 AS progress_pct_drops
 FROM pg_flashback_summary_progress;
+
+DO $$
+DECLARE
+	data_dir text := current_setting('data_directory');
+	timeline_id integer :=
+		(('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::bigint)::integer;
+	state_json text;
+BEGIN
+	state_json := format(
+		'{"service_enabled":true,' ||
+		'"daemon_pid":23456,' ||
+		'"registered_workers":1,' ||
+		'"active_workers":1,' ||
+		'"queue_capacity":16,' ||
+		'"hot_window":8,' ||
+		'"pending_hot":0,' ||
+		'"pending_cold":0,' ||
+		'"running_hot":0,' ||
+		'"running_cold":0,' ||
+		'"snapshot_timeline_id":%s,' ||
+		'"snapshot_oldest_segno":%s,' ||
+		'"snapshot_newest_segno":%s,' ||
+		'"snapshot_hot_candidates":2,' ||
+		'"snapshot_cold_candidates":2,' ||
+		'"scan_count":1,' ||
+		'"enqueue_count":0,' ||
+		'"build_count":1,' ||
+		'"cleanup_count":0,' ||
+		'"last_scan_at":"2026-04-09 12:00:00+00",' ||
+		'"last_error":""}',
+		timeline_id,
+		(SELECT min(segno) FROM fb_summary_gap_fixture),
+		(SELECT max(segno) + 1 FROM fb_summary_gap_fixture));
+
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'mkdir -p ' || quote_literal(data_dir || '/pg_flashback/meta/summaryd'));
+	EXECUTE format('COPY (SELECT %L) TO %L',
+				   state_json,
+				   data_dir || '/pg_flashback/meta/summaryd/state.json');
+END;
+$$;
+
+SELECT stable_oldest_segno = (SELECT min(segno) FROM fb_summary_gap_fixture)
+	   AS snapshot_pins_oldest,
+	   stable_newest_segno = (SELECT max(segno) + 1 FROM fb_summary_gap_fixture)
+	   AS snapshot_pins_newest,
+	   missing_segments = 2 AS snapshot_counts_deleted_and_tail_gap,
+	   first_gap_from_newest_segno = (SELECT max(segno) + 1 FROM fb_summary_gap_fixture)
+	   AS newest_gap_tracks_snapshot_tail
+FROM pg_flashback_summary_progress;
+
+DO $$
+DECLARE
+	data_dir text := current_setting('data_directory');
+BEGIN
+	EXECUTE format(
+		'COPY (SELECT '''') TO PROGRAM %L',
+		'rm -f ' || quote_literal(data_dir || '/pg_flashback/meta/summaryd/state.json'));
+END;
+$$;
 
 DO $$
 DECLARE

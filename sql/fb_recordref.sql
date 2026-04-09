@@ -135,6 +135,8 @@ SELECT :'serial_summary' LIKE '%payload_windows=%' AS serial_payload_windows_pre
 	   AS serial_summary_xid_exact_segments_read_present,
 	   :'serial_summary' LIKE '%xact_fallback_windows=%'
 	   AS serial_xact_fallback_windows_present,
+	   :'serial_summary' LIKE '%xact_parallel_workers=%'
+	   AS serial_xact_parallel_workers_present,
 	   :'serial_summary' LIKE '%xact_fallback_covered_segments=%'
 	   AS serial_xact_fallback_segments_present;
 
@@ -176,6 +178,8 @@ SELECT :'parallel_summary' LIKE '%payload_windows=%' AS parallel_payload_windows
 	   AS parallel_summary_xid_exact_segments_read_present,
 	   :'parallel_summary' LIKE '%xact_fallback_windows=%'
 	   AS parallel_xact_fallback_windows_present,
+	   :'parallel_summary' LIKE '%xact_parallel_workers=%'
+	   AS parallel_xact_parallel_workers_present,
 	   :'parallel_summary' LIKE '%xact_fallback_covered_segments=%'
 	   AS parallel_xact_fallback_segments_present;
 
@@ -415,13 +419,13 @@ SELECT :'parallel_unsafe_summary' LIKE '%unsafe=true%' AS parallel_unsafe_true,
 
 SELECT regexp_replace(
 		   :'serial_unsafe_summary',
-		   ' (parallel|prefilter|visited_segments|payload_windows|payload_scan_mode|payload_parallel_workers|payload_covered_segments|payload_scanned_records|payload_kept_records|summary_payload_locator_records|summary_payload_locator_segments_read|summary_payload_locator_public_builds|summary_payload_locator_fallback_segments|summary_span_windows|summary_span_segments_read|summary_span_public_builds|summary_xid_hits|summary_xid_fallback|summary_xid_segments_read|summary_xid_exact_hits|summary_xid_exact_segments_read|summary_unsafe_hits|metadata_fallback_windows|xact_fallback_windows|xact_fallback_covered_segments|xact_summary_spool_records|xact_summary_spool_hits)=[^ ]+',
+		   ' (parallel|prefilter|visited_segments|payload_windows|payload_scan_mode|payload_parallel_workers|payload_covered_segments|payload_scanned_records|payload_kept_records|summary_payload_locator_records|summary_payload_locator_segments_read|summary_payload_locator_public_builds|summary_payload_locator_fallback_segments|summary_span_windows|summary_span_segments_read|summary_span_public_builds|summary_xid_hits|summary_xid_fallback|summary_xid_segments_read|summary_xid_exact_hits|summary_xid_exact_segments_read|summary_unsafe_hits|metadata_fallback_windows|xact_fallback_windows|xact_fallback_covered_segments|xact_parallel_workers|xact_summary_spool_records|xact_summary_spool_hits)=[^ ]+',
 		   '',
 		   'g'
 	   ) =
 	   regexp_replace(
 		   :'parallel_unsafe_summary',
-		   ' (parallel|prefilter|visited_segments|payload_windows|payload_scan_mode|payload_parallel_workers|payload_covered_segments|payload_scanned_records|payload_kept_records|summary_payload_locator_records|summary_payload_locator_segments_read|summary_payload_locator_public_builds|summary_payload_locator_fallback_segments|summary_span_windows|summary_span_segments_read|summary_span_public_builds|summary_xid_hits|summary_xid_fallback|summary_xid_segments_read|summary_xid_exact_hits|summary_xid_exact_segments_read|summary_unsafe_hits|metadata_fallback_windows|xact_fallback_windows|xact_fallback_covered_segments|xact_summary_spool_records|xact_summary_spool_hits)=[^ ]+',
+		   ' (parallel|prefilter|visited_segments|payload_windows|payload_scan_mode|payload_parallel_workers|payload_covered_segments|payload_scanned_records|payload_kept_records|summary_payload_locator_records|summary_payload_locator_segments_read|summary_payload_locator_public_builds|summary_payload_locator_fallback_segments|summary_span_windows|summary_span_segments_read|summary_span_public_builds|summary_xid_hits|summary_xid_fallback|summary_xid_segments_read|summary_xid_exact_hits|summary_xid_exact_segments_read|summary_unsafe_hits|metadata_fallback_windows|xact_fallback_windows|xact_fallback_covered_segments|xact_parallel_workers|xact_summary_spool_records|xact_summary_spool_hits)=[^ ]+',
 		   '',
 		   'g'
 	   ) AS unsafe_serial_parallel_stable_contract_equal;

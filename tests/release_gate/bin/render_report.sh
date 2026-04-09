@@ -57,14 +57,6 @@ report_content="$(jq -nr \
 			elif $value == "infra_fail" then "基础设施失败"
 			else ($value // "-")
 			end;
-		def performance_label($value):
-			if $value == "pass" then "通过"
-			elif $value == "fail" then "回归"
-			elif $value == "missing_baseline" then "未评估"
-			elif $value == "skipped" then "跳过"
-			elif $value == "infra_fail" then "基础设施失败"
-			else ($value // "-")
-			end;
 		def nonempty($value):
 			if ($value // "") == "" then "-" else $value end;
 
@@ -83,12 +75,11 @@ report_content="$(jq -nr \
 			"- 判定：\($evaluation.verdict)",
 			"- PostgreSQL 主版本：\($evaluation.pg_major)",
 			"- 输出目录：\($evaluation.output_dir)",
-			"- Golden 基线文件：\($evaluation.golden_file)",
 			"- Archive Dir：\($environment.archive_dir // "-")",
 			"- Archive Mode：\($environment.archive_mode // "-")",
 			"- Archive Command：\($environment.archive_command // "-")",
 			"- 正确性：\($evaluation.summary.correctness_passed // 0) 通过 / \($evaluation.summary.correctness_failures // 0) 失败 / \($evaluation.summary.correctness_infra_failures // 0) 基础设施失败",
-			"- 性能：\($evaluation.summary.performance_regressions // 0) 回归 / \($evaluation.summary.performance_missing_baseline // 0) 未评估 / \($evaluation.summary.performance_skipped // 0) 跳过 / \($evaluation.summary.performance_infra_failures // 0) 基础设施失败",
+			"- 耗时口径：记录每个 case 的单次执行耗时，不做 golden baseline 或性能回归评估",
 			"- truth manifest：\($truth_entries) 条，target_snapshot 覆盖率：\($truth_snapshot_entries)/\($truth_entries)",
 			(if ($truth_entries > 0 and $truth_snapshot_entries < $truth_entries)
 			 then "- 风险提示：本轮 truth manifest 未完整携带 `target_snapshot`，这通常意味着并未按最新 MVCC snapshot 口径重新采集 truth。"
@@ -132,11 +123,11 @@ report_content="$(jq -nr \
 			 then "没有可渲染的执行结果。"
 			 else ((
 				[
-					"| 场景 | 路径 | 表 | target_ts(UTC) | 正确性 | 性能 | 耗时(ms) |",
-					"| --- | --- | --- | --- | --- | --- | ---: |"
+					"| 场景 | 路径 | 表 | target_ts(UTC) | 正确性 | 单次耗时(ms) |",
+					"| --- | --- | --- | --- | --- | ---: |"
 				] + (
 					$results | map(
-						"| \(.scenario_id) | \(path_label(.path_kind)) | \(.table_name) | \(.target_ts // "-") | \(correctness_label(.correctness_status)) | \(performance_label(.performance_status)) | \(.gate_elapsed_ms // 0) |"
+						"| \(.scenario_id) | \(path_label(.path_kind)) | \(.table_name) | \(.target_ts // "-") | \(correctness_label(.correctness_status)) | \(.gate_elapsed_ms // 0) |"
 						)
 					)
 			 ) | join("\n"))
@@ -147,10 +138,7 @@ report_content="$(jq -nr \
 			"- 总 case 数：\($evaluation.summary.total // ($results | length))",
 			"- 正确性失败：\($evaluation.summary.correctness_failures // 0)",
 			"- 正确性基础设施失败：\($evaluation.summary.correctness_infra_failures // 0)",
-			"- 性能回归：\($evaluation.summary.performance_regressions // 0)",
-			"- 性能未评估（缺少 golden baseline）：\($evaluation.summary.performance_missing_baseline // 0)",
-			"- 性能跳过：\($evaluation.summary.performance_skipped // 0)",
-			"- 性能基础设施失败：\($evaluation.summary.performance_infra_failures // 0)",
+			"- 耗时记录：\($evaluation.summary.total // ($results | length)) 条 case 的单次执行时间已写入场景执行矩阵",
 			"",
 			"## 正确性失败明细",
 			"",
@@ -165,42 +153,6 @@ report_content="$(jq -nr \
 					| map(select(.correctness_status == "fail" or .correctness_status == "infra_fail"))
 					| map(
 						"| \(.scenario_id) | \(path_label(.path_kind)) | \(.table_name) | \(.target_ts // "-") | \(.result_row_count // 0) | \(.truth_row_count // 0) | \(nonempty(.correctness_reason)) | \(nonempty(.diff_path)) |"
-						)
-					)
-			 ) | join("\n"))
-			 end),
-			"",
-			"## 性能结论",
-			"",
-			(if (($results | map(select(.performance_status == "fail")) | length) == 0)
-			 then "本轮没有检测到性能回归。"
-			 else ((
-				[
-					"| 场景 | 路径 | 表 | 当前耗时(ms) | 基线(ms) | 阈值 | 结论 |",
-					"| --- | --- | --- | ---: | ---: | --- | --- |"
-				] + (
-					$results
-					| map(select(.performance_status == "fail"))
-					| map(
-						"| \(.scenario_id) | \(path_label(.path_kind)) | \(.table_name) | \(.gate_elapsed_ms // 0) | \(.baseline_elapsed_ms // 0) | ratio>\(.ratio_threshold // 0) and +\(.absolute_threshold_ms // 0)ms | 回归 |"
-						)
-					)
-			 ) | join("\n"))
-			 end),
-			"",
-			"## 未评估与阻塞项",
-			"",
-			(if (($results | map(select(.performance_status == "missing_baseline")) | length) == 0)
-			 then "本轮没有“缺少 golden baseline”导致的未评估项。"
-			 else ((
-				[
-					"| 场景 | 路径 | 表 | 未评估原因 |",
-					"| --- | --- | --- | --- |"
-				] + (
-					$results
-					| map(select(.performance_status == "missing_baseline"))
-					| map(
-						"| \(.scenario_id) | \(path_label(.path_kind)) | \(.table_name) | 缺少 golden baseline |"
 						)
 					)
 			 ) | join("\n"))

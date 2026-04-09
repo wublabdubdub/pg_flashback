@@ -32,6 +32,7 @@
 #include "fb_guc.h"
 #include "fb_runtime.h"
 #include "fb_summary.h"
+#include "fb_summary_state.h"
 #include "fb_summary_service.h"
 
 #define FB_SUMMARY_SERVICE_TRANCHE "fb_summary_service"
@@ -194,7 +195,9 @@ typedef struct FbSummaryServiceProgressStats
 } FbSummaryServiceProgressStats;
 
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+#if PG_VERSION_NUM >= 180000
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
+#endif
 static FbSummaryServiceShared *fb_summary_service = NULL;
 static LWLock *fb_summary_service_lock = NULL;
 static volatile sig_atomic_t fb_summary_service_got_sigterm = false;
@@ -203,13 +206,17 @@ PGDLLEXPORT void fb_summary_service_launcher_main(Datum main_arg);
 PGDLLEXPORT void fb_summary_service_worker_main(Datum main_arg);
 
 static Size fb_summary_service_shmem_size(void);
+#if PG_VERSION_NUM >= 180000
 static void fb_summary_service_shmem_request(void);
+#endif
 static void fb_summary_service_shmem_startup(void);
 static void fb_summary_service_register_bgworkers(void);
 static int fb_summary_service_registered_workers(void);
 static void fb_summary_service_sigterm(SIGNAL_ARGS);
 static int fb_summary_service_hot_window(void);
 static int fb_summary_service_recent_rank_for_index(int candidate_index, int candidate_count);
+static int fb_summary_service_recent_rank_for_segno(XLogSegNo newest_segno,
+													 XLogSegNo segno);
 static int fb_summary_service_queue_kind_for_rank(int recent_rank, int hot_window);
 static const char *fb_summary_service_queue_kind_name(int queue_kind);
 static int fb_summary_service_compare_priority(int queue_kind_a,
@@ -236,7 +243,8 @@ static int fb_summary_service_claim_tasks(FbSummaryBuildCandidate *candidates_ou
 static void fb_summary_service_finish_task(int slot_index, bool built);
 static void fb_summary_service_run_scan(void);
 static void fb_summary_service_run_cleanup(void);
-static void fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats);
+static void fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats,
+												bool prefer_debug_state);
 static void fb_summary_service_compute_eta(FbSummaryServiceProgressStats *stats);
 static bool fb_summary_service_build_candidate_safe(const FbSummaryBuildCandidate *candidate);
 static bool fb_summary_service_candidate_in_snapshot(bool snapshot_valid,
@@ -244,6 +252,9 @@ static bool fb_summary_service_candidate_in_snapshot(bool snapshot_valid,
 													 XLogSegNo snapshot_oldest_segno,
 													 XLogSegNo snapshot_newest_segno,
 													 const FbSummaryBuildCandidate *candidate);
+static void fb_summary_service_add_missing_range(FbSummaryServiceProgressStats *stats,
+												 XLogSegNo start_segno,
+												 XLogSegNo end_segno);
 static void fb_summary_service_collect_candidate_hashes(const FbSummaryBuildCandidate *candidates,
 														 int candidate_count,
 														 uint64 **hashes_out,
@@ -264,9 +275,11 @@ fb_summary_service_report_query_summary_usage(TimestampTz observed_at,
 												   uint32 summary_span_fallback_segments,
 												   uint32 metadata_fallback_segments)
 {
-	if (!fb_summary_service_enabled() ||
-		fb_summary_service == NULL ||
-		fb_summary_service_lock == NULL)
+	fb_summary_query_hint_write(observed_at,
+								summary_span_fallback_segments,
+								metadata_fallback_segments);
+
+	if (fb_summary_service == NULL || fb_summary_service_lock == NULL)
 		return;
 
 	LWLockAcquire(fb_summary_service_lock, LW_EXCLUSIVE);
@@ -284,8 +297,13 @@ fb_summary_service_shmem_init(void)
 	if (!fb_summary_service_enabled())
 		return;
 
+#if PG_VERSION_NUM >= 180000
 	prev_shmem_request_hook = shmem_request_hook;
 	shmem_request_hook = fb_summary_service_shmem_request;
+#else
+	RequestAddinShmemSpace(fb_summary_service_shmem_size());
+	RequestNamedLWLockTranche(FB_SUMMARY_SERVICE_TRANCHE, 1);
+#endif
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = fb_summary_service_shmem_startup;
 
@@ -299,6 +317,7 @@ fb_summary_service_shmem_size(void)
 		MAXALIGN(sizeof(FbSummaryServiceTask) * fb_summary_service_queue_size());
 }
 
+#if PG_VERSION_NUM >= 180000
 static void
 fb_summary_service_shmem_request(void)
 {
@@ -308,6 +327,7 @@ fb_summary_service_shmem_request(void)
 	RequestAddinShmemSpace(fb_summary_service_shmem_size());
 	RequestNamedLWLockTranche(FB_SUMMARY_SERVICE_TRANCHE, 1);
 }
+#endif
 
 static void
 fb_summary_service_shmem_startup(void)
@@ -398,6 +418,20 @@ static int
 fb_summary_service_recent_rank_for_index(int candidate_index, int candidate_count)
 {
 	return candidate_count - candidate_index;
+}
+
+static int
+fb_summary_service_recent_rank_for_segno(XLogSegNo newest_segno, XLogSegNo segno)
+{
+	uint64 rank;
+
+	if (newest_segno < segno)
+		return INT_MAX;
+
+	rank = (uint64) (newest_segno - segno) + 1;
+	if (rank > (uint64) INT_MAX)
+		return INT_MAX;
+	return (int) rank;
 }
 
 static int
@@ -1022,7 +1056,6 @@ fb_summary_service_run_cleanup(void)
 		entries[entry_count].mtime_nsec = st.st_mtimespec.tv_nsec;
 #else
 		entries[entry_count].mtime_nsec = st.st_mtim.tv_nsec;
-#endif
 		entry_count++;
 	}
 	FreeDir(dir);
@@ -1064,7 +1097,8 @@ fb_summary_service_run_cleanup(void)
 }
 
 static void
-fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats)
+fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats,
+									bool prefer_debug_state)
 {
 	FbSummaryBuildCandidate *candidates = NULL;
 	bool *summary_exists = NULL;
@@ -1077,17 +1111,78 @@ fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats)
 	int filtered_count = 0;
 	int filtered_index = 0;
 	int i;
+	FbSummaryDaemonState external_state;
+	FbSummaryDaemonState external_debug_state;
+	FbSummaryQueryHint hint_state;
+	bool external_state_loaded;
+	bool external_debug_loaded;
+	bool use_external_state;
+	bool use_external_debug_state;
+	bool hint_loaded;
+	bool authoritative_snapshot;
 
 	MemSet(stats, 0, sizeof(*stats));
-	stats->service_enabled = fb_summary_service_enabled();
-	stats->queue_capacity = fb_summary_service_queue_size();
-	stats->registered_workers = fb_summary_service_registered_workers();
-	stats->hot_window = fb_summary_service_hot_window();
+	external_state_loaded = fb_summary_state_load(&external_state);
+	external_debug_loaded = fb_summary_debug_state_load(&external_debug_state);
+	use_external_state =
+		external_state_loaded &&
+		(!external_state.stale || fb_summary_service == NULL);
+	use_external_debug_state =
+		external_debug_loaded &&
+		(!external_debug_state.stale || fb_summary_service == NULL);
+	hint_loaded = fb_summary_query_hint_load(&hint_state);
+	if (prefer_debug_state && use_external_debug_state)
+		external_state = external_debug_state;
+	else if (!use_external_state && use_external_debug_state)
+		external_state = external_debug_state;
+	if (prefer_debug_state)
+		external_state_loaded = use_external_debug_state || use_external_state;
+	else if (!use_external_state && use_external_debug_state)
+		external_state_loaded = true;
+	else
+		external_state_loaded = use_external_state;
+	authoritative_snapshot = external_state_loaded;
+
+	stats->service_enabled = external_state_loaded && external_state.service_enabled;
+	stats->queue_capacity = external_state_loaded ? external_state.queue_capacity : 0;
+	stats->registered_workers =
+		external_state_loaded ? external_state.registered_workers : 0;
+	stats->active_workers = external_state_loaded ? external_state.active_workers : 0;
+	stats->hot_window = external_state_loaded ? external_state.hot_window : 0;
+	stats->pending_hot = external_state_loaded ? external_state.pending_hot : 0;
+	stats->pending_cold = external_state_loaded ? external_state.pending_cold : 0;
+	stats->running_hot = external_state_loaded ? external_state.running_hot : 0;
+	stats->running_cold = external_state_loaded ? external_state.running_cold : 0;
+	stats->snapshot_timeline_id =
+		external_state_loaded ? external_state.snapshot_timeline_id : 0;
+	stats->snapshot_oldest_segno =
+		external_state_loaded ? external_state.snapshot_oldest_segno : 0;
+	stats->snapshot_newest_segno =
+		external_state_loaded ? external_state.snapshot_newest_segno : 0;
+	stats->snapshot_hot_candidates =
+		external_state_loaded ? external_state.snapshot_hot_candidates : 0;
+	stats->snapshot_cold_candidates =
+		external_state_loaded ? external_state.snapshot_cold_candidates : 0;
+	stats->scan_count = external_state_loaded ? external_state.scan_count : 0;
+	stats->enqueue_count = external_state_loaded ? external_state.enqueue_count : 0;
+	stats->build_count = external_state_loaded ? external_state.build_count : 0;
+	stats->cleanup_count = external_state_loaded ? external_state.cleanup_count : 0;
+	stats->launcher_pid = external_state_loaded ? external_state.daemon_pid : 0;
+	stats->last_scan_at = external_state_loaded ? external_state.last_scan_at : 0;
+	stats->throughput_window_started_at =
+		external_state_loaded ? external_state.throughput_window_started_at : 0;
+	stats->last_build_at = external_state_loaded ? external_state.last_build_at : 0;
+	stats->throughput_window_builds =
+		external_state_loaded ? external_state.throughput_window_builds : 0;
 	stats->summary_bytes = fb_summary_meta_summary_size_bytes(&stats->summary_files);
 
-	if (fb_summary_service != NULL)
+	if (!external_state_loaded && fb_summary_service != NULL)
 	{
 		LWLockAcquire(fb_summary_service_lock, LW_SHARED);
+			stats->service_enabled = fb_summary_service_enabled();
+			stats->queue_capacity = fb_summary_service->queue_capacity;
+			stats->registered_workers = fb_summary_service_registered_workers();
+			stats->hot_window = fb_summary_service_hot_window();
 			stats->queue_capacity = fb_summary_service->queue_capacity;
 			stats->launcher_pid = fb_summary_service->launcher_pid;
 			snapshot_valid = fb_summary_service->snapshot_valid;
@@ -1149,12 +1244,28 @@ fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats)
 		}
 		LWLockRelease(fb_summary_service_lock);
 	}
+	else
+	{
+		snapshot_valid = (stats->snapshot_timeline_id != 0 &&
+						  stats->snapshot_oldest_segno != 0 &&
+						  stats->snapshot_newest_segno != 0);
+	}
+	if (hint_loaded)
+	{
+		stats->last_query_observed_at = hint_state.observed_at;
+		stats->last_query_summary_span_fallback_segments =
+			hint_state.summary_span_fallback_segments;
+		stats->last_query_metadata_fallback_segments =
+			hint_state.metadata_fallback_segments;
+	}
 	stats->last_query_summary_ready =
 		(stats->last_query_observed_at != 0 &&
 		 stats->last_query_summary_span_fallback_segments == 0 &&
 		 stats->last_query_metadata_fallback_segments == 0);
 
 	candidate_count = fb_summary_collect_build_candidates(&candidates, false);
+	if (stats->hot_window <= 0)
+		stats->hot_window = fb_summary_service_hot_window();
 	use_snapshot_filter = snapshot_valid;
 	for (i = 0; i < candidate_count; i++)
 	{
@@ -1168,7 +1279,10 @@ fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats)
 		}
 		filtered_count++;
 	}
-	if (use_snapshot_filter && filtered_count == 0 && candidate_count > 0)
+	if (use_snapshot_filter &&
+		!authoritative_snapshot &&
+		filtered_count == 0 &&
+		candidate_count > 0)
 	{
 		use_snapshot_filter = false;
 		filtered_count = candidate_count;
@@ -1180,12 +1294,28 @@ fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats)
 		newest_xact_ts = palloc0(sizeof(TimestampTz) * filtered_count);
 		filtered_segnos = palloc0(sizeof(XLogSegNo) * filtered_count);
 	}
-	if (use_snapshot_filter)
-		stats->snapshot_hot_candidates = Min(stats->snapshot_hot_candidates, filtered_count);
+	if (use_snapshot_filter && authoritative_snapshot)
+	{
+		if (stats->snapshot_oldest_segno <= stats->snapshot_newest_segno)
+			stats->stable_candidates =
+				(uint64) (stats->snapshot_newest_segno - stats->snapshot_oldest_segno) + 1;
+		if (stats->snapshot_hot_candidates <= 0)
+			stats->snapshot_hot_candidates =
+				Min(stats->hot_window, (int) Min(stats->stable_candidates, (uint64) INT_MAX));
+		else if ((uint64) stats->snapshot_hot_candidates > stats->stable_candidates)
+			stats->snapshot_hot_candidates =
+				(int) Min(stats->stable_candidates, (uint64) INT_MAX);
+		stats->snapshot_cold_candidates =
+			(int) Min((stats->stable_candidates > (uint64) stats->snapshot_hot_candidates) ?
+					  (stats->stable_candidates - (uint64) stats->snapshot_hot_candidates) : 0,
+					  (uint64) INT_MAX);
+	}
 	else
+	{
 		stats->snapshot_hot_candidates = Min(stats->hot_window, filtered_count);
-	stats->snapshot_cold_candidates =
-		Max(0, filtered_count - stats->snapshot_hot_candidates);
+		stats->snapshot_cold_candidates =
+			Max(0, filtered_count - stats->snapshot_hot_candidates);
+	}
 	for (i = 0; i < candidate_count; i++)
 	{
 		int recent_rank;
@@ -1200,10 +1330,13 @@ fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats)
 				continue;
 		}
 
-		recent_rank = fb_summary_service_recent_rank_for_index(filtered_index, filtered_count);
-		queue_kind = (recent_rank <= stats->snapshot_hot_candidates) ?
-			FB_SUMMARY_SERVICE_QUEUE_HOT :
-			FB_SUMMARY_SERVICE_QUEUE_COLD;
+		if (use_snapshot_filter && authoritative_snapshot)
+			recent_rank = fb_summary_service_recent_rank_for_segno(stats->snapshot_newest_segno,
+																   candidates[i].segno);
+		else
+			recent_rank = fb_summary_service_recent_rank_for_index(filtered_index, filtered_count);
+		queue_kind = fb_summary_service_queue_kind_for_rank(recent_rank,
+															 stats->snapshot_hot_candidates);
 		filtered_segnos[filtered_index] = candidates[i].segno;
 		summary_exists[filtered_index] =
 			fb_summary_candidate_time_bounds(&candidates[i],
@@ -1221,7 +1354,12 @@ fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats)
 		}
 		filtered_index++;
 	}
-	if (filtered_count > 0)
+	if (snapshot_valid && authoritative_snapshot)
+	{
+		stats->visible_oldest_segno = stats->snapshot_oldest_segno;
+		stats->visible_newest_segno = stats->snapshot_newest_segno;
+	}
+	else if (filtered_count > 0)
 	{
 		stats->visible_oldest_segno = filtered_segnos[0];
 		stats->visible_newest_segno = filtered_segnos[filtered_count - 1];
@@ -1244,54 +1382,95 @@ fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats)
 			break;
 		}
 	}
-	for (i = filtered_count - 1; i >= 0; i--)
+	if (snapshot_valid && authoritative_snapshot && filtered_count == 0)
 	{
-		if (i + 1 < filtered_count &&
-			filtered_segnos[i] + 1 < filtered_segnos[i + 1])
-		{
-			stats->first_gap_from_newest_segno = filtered_segnos[i + 1] - 1;
-			if (oldest_xact_ts[i + 1] != 0)
-				stats->first_gap_from_newest_ts = oldest_xact_ts[i + 1];
-			break;
-		}
-		if (!summary_exists[i])
-		{
-			stats->first_gap_from_newest_segno = filtered_segnos[i];
-			if (i + 1 < filtered_count && oldest_xact_ts[i + 1] != 0)
-				stats->first_gap_from_newest_ts = oldest_xact_ts[i + 1];
-			break;
-		}
-		if (oldest_xact_ts[i] != 0 &&
-			(stats->near_contiguous_through_ts == 0 ||
-			 oldest_xact_ts[i] < stats->near_contiguous_through_ts))
-				stats->near_contiguous_through_ts = oldest_xact_ts[i];
+		fb_summary_service_add_missing_range(stats,
+											 stats->snapshot_oldest_segno,
+											 stats->snapshot_newest_segno);
+		stats->first_gap_from_newest_segno = stats->snapshot_newest_segno;
+		stats->first_gap_from_oldest_segno = stats->snapshot_oldest_segno;
 	}
-	for (i = 0; i < filtered_count; i++)
+	else
 	{
-		if (i > 0 && filtered_segnos[i - 1] + 1 < filtered_segnos[i])
+		if (snapshot_valid && authoritative_snapshot && filtered_count > 0)
 		{
-			stats->first_gap_from_oldest_segno = filtered_segnos[i - 1] + 1;
-			if (newest_xact_ts[i - 1] != 0)
-				stats->first_gap_from_oldest_ts = newest_xact_ts[i - 1];
-			break;
+			fb_summary_service_add_missing_range(stats,
+												 stats->snapshot_oldest_segno,
+												 filtered_segnos[0] - 1);
+			fb_summary_service_add_missing_range(stats,
+												 filtered_segnos[filtered_count - 1] + 1,
+												 stats->snapshot_newest_segno);
 		}
-		if (!summary_exists[i])
+		for (i = 1; i < filtered_count; i++)
 		{
-			stats->first_gap_from_oldest_segno = filtered_segnos[i];
-			if (i > 0 && newest_xact_ts[i - 1] != 0)
-				stats->first_gap_from_oldest_ts = newest_xact_ts[i - 1];
-			break;
+			if (filtered_segnos[i - 1] + 1 < filtered_segnos[i])
+				fb_summary_service_add_missing_range(stats,
+													 filtered_segnos[i - 1] + 1,
+													 filtered_segnos[i] - 1);
 		}
-		if (newest_xact_ts[i] != 0 &&
-			(stats->far_contiguous_until_ts == 0 ||
-			 newest_xact_ts[i] > stats->far_contiguous_until_ts))
-			stats->far_contiguous_until_ts = newest_xact_ts[i];
-	}
-	for (i = 1; i < filtered_count; i++)
-	{
-		if (filtered_segnos[i - 1] + 1 < filtered_segnos[i])
-			stats->missing_summaries +=
-				(uint64) (filtered_segnos[i] - filtered_segnos[i - 1] - 1);
+		if (snapshot_valid &&
+			authoritative_snapshot &&
+			filtered_count > 0 &&
+			filtered_segnos[filtered_count - 1] < stats->snapshot_newest_segno)
+		{
+			stats->first_gap_from_newest_segno = stats->snapshot_newest_segno;
+		}
+		else
+		{
+			for (i = filtered_count - 1; i >= 0; i--)
+			{
+				if (i + 1 < filtered_count &&
+					filtered_segnos[i] + 1 < filtered_segnos[i + 1])
+				{
+					stats->first_gap_from_newest_segno = filtered_segnos[i + 1] - 1;
+					if (oldest_xact_ts[i + 1] != 0)
+						stats->first_gap_from_newest_ts = oldest_xact_ts[i + 1];
+					break;
+				}
+				if (!summary_exists[i])
+				{
+					stats->first_gap_from_newest_segno = filtered_segnos[i];
+					if (i + 1 < filtered_count && oldest_xact_ts[i + 1] != 0)
+						stats->first_gap_from_newest_ts = oldest_xact_ts[i + 1];
+					break;
+				}
+				if (oldest_xact_ts[i] != 0 &&
+					(stats->near_contiguous_through_ts == 0 ||
+					 oldest_xact_ts[i] < stats->near_contiguous_through_ts))
+					stats->near_contiguous_through_ts = oldest_xact_ts[i];
+			}
+		}
+		if (snapshot_valid &&
+			authoritative_snapshot &&
+			filtered_count > 0 &&
+			stats->snapshot_oldest_segno < filtered_segnos[0])
+		{
+			stats->first_gap_from_oldest_segno = stats->snapshot_oldest_segno;
+		}
+		else
+		{
+			for (i = 0; i < filtered_count; i++)
+			{
+				if (i > 0 && filtered_segnos[i - 1] + 1 < filtered_segnos[i])
+				{
+					stats->first_gap_from_oldest_segno = filtered_segnos[i - 1] + 1;
+					if (newest_xact_ts[i - 1] != 0)
+						stats->first_gap_from_oldest_ts = newest_xact_ts[i - 1];
+					break;
+				}
+				if (!summary_exists[i])
+				{
+					stats->first_gap_from_oldest_segno = filtered_segnos[i];
+					if (i > 0 && newest_xact_ts[i - 1] != 0)
+						stats->first_gap_from_oldest_ts = newest_xact_ts[i - 1];
+					break;
+				}
+				if (newest_xact_ts[i] != 0 &&
+					(stats->far_contiguous_until_ts == 0 ||
+					 newest_xact_ts[i] > stats->far_contiguous_until_ts))
+					stats->far_contiguous_until_ts = newest_xact_ts[i];
+			}
+		}
 	}
 	if (summary_exists != NULL)
 		pfree(summary_exists);
@@ -1375,6 +1554,40 @@ fb_summary_service_candidate_in_snapshot(bool snapshot_valid,
 		candidate->segno > snapshot_newest_segno)
 		return false;
 	return true;
+}
+
+static void
+fb_summary_service_add_missing_range(FbSummaryServiceProgressStats *stats,
+									 XLogSegNo start_segno,
+									 XLogSegNo end_segno)
+{
+	uint64 missing_count;
+	uint64 hot_count = 0;
+	XLogSegNo hot_start_segno;
+
+	if (stats == NULL || start_segno == 0 || end_segno < start_segno)
+		return;
+
+	missing_count = (uint64) (end_segno - start_segno) + 1;
+	stats->missing_summaries += missing_count;
+
+	if (stats->snapshot_hot_candidates <= 0 || stats->visible_newest_segno == 0)
+	{
+		stats->cold_missing_summaries += missing_count;
+		return;
+	}
+
+	hot_start_segno =
+		stats->visible_newest_segno - (XLogSegNo) (stats->snapshot_hot_candidates - 1);
+	if (end_segno >= hot_start_segno)
+	{
+		XLogSegNo hot_range_start = Max(start_segno, hot_start_segno);
+
+		hot_count = (uint64) (end_segno - hot_range_start) + 1;
+	}
+
+	stats->hot_missing_summaries += hot_count;
+	stats->cold_missing_summaries += (missing_count - hot_count);
 }
 
 static bool
@@ -1674,7 +1887,7 @@ fb_summary_progress_internal(PG_FUNCTION_ARGS)
 	tupdesc = BlessTupleDesc(tupdesc);
 	MemSet(nulls, 0, sizeof(nulls));
 
-	fb_summary_service_collect_progress(&stats);
+	fb_summary_service_collect_progress(&stats, false);
 	if (stats.stable_candidates == 0)
 		progress_pct = 100.0;
 	else
@@ -1771,7 +1984,7 @@ fb_summary_service_debug_internal(PG_FUNCTION_ARGS)
 	tupdesc = BlessTupleDesc(tupdesc);
 	MemSet(nulls, 0, sizeof(nulls));
 
-	fb_summary_service_collect_progress(&stats);
+	fb_summary_service_collect_progress(&stats, true);
 
 	values[0] = BoolGetDatum(stats.service_enabled);
 	if (stats.launcher_pid == 0)
@@ -2196,3 +2409,5 @@ fb_summary_cleanup_plan_debug(PG_FUNCTION_ARGS)
 	}
 	SRF_RETURN_DONE(funcctx);
 }
+
+#endif

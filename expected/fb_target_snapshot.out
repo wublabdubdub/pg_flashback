@@ -1,0 +1,53 @@
+DO $$
+BEGIN
+	IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_flashback') THEN
+		EXECUTE 'DROP EXTENSION pg_flashback CASCADE';
+	END IF;
+END;
+$$;
+CREATE EXTENSION pg_flashback;
+SET pg_flashback.show_progress = off;
+DO $$
+BEGIN
+	EXECUTE format('SET pg_flashback.archive_dir = %L', current_setting('data_directory') || '/pg_wal');
+END;
+$$;
+CREATE TABLE fb_target_snapshot_target (
+	id integer PRIMARY KEY,
+	payload text NOT NULL
+);
+INSERT INTO fb_target_snapshot_target VALUES (1, 'alpha');
+CHECKPOINT;
+\setenv PGDATABASE :DBNAME
+\setenv PGPORT :PORT
+\setenv PGUSER :USER
+\setenv PGHOST :HOST
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT txid_current_snapshot()::text AS fb_snapshot \gset
+\! psql -X -v ON_ERROR_STOP=1 -qAt -c "UPDATE fb_target_snapshot_target SET payload = 'beta' WHERE id = 1" > /tmp/fb_target_snapshot_update.log 2>&1
+SELECT clock_timestamp()::text AS fb_target_ts \gset
+COMMIT;
+SELECT id, payload FROM fb_target_snapshot_target ORDER BY 1;
+ id | payload 
+----+---------
+  1 | beta
+(1 row)
+
+SELECT set_config('pg_flashback.target_snapshot', :'fb_snapshot', false) = :'fb_snapshot' AS snapshot_applied;
+ snapshot_applied 
+------------------
+ t
+(1 row)
+
+SELECT id, payload
+FROM pg_flashback(
+	NULL::public.fb_target_snapshot_target,
+	:'fb_target_ts'
+)
+ORDER BY 1;
+ id | payload 
+----+---------
+  1 | alpha
+(1 row)
+
+RESET pg_flashback.target_snapshot;

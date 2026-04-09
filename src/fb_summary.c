@@ -2823,7 +2823,7 @@ fb_summary_build_file_for_segment(const FbSummarySegmentEntry *entry,
 				 errmsg("out of memory"),
 				 errdetail("Failed while allocating a summary WAL reader.")));
 
-	first_record = XLogFindNextRecord(reader, start_lsn);
+	first_record = fb_xlog_find_next_record_compat(reader, start_lsn);
 	if (!XLogRecPtrIsInvalid(first_record))
 	{
 		char *errormsg = NULL;

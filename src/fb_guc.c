@@ -18,6 +18,7 @@
 #include "utils/elog.h"
 #include "utils/guc.h"
 
+#include "fb_compat.h"
 #include "fb_guc.h"
 #include "fb_custom_scan.h"
 #include "fb_runtime.h"
@@ -125,7 +126,7 @@ _PG_init(void)
 
 	DefineCustomStringVariable("pg_flashback.target_snapshot",
 							   "Optional MVCC snapshot text used to refine target visibility.",
-							   "When set to txid_current_snapshot() text, pg_flashback treats XIDs listed as in-progress at the target as after-target even if their WAL commit timestamp sorts earlier.",
+							   "When set to txid_current_snapshot() text, pg_flashback treats target-invisible XIDs as after-target, including both in-progress XIDs from the snapshot xip list and later XIDs at or beyond snapshot xmax.",
 							   &fb_target_snapshot,
 							   NULL,
 							   PGC_USERSET,
@@ -273,7 +274,7 @@ _PG_init(void)
 	 * Deferring this call preserves placeholders the user set before the
 	 * module was loaded and lets DefineCustom* adopt their values.
 	 */
-	MarkGUCPrefixReserved("pg_flashback");
+	fb_mark_guc_prefix_reserved("pg_flashback");
 
 	fb_runtime_ensure_initialized();
 	fb_custom_scan_init();
@@ -746,7 +747,7 @@ fb_memory_limit_canonical_text(uint64 kb)
 	text = psprintf("%llu%s",
 					(unsigned long long) value,
 					unit);
-	result = guc_strdup(ERROR, text);
+	result = fb_guc_strdup_compat(text);
 	pfree(text);
 	return result;
 }
@@ -768,10 +769,13 @@ fb_spill_mode_check_hook(char **newval, void **extra, GucSource source)
 		return false;
 	}
 
-	guc_free(*newval);
-	*newval = guc_strdup(ERROR, canonical);
+	/*
+	 * Older PostgreSQL branches may pass boot/default strings here, which are
+	 * not guaranteed to be guc_malloc()/malloc() allocations.
+	 */
+	*newval = fb_guc_strdup_compat(canonical);
 
-	result = (FbSpillModeParseResult *) guc_malloc(ERROR, sizeof(*result));
+	result = (FbSpillModeParseResult *) fb_guc_malloc_compat(sizeof(*result));
 	result->mode = mode;
 	*extra = result;
 	return true;
@@ -818,10 +822,13 @@ fb_memory_limit_check_hook(char **newval, void **extra, GucSource source)
 	}
 
 	canonical = fb_memory_limit_canonical_text(parsed_kb);
-	guc_free(*newval);
+	/*
+	 * Older PostgreSQL branches may pass boot/default strings here, which are
+	 * not guaranteed to be guc_malloc()/malloc() allocations.
+	 */
 	*newval = canonical;
 
-	result = (FbMemoryLimitParseResult *) guc_malloc(ERROR, sizeof(*result));
+	result = (FbMemoryLimitParseResult *) fb_guc_malloc_compat(sizeof(*result));
 	result->kb = parsed_kb;
 	*extra = result;
 	return true;

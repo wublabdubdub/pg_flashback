@@ -1,0 +1,5 @@
+# pg_flashback-summaryd sample configuration
+pgdata=/var/lib/postgresql/data
+archive_dest=/var/lib/postgresql/archive
+interval_ms=1000
+foreground=false

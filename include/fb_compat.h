@@ -6,7 +6,10 @@
 #ifndef FB_COMPAT_H
 #define FB_COMPAT_H
 
+#include "miscadmin.h"
+#include "access/genam.h"
 #include "access/xlogreader.h"
+#include "storage/shm_mq.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "storage/relfilelocator.h"
@@ -95,8 +98,21 @@ fb_xlogrec_get_block_tag(XLogReaderState *reader,
 #define FB_XLH_INSERT_ALL_FROZEN_SET 0
 #endif
 
-#if PG_VERSION_NUM < 130000
-extern XLogRecPtr XLogFindNextRecord(XLogReaderState *state, XLogRecPtr RecPtr);
-#endif
+void fb_mark_guc_prefix_reserved(const char *class_name);
+void *fb_guc_malloc_compat(size_t size);
+char *fb_guc_strdup_compat(const char *src);
+void fb_guc_free_compat(void *ptr);
+int fb_mkdir_p_compat(const char *path, int omode);
+XLogRecPtr fb_xlog_find_next_record_compat(XLogReaderState *state,
+										   XLogRecPtr recptr);
+IndexScanDesc fb_index_beginscan_compat(Relation heap_relation,
+										Relation index_relation,
+										Snapshot snapshot,
+										int nkeys,
+										int norderbys);
+shm_mq_result fb_shm_mq_send_compat(shm_mq_handle *mqh,
+									Size nbytes,
+									const void *data,
+									bool nowait);
 
 #endif

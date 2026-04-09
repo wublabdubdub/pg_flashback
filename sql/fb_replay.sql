@@ -68,6 +68,9 @@ BEGIN
 	IF to_regprocedure('fb_replay_prune_lookahead_snapshot_isolation_debug()') IS NOT NULL THEN
 		EXECUTE 'DROP FUNCTION fb_replay_prune_lookahead_snapshot_isolation_debug()';
 	END IF;
+	IF to_regprocedure('fb_replay_prune_releases_space_debug()') IS NOT NULL THEN
+		EXECUTE 'DROP FUNCTION fb_replay_prune_releases_space_debug()';
+	END IF;
 END;
 $$;
 
@@ -157,6 +160,11 @@ RETURNS text
 AS '$libdir/pg_flashback', 'fb_replay_prune_lookahead_snapshot_isolation_debug'
 LANGUAGE C;
 
+CREATE FUNCTION fb_replay_prune_releases_space_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_replay_prune_releases_space_debug'
+LANGUAGE C;
+
 SELECT fb_replay_apply_image_contract_debug() AS apply_image_contract
 \gset
 
@@ -227,6 +235,11 @@ SELECT fb_replay_prune_lookahead_snapshot_isolation_debug() AS prune_lookahead_s
 \gset
 
 SELECT :'prune_lookahead_snapshot_isolation_contract' LIKE '%prune_lookahead_snapshot_isolated=true%' AS prune_lookahead_snapshot_isolated;
+
+SELECT fb_replay_prune_releases_space_debug() AS prune_releases_space_contract
+\gset
+
+SELECT :'prune_releases_space_contract' LIKE '%prune_releases_space=true%' AS prune_releases_space;
 
 DROP TABLE IF EXISTS fb_replay_target;
 DROP TABLE IF EXISTS fb_replay_mark;

@@ -39,6 +39,9 @@ make PG_CONFIG=/path/to/pg_config
 make PG_CONFIG=/path/to/pg_config install
 ```
 
+当前顶层构建也会同时安装独立可执行文件 `pg_flashback-summaryd`
+到 PostgreSQL `bindir`，作为库外 summary daemon 形态的统一交付入口。
+
 然后在数据库里创建或升级扩展：
 
 ```sql
@@ -49,10 +52,45 @@ CREATE EXTENSION pg_flashback;
 ALTER EXTENSION pg_flashback UPDATE TO '0.2.0';
 ```
 
-至少配置一个可读的 WAL 归档目录：
+如果你要在“不重启 PostgreSQL”的前提下获得完整 summary 体验，
+当前可用方式是启动独立 daemon。
+
+当前实现注意点：
+
+- `pg_flashback-summaryd` 目前仍通过 libpq 连接扩展内部 debug helper
+  触发 build / cleanup
+- 因此当前启动时应显式提供 `--conninfo`
+- 如果不写 `--conninfo`，daemon 会退回 libpq 默认连接参数，
+  很容易因为默认 `dbname/user` 不匹配而启动失败
+
+推荐直接按完整参数启动：
+
+```bash
+pg_flashback-summaryd \
+  --pgdata /path/to/pgdata \
+  --archive-dest /path/to/archive \
+  --conninfo "host=/tmp port=5432 dbname=postgres user=postgres connect_timeout=2" \
+  --foreground
+```
+
+也可以改成配置文件方式，但 sample config 中同样应写入 `conninfo=...`。
+
+WAL 来源建议：
+
+- 若本机 `archive_command` 属于当前支持的本地模式，可依赖 autodiscovery
+- 若归档路径复杂、远程或想避免歧义，显式设置 `pg_flashback.archive_dest`
+
+例如：
 
 ```sql
 SET pg_flashback.archive_dest = '/path/to/archive';
+```
+
+启动后先确认 summary 服务状态面已经可见：
+
+```sql
+SELECT *
+FROM pg_flashback_summary_progress;
 ```
 
 建议先检查目标表是否受支持：
@@ -120,12 +158,18 @@ SET pg_flashback.parallel_workers = 4;
 
 使用前需要满足这些条件：
 
-- PostgreSQL `12-18`
+- PostgreSQL `14-18`
 - `full_page_writes = on`
 - 目标时间窗所需 WAL 必须完整可读
 - 归档目录必须覆盖目标时间窗
 - 目标对象必须是普通持久化 heap 表
 - 除此以外无其他任何附加条件
+
+如果使用库外 summary daemon，当前额外需要：
+
+- `pg_flashback-summaryd` 进程能访问 `PGDATA`
+- 显式提供可用的 `--conninfo`
+- 可读的 archive 路径，通常与 `pg_flashback.archive_dest` 一致
 
 当前这些场景不在支持范围内：
 
@@ -180,6 +224,10 @@ make PG_CONFIG=/path/to/pg_config
 make PG_CONFIG=/path/to/pg_config install
 ```
 
+The top-level build also installs a standalone executable,
+`pg_flashback-summaryd`, into PostgreSQL's `bindir` as the delivery entry point
+for the external summary-daemon mode.
+
 Create or upgrade the extension in the database:
 
 ```sql
@@ -190,10 +238,48 @@ CREATE EXTENSION pg_flashback;
 ALTER EXTENSION pg_flashback UPDATE TO '0.2.0';
 ```
 
-Configure at least one readable WAL archive directory:
+To get the full summary experience without restarting PostgreSQL, use the
+standalone daemon.
+
+Current implementation notes:
+
+- `pg_flashback-summaryd` still connects through libpq and reuses
+  extension-exposed debug helpers for build / cleanup
+- because of that, you should currently pass `--conninfo` explicitly
+- if `--conninfo` is omitted, libpq defaults may choose the wrong
+  `dbname/user`, which often makes startup fail
+
+Recommended full command:
+
+```bash
+pg_flashback-summaryd \
+  --pgdata /path/to/pgdata \
+  --archive-dest /path/to/archive \
+  --conninfo "host=/tmp port=5432 dbname=postgres user=postgres connect_timeout=2" \
+  --foreground
+```
+
+You can also use `--config`, but the config file should still include
+`conninfo=...` in the current implementation.
+
+WAL source guidance:
+
+- if your local `archive_command` matches one of the supported local patterns,
+  autodiscovery can be enough
+- if the archive path is complex, remote, or you want deterministic behavior,
+  set `pg_flashback.archive_dest` explicitly
+
+For example:
 
 ```sql
 SET pg_flashback.archive_dest = '/path/to/archive';
+```
+
+After startup, verify that the summary status surface is visible:
+
+```sql
+SELECT *
+FROM pg_flashback_summary_progress;
 ```
 
 It is recommended to check that the target table is supported:
@@ -263,12 +349,19 @@ SET pg_flashback.parallel_workers = 4;
 
 Before using it, make sure the following conditions are true:
 
-- PostgreSQL `12-18`
+- PostgreSQL `14-18`
 - `full_page_writes = on`
 - the WAL required by the target time window is complete and readable
 - the archive directory covers the target time window
 - the target object is a regular persistent heap table
 - there are no additional prerequisites beyond the items above
+
+If you use the external summary daemon, the current implementation also needs:
+
+- a `pg_flashback-summaryd` process that can access `PGDATA`
+- an explicit working `--conninfo`
+- a readable archive path, usually the same path used by
+  `pg_flashback.archive_dest`
 
 The following are currently unsupported:
 

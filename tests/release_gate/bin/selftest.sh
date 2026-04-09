@@ -15,7 +15,6 @@ EVAL_SH="$REPO_ROOT/tests/release_gate/bin/evaluate_gate.sh"
 REPORT_SH="$REPO_ROOT/tests/release_gate/bin/render_report.sh"
 CONFIG_DIR="$REPO_ROOT/tests/release_gate/config"
 TEMPLATE_DIR="$REPO_ROOT/tests/release_gate/templates"
-GOLDEN_DIR="$REPO_ROOT/tests/release_gate/golden"
 SQL_DIR="$REPO_ROOT/tests/release_gate/sql"
 
 fail() {
@@ -69,24 +68,27 @@ bash -n "$COMMON_SH" "$RUN_SH" "$PREPARE_SH" "$SIM_SH" "$LOAD_SH" "$PRESSURE_SH"
 # shellcheck disable=SC1090
 source "$COMMON_SH"
 
+test_major=14
+test_port=5432
+test_pguser=14pg
+
 for major in 14 15 16 17 18; do
-	expected="/walstorage/${major}waldata"
+	expected="$(readlink -f "/home/${major}pg/wal_arch" 2>/dev/null || printf '/walstorage/%swaldata\n' "$major")"
 	actual="$(fb_release_gate_archive_dir_from_major "$major")"
 	[[ "$actual" == "$expected" ]] || fail "archive dir mismatch for PG${major}: $actual"
 done
 
-archive_cmd='cp %p /home/18pg/wal_arch/%f'
-fb_release_gate_archive_command_matches_dir "$archive_cmd" "/walstorage/18waldata" || \
-	fail "symlink-equivalent archive_command should match /walstorage/18waldata"
+archive_cmd='cp %p /home/14pg/wal_arch/%f'
+fb_release_gate_archive_command_matches_dir "$archive_cmd" "/isoTest/14waldata" || \
+	fail "symlink-equivalent archive_command should match /isoTest/14waldata"
 
 archive_cmd='cp %p /tmp/not-release-gate/%f'
-if fb_release_gate_archive_command_matches_dir "$archive_cmd" "/walstorage/18waldata"; then
-	fail "wrong archive target should not match /walstorage/18waldata"
+if fb_release_gate_archive_command_matches_dir "$archive_cmd" "/isoTest/14waldata"; then
+	fail "wrong archive target should not match /isoTest/14waldata"
 fi
 
 [[ -f "$CONFIG_DIR/release_gate.conf" ]] || fail "missing release_gate.conf"
 [[ -f "$CONFIG_DIR/scenario_matrix.json" ]] || fail "missing scenario_matrix.json"
-[[ -f "$CONFIG_DIR/thresholds.json" ]] || fail "missing thresholds.json"
 [[ -f "$TEMPLATE_DIR/report.md.tpl" ]] || fail "missing report template"
 [[ -f "$SQL_DIR/recreate_alldb.sql" ]] || fail "missing recreate_alldb.sql"
 [[ -f "$SQL_DIR/table_size_summary.sql" ]] || fail "missing table_size_summary.sql"
@@ -96,13 +98,7 @@ fi
 [[ -f "$SQL_DIR/drop_flashback_ctas.sql" ]] || fail "missing drop_flashback_ctas.sql"
 
 jq empty \
-	"$CONFIG_DIR/scenario_matrix.json" \
-	"$CONFIG_DIR/thresholds.json" \
-	"$GOLDEN_DIR/pg14.json" \
-	"$GOLDEN_DIR/pg15.json" \
-	"$GOLDEN_DIR/pg16.json" \
-	"$GOLDEN_DIR/pg17.json" \
-	"$GOLDEN_DIR/pg18.json" >/dev/null
+	"$CONFIG_DIR/scenario_matrix.json" >/dev/null
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -112,26 +108,17 @@ mkdir -p "$render_output_dir/json" "$render_output_dir/reports"
 
 cat > "$render_output_dir/json/gate_evaluation.json" <<'EOF'
 {
-  "pg_major": "18",
-  "verdict": "INCOMPLETE",
-  "golden_file": "/tmp/fake-golden.json",
+  "pg_major": "14",
+  "verdict": "FAIL",
   "summary": {
     "total": 3,
     "correctness_passed": 2,
     "correctness_failures": 1,
-    "correctness_infra_failures": 0,
-    "performance_failures": 0,
-    "performance_regressions": 0,
-    "performance_infra_failures": 0,
-    "performance_skipped": 1,
-    "performance_missing_baseline": 2
+    "correctness_infra_failures": 0
   },
   "truth_summary": {
     "entries": 2,
     "target_snapshot_entries": 1
-  },
-  "golden_summary": {
-    "entries": 0
   },
   "results": [
     {
@@ -141,20 +128,14 @@ cat > "$render_output_dir/json/gate_evaluation.json" <<'EOF'
       "table_name": "users",
       "target_ts": "2026-04-08 00:38:25.357868+00",
       "path_kind": "query",
-      "baseline_key": "query:random_flashback_1:scenario_oa_50t_50000r.users",
       "correctness_status": "fail",
       "correctness_reason": "row_count or sha256 mismatch",
-      "performance_status": "skipped",
-      "performance_reason": "correctness failed",
       "diff_path": "/tmp/diff_users.diff",
       "result_sha256": "result_users",
       "truth_sha256": "truth_users",
       "result_row_count": 50015,
       "truth_row_count": 50015,
-      "gate_elapsed_ms": 18380,
-      "baseline_elapsed_ms": 0,
-      "ratio_threshold": 0.2,
-      "absolute_threshold_ms": 30000
+      "gate_elapsed_ms": 18380
     },
     {
       "scenario_id": "random_flashback_1",
@@ -163,20 +144,14 @@ cat > "$render_output_dir/json/gate_evaluation.json" <<'EOF'
       "table_name": "documents",
       "target_ts": "2026-04-08 00:38:25.357868+00",
       "path_kind": "query",
-      "baseline_key": "query:random_flashback_1:scenario_oa_50t_50000r.documents",
       "correctness_status": "pass",
       "correctness_reason": "",
-      "performance_status": "missing_baseline",
-      "performance_reason": "missing golden baseline",
       "diff_path": "",
       "result_sha256": "result_documents",
       "truth_sha256": "truth_documents",
       "result_row_count": 1949993,
       "truth_row_count": 1949993,
-      "gate_elapsed_ms": 461652,
-      "baseline_elapsed_ms": 0,
-      "ratio_threshold": 0.2,
-      "absolute_threshold_ms": 30000
+      "gate_elapsed_ms": 461652
     },
     {
       "scenario_id": "copy_to_flashback",
@@ -185,20 +160,14 @@ cat > "$render_output_dir/json/gate_evaluation.json" <<'EOF'
       "table_name": "documents",
       "target_ts": "2026-04-08 00:38:25.357868+00",
       "path_kind": "copy",
-      "baseline_key": "copy:copy_to_flashback:scenario_oa_50t_50000r.documents",
       "correctness_status": "pass",
       "correctness_reason": "",
-      "performance_status": "missing_baseline",
-      "performance_reason": "missing golden baseline",
       "diff_path": "",
       "result_sha256": "result_copy",
       "truth_sha256": "truth_documents",
       "result_row_count": 1949993,
       "truth_row_count": 1949993,
-      "gate_elapsed_ms": 329027,
-      "baseline_elapsed_ms": 0,
-      "ratio_threshold": 0.2,
-      "absolute_threshold_ms": 30000
+      "gate_elapsed_ms": 329027
     }
   ]
 }
@@ -206,9 +175,9 @@ EOF
 
 cat > "$render_output_dir/json/environment.json" <<'EOF'
 {
-  "archive_dir": "/walstorage/18waldata",
+  "archive_dir": "/isoTest/14waldata",
   "archive_mode": "on",
-  "archive_command": "cp %p /walstorage/18waldata/%f"
+  "archive_command": "cp %p /home/14pg/wal_arch/%f"
 }
 EOF
 
@@ -271,7 +240,7 @@ assert_file_contains "$render_output_dir/reports/release_gate_report.md" "## 一
 assert_file_contains "$render_output_dir/reports/release_gate_report.md" "## 测试过程"
 assert_file_contains "$render_output_dir/reports/release_gate_report.md" "## 正确性失败明细"
 assert_file_contains "$render_output_dir/reports/release_gate_report.md" "target_snapshot 覆盖率"
-assert_file_contains "$render_output_dir/reports/release_gate_report.md" "缺少 golden baseline"
+assert_file_contains "$render_output_dir/reports/release_gate_report.md" "单次执行耗时"
 assert_file_contains "$only_log" "render_gate_report"
 assert_file_matches "$only_log" '^\[release_gate\]\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}( [+-][0-9]{4})?\]'
 
@@ -285,11 +254,11 @@ assert_file_contains "$from_to_log" "render_gate_report"
 
 fake_bin_dir="$tmp_dir/fakebin"
 fake_archive_root="$tmp_dir/walstorage"
-fake_archive_dir="$fake_archive_root/18waldata"
+fake_archive_dir="$fake_archive_root/${test_major}waldata"
 mkdir -p "$fake_bin_dir" "$fake_archive_dir"
 cat > "$fake_bin_dir/psql" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' 180000
+printf '%s\n' 140000
 EOF
 chmod +x "$fake_bin_dir/psql"
 touch "$fake_archive_dir/keep.seg"
@@ -334,7 +303,7 @@ prepare_test_sh="$prepare_test_root/bin/prepare_empty_instance.sh"
 prepare_fake_bin_dir="$tmp_dir/prepare_fakebin"
 prepare_log="$tmp_dir/prepare_calls.log"
 prepare_archive_root="$tmp_dir/prepare_walstorage"
-prepare_archive_dir="$prepare_archive_root/18waldata"
+prepare_archive_dir="$prepare_archive_root/${test_major}waldata"
 mkdir -p "$prepare_fake_bin_dir" "$prepare_archive_dir"
 
 cat > "$prepare_fake_bin_dir/psql" <<EOF
@@ -342,7 +311,7 @@ cat > "$prepare_fake_bin_dir/psql" <<EOF
 set -euo pipefail
 printf 'psql %s\n' "\$*" >> "$prepare_log"
 if [[ "\$*" == *"show server_version_num;"* ]]; then
-	printf '%s\n' 180000
+	printf '%s\n' 140000
 	exit 0
 fi
 if [[ "\$*" == *"check_environment.sql"* ]]; then
@@ -372,13 +341,14 @@ chmod +x "$prepare_fake_bin_dir/dropdb"
 prepare_output_dir="$tmp_dir/prepare_output"
 mkdir -p "$prepare_output_dir"
 FB_RELEASE_GATE_OUTPUT_DIR="$prepare_output_dir" \
+FB_RELEASE_GATE_PG_MAJOR="$test_major" \
 FB_RELEASE_GATE_PSQL="$prepare_fake_bin_dir/psql" \
 FB_RELEASE_GATE_CREATEDB="$prepare_fake_bin_dir/createdb" \
 FB_RELEASE_GATE_DROPDB="$prepare_fake_bin_dir/dropdb" \
 FB_RELEASE_GATE_OS_USER="$(id -un)" \
 bash "$prepare_test_sh" >"$tmp_dir/prepare.log" 2>&1 || fail "prepare_empty_instance should succeed with fake commands"
-assert_file_contains "$prepare_log" "createdb -p 5832 -U 18pg alldb"
-assert_file_contains "$prepare_log" "psql -X -v ON_ERROR_STOP=1 -p 5832 -U 18pg -d alldb -Atqc CREATE EXTENSION IF NOT EXISTS pg_flashback;"
+assert_file_contains "$prepare_log" "createdb -p $test_port -U $test_pguser alldb"
+assert_file_contains "$prepare_log" "psql -X -v ON_ERROR_STOP=1 -p $test_port -U $test_pguser -d alldb -Atqc CREATE EXTENSION IF NOT EXISTS pg_flashback;"
 
 cleanup_test_repo="$tmp_dir/cleanup_repo"
 cleanup_test_root="$cleanup_test_repo/tests/release_gate"
@@ -398,7 +368,7 @@ cleanup_prepare_sh="$cleanup_test_root/bin/prepare_empty_instance.sh"
 cleanup_fake_bin_dir="$tmp_dir/cleanup_fakebin"
 cleanup_log="$tmp_dir/cleanup_calls.log"
 cleanup_archive_root="$tmp_dir/cleanup_walstorage"
-cleanup_archive_dir="$cleanup_archive_root/18waldata"
+cleanup_archive_dir="$cleanup_archive_root/${test_major}waldata"
 cleanup_marker="$cleanup_archive_dir/post_prepare.seg"
 mkdir -p "$cleanup_fake_bin_dir" "$cleanup_archive_dir"
 
@@ -407,7 +377,7 @@ cat > "$cleanup_fake_bin_dir/psql" <<EOF
 set -euo pipefail
 printf 'psql %s\n' "\$*" >> "$cleanup_log"
 if [[ "\$*" == *"show server_version_num;"* ]]; then
-	printf '%s\n' 180000
+	printf '%s\n' 140000
 	exit 0
 fi
 if [[ "\$*" == *"check_environment.sql"* ]]; then
@@ -446,6 +416,7 @@ chmod +x "$cleanup_test_root/bin/start_alldbsim.sh"
 cleanup_output_dir="$tmp_dir/cleanup_output"
 mkdir -p "$cleanup_output_dir"
 FB_RELEASE_GATE_OUTPUT_DIR="$cleanup_output_dir" \
+FB_RELEASE_GATE_PG_MAJOR="$test_major" \
 FB_RELEASE_GATE_PSQL="$cleanup_fake_bin_dir/psql" \
 FB_RELEASE_GATE_CREATEDB="$cleanup_fake_bin_dir/createdb" \
 FB_RELEASE_GATE_DROPDB="$cleanup_fake_bin_dir/dropdb" \
@@ -463,7 +434,7 @@ cp -R "$REPO_ROOT/tests/release_gate/templates" "$matrix_test_root/templates"
 matrix_output_dir="$tmp_dir/matrix_output"
 matrix_log="$tmp_dir/matrix_psql.log"
 matrix_archive_root="$tmp_dir/matrix_walstorage"
-matrix_archive_dir="$matrix_archive_root/18waldata"
+matrix_archive_dir="$matrix_archive_root/${test_major}waldata"
 matrix_pgwal_dir="$tmp_dir/matrix_pgwal"
 mkdir -p "$matrix_output_dir/json" "$matrix_archive_dir" "$matrix_pgwal_dir"
 touch \
@@ -493,7 +464,7 @@ cat > "$matrix_fake_bin_dir/psql" <<EOF
 set -euo pipefail
 printf 'PGOPTIONS=%s psql %s\n' "\${PGOPTIONS-}" "\$*" >> "$matrix_log"
 if [[ "\$*" == *"show server_version_num;"* ]]; then
-	printf '%s\n' 180000
+	printf '%s\n' 140000
 	exit 0
 fi
 if [[ "\$*" == *"string_agg(format('%I', a.attname), ', ' order by key_ord.ord)"* ]]; then
@@ -515,6 +486,7 @@ EOF
 chmod +x "$matrix_fake_bin_dir/psql"
 
 FB_RELEASE_GATE_OUTPUT_DIR="$matrix_output_dir" \
+FB_RELEASE_GATE_PG_MAJOR="$test_major" \
 FB_RELEASE_GATE_ARCHIVE_ROOT="$matrix_archive_root" \
 FB_RELEASE_GATE_PSQL="$matrix_fake_bin_dir/psql" \
 FB_RELEASE_GATE_OS_USER="$(id -un)" \

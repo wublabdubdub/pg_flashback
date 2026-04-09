@@ -53,7 +53,7 @@ stage_description() {
 			printf '%s\n' 'run pg_flashback query, COPY TO, and CTAS verification scenarios'
 			;;
 		evaluate_gate)
-			printf '%s\n' 'compare flashback results with truth snapshots and golden baselines'
+			printf '%s\n' 'summarize correctness results and record single-run elapsed times'
 			;;
 		render_gate_report)
 			printf '%s\n' 'render the final Markdown report from collected JSON artifacts'

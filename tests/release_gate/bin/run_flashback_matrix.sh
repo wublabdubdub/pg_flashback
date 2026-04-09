@@ -170,7 +170,6 @@ run_query_case() {
 	local gate_elapsed_ms
 	local sha256
 	local row_count
-	local baseline_key
 	local result_json
 	local correctness_eval_json
 	local correctness_status
@@ -299,7 +298,6 @@ run_query_case() {
 	else
 		fb_release_gate_log "accuracy [${scenario_id}:${table_name}:${path_kind}] ${correctness_status} result_row_count=${row_count} truth_row_count=${truth_row_count} result_sha256=${sha256} truth_sha256=${truth_sha256}"
 	fi
-	baseline_key="${path_kind}:${scenario_id}:${schema_name}.${table_name}"
 	result_json="$(jq -cn \
 		--arg scenario_id "$scenario_id" \
 		--arg truth_scenario_id "$truth_scenario_id" \
@@ -314,12 +312,11 @@ run_query_case() {
 		--arg diff_path "$diff_path" \
 		--arg truth_sha256 "$truth_sha256" \
 		--arg table_class "$table_class" \
-		--arg baseline_key "$baseline_key" \
 		--argjson row_count "$row_count" \
 		--argjson truth_row_count "$truth_row_count" \
 		--argjson gate_elapsed_ms "$gate_elapsed_ms" \
 		--argjson measured_elapsed_ms "$(printf '%s\n' "${measured[@]}" | jq -R . | jq -s .)" \
-		'{scenario_id:$scenario_id, truth_scenario_id:$truth_scenario_id, schema_name:$schema_name, table_name:$table_name, target_ts:$target_ts, path_kind:$path_kind, csv_path:$csv_path, sha256:$sha256, row_count:$row_count, truth_sha256:$truth_sha256, truth_row_count:$truth_row_count, correctness_status:$correctness_status, correctness_reason:$correctness_reason, diff_path:$diff_path, gate_elapsed_ms:$gate_elapsed_ms, measured_elapsed_ms:$measured_elapsed_ms, table_class:$table_class, baseline_key:$baseline_key, dry_run:false}')"
+		'{scenario_id:$scenario_id, truth_scenario_id:$truth_scenario_id, schema_name:$schema_name, table_name:$table_name, target_ts:$target_ts, path_kind:$path_kind, csv_path:$csv_path, sha256:$sha256, row_count:$row_count, truth_sha256:$truth_sha256, truth_row_count:$truth_row_count, correctness_status:$correctness_status, correctness_reason:$correctness_reason, diff_path:$diff_path, gate_elapsed_ms:$gate_elapsed_ms, measured_elapsed_ms:$measured_elapsed_ms, table_class:$table_class, dry_run:false}')"
 	fb_release_gate_manifest_append "$results_manifest" "$result_json"
 }
 

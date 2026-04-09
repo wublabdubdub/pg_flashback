@@ -8,13 +8,15 @@
 #include <dirent.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
+#include <unistd.h>
 
 #include "common/file_perm.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
-#include "utils/wait_event_types.h"
+#include "utils/wait_event.h"
 
 #include "fb_runtime.h"
 #include "fb_spool.h"
@@ -159,12 +161,37 @@ fb_spool_writev_exact(FbSpoolLog *log,
 	if (log == NULL || iov == NULL || iovcnt <= 0 || total_len == 0)
 		return;
 
+#if PG_VERSION_NUM >= 180000
 	if (FileWriteV(log->file, iov, iovcnt, offset, WAIT_EVENT_BUFFILE_WRITE) !=
 		(int) total_len)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not write fb spill file"),
 				 errdetail("path=%s: %m", log->path)));
+#else
+	{
+		int i;
+		off_t current = offset;
+
+		for (i = 0; i < iovcnt; i++)
+		{
+			const struct iovec *part = &iov[i];
+
+			if (part->iov_len == 0)
+				continue;
+			if (FileWrite(log->file,
+						  (char *) part->iov_base,
+						  (int) part->iov_len,
+						  current,
+						  WAIT_EVENT_BUFFILE_WRITE) != (int) part->iov_len)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not write fb spill file"),
+						 errdetail("path=%s: %m", log->path)));
+			current += (off_t) part->iov_len;
+		}
+	}
+#endif
 }
 
 static void

@@ -9,17 +9,37 @@ FB_RELEASE_GATE_CONFIG_DIR="$FB_RELEASE_GATE_ROOT/config"
 FB_RELEASE_GATE_TEMPLATE_DIR="$FB_RELEASE_GATE_ROOT/templates"
 FB_RELEASE_GATE_OUTPUT_ROOT="$FB_RELEASE_GATE_ROOT/output"
 
-FB_RELEASE_GATE_PSQL="${FB_RELEASE_GATE_PSQL:-/home/18pg/local/bin/psql}"
-FB_RELEASE_GATE_CREATEDB="${FB_RELEASE_GATE_CREATEDB:-/home/18pg/local/bin/createdb}"
-FB_RELEASE_GATE_DROPDB="${FB_RELEASE_GATE_DROPDB:-/home/18pg/local/bin/dropdb}"
-FB_RELEASE_GATE_PGPORT="${FB_RELEASE_GATE_PGPORT:-5832}"
-FB_RELEASE_GATE_PGUSER="${FB_RELEASE_GATE_PGUSER:-18pg}"
+fb_release_gate_default_pg_port_from_major() {
+	case "$1" in
+		14) printf '%s\n' 5432 ;;
+		15) printf '%s\n' 5532 ;;
+		16) printf '%s\n' 5632 ;;
+		17) printf '%s\n' 5732 ;;
+		18) printf '%s\n' 5832 ;;
+		*)
+			printf '[release_gate] ERROR: unsupported PG major for release gate: %s\n' "$1" >&2
+			exit 1
+			;;
+	esac
+}
+
+FB_RELEASE_GATE_PG_MAJOR="${FB_RELEASE_GATE_PG_MAJOR:-14}"
+if [[ -z "${FB_RELEASE_GATE_ARCHIVE_ROOT+x}" ]]; then
+	FB_RELEASE_GATE_ARCHIVE_ROOT="/walstorage"
+	FB_RELEASE_GATE_ARCHIVE_ROOT_IS_DEFAULT=1
+else
+	FB_RELEASE_GATE_ARCHIVE_ROOT_IS_DEFAULT=0
+fi
+FB_RELEASE_GATE_PSQL="${FB_RELEASE_GATE_PSQL:-/home/${FB_RELEASE_GATE_PG_MAJOR}pg/local/bin/psql}"
+FB_RELEASE_GATE_CREATEDB="${FB_RELEASE_GATE_CREATEDB:-/home/${FB_RELEASE_GATE_PG_MAJOR}pg/local/bin/createdb}"
+FB_RELEASE_GATE_DROPDB="${FB_RELEASE_GATE_DROPDB:-/home/${FB_RELEASE_GATE_PG_MAJOR}pg/local/bin/dropdb}"
+FB_RELEASE_GATE_PGPORT="${FB_RELEASE_GATE_PGPORT:-$(fb_release_gate_default_pg_port_from_major "$FB_RELEASE_GATE_PG_MAJOR")}"
+FB_RELEASE_GATE_PGUSER="${FB_RELEASE_GATE_PGUSER:-${FB_RELEASE_GATE_PG_MAJOR}pg}"
 FB_RELEASE_GATE_MAINT_DB="${FB_RELEASE_GATE_MAINT_DB:-postgres}"
 FB_RELEASE_GATE_DBNAME="${FB_RELEASE_GATE_DBNAME:-alldb}"
-FB_RELEASE_GATE_ARCHIVE_ROOT="${FB_RELEASE_GATE_ARCHIVE_ROOT:-/walstorage}"
 FB_RELEASE_GATE_OUTPUT_DIR="${FB_RELEASE_GATE_OUTPUT_DIR:-$FB_RELEASE_GATE_OUTPUT_ROOT/latest}"
 FB_RELEASE_GATE_LARGE_DB_THRESHOLD_MB="${FB_RELEASE_GATE_LARGE_DB_THRESHOLD_MB:-100}"
-FB_RELEASE_GATE_OS_USER="${FB_RELEASE_GATE_OS_USER:-18pg}"
+FB_RELEASE_GATE_OS_USER="${FB_RELEASE_GATE_OS_USER:-$FB_RELEASE_GATE_PGUSER}"
 FB_RELEASE_GATE_SIM_BIN="${FB_RELEASE_GATE_SIM_BIN:-/root/alldbsimulator/bin/alldbsim}"
 FB_RELEASE_GATE_SIM_LISTEN_ADDR="${FB_RELEASE_GATE_SIM_LISTEN_ADDR:-127.0.0.1:18080}"
 FB_RELEASE_GATE_SIM_HEALTH_PATH="${FB_RELEASE_GATE_SIM_HEALTH_PATH:-/api/health}"
@@ -62,10 +82,15 @@ fb_release_gate_require_cmd() {
 
 fb_release_gate_load_config() {
 	local config_file="$FB_RELEASE_GATE_CONFIG_DIR/release_gate.conf"
+	local archive_root_before="$FB_RELEASE_GATE_ARCHIVE_ROOT"
 
 	if [[ -f "$config_file" ]]; then
 		# shellcheck disable=SC1090
 		source "$config_file"
+	fi
+
+	if [[ "$FB_RELEASE_GATE_ARCHIVE_ROOT" != "$archive_root_before" ]]; then
+		FB_RELEASE_GATE_ARCHIVE_ROOT_IS_DEFAULT=0
 	fi
 }
 
@@ -81,6 +106,16 @@ fb_release_gate_run_as_os_user() {
 
 fb_release_gate_archive_dir_from_major() {
 	local major="$1"
+	local wal_arch_link="/home/${major}pg/wal_arch"
+	local resolved=""
+
+	if [[ "${FB_RELEASE_GATE_ARCHIVE_ROOT_IS_DEFAULT:-0}" -eq 1 ]]; then
+		resolved="$(readlink -f "$wal_arch_link" 2>/dev/null || true)"
+		if [[ -n "$resolved" ]]; then
+			printf '%s\n' "$resolved"
+			return 0
+		fi
+	fi
 
 	case "$major" in
 		14|15|16|17|18)

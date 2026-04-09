@@ -239,24 +239,39 @@ Custom Scan (FbCountAggScan)
 
 职责：
 
-- 在 `shared_preload_libraries` 模式下注册 launcher 与 worker
-- 维护扩展私有 shared queue
-- 显式区分热前沿与冷回填两类任务
-- 当前调度收敛目标是：
-  - 固定 `1` 个 worker 优先跟 hot frontiers
-  - 其余 worker 优先补历史 cold backlog
-  - cold backlog 支持小批量连续 segment claim
+- 当前代码仍保留 preload/shared-memory 版 summary 服务与 SQL 视图实现
+- 已接受的新主线是将该服务外移为库外 daemon `pg_flashback-summaryd`
+- 迁移完成后的扩展内职责收口为：
+  - 优先读取 daemon 发布的 `state.json` / `debug.json`
+  - daemon 状态缺失或 stale 且 preload 服务存在时，回退读取 shmem 视图数据
+  - 提供 `pg_flashback_summary_progress`
+  - 提供 `pg_flashback_summary_service_debug`
+  - 写入并直接读取查询侧最近一次 summary 使用/降级观测 hint
+
+迁移中的 daemon 目标职责：
+
 - 周期扫描 archive / `pg_wal` / `recovered_wal`
-- 让 worker 读取 WAL segment 并预建 summary
-- 对 `meta/summary` 执行 summary 专属自动清理
-  - 包括按源 WAL 探活删除失活 summary 文件：
-    - 若对应 segment 已不在 archive / `pg_wal` / `recovered_wal` 的当前可见集合中
-    - 则清理对应 `meta/summary` 文件，不保留僵尸索引
-- 提供 summary 预建进度的 SQL 可观测面：
-  - 用户主视图为 `pg_flashback_summary_progress`
-    - 当前同时暴露 backlog 的 best-effort `estimated_completion_at`
-  - 服务内部调试视图为 `pg_flashback_summary_service_debug`
-  - 并维护最近一次 flashback 查询的 summary 降级观测，区分“summary 文件都在”和“最近查询没有回退到原始 WAL 扫描”
+- 承担 hot / cold backlog 调度
+- 构建 `meta/summary`
+- 对 `meta/summary` 做源 WAL 探活与自动清理
+- 发布 `meta/summaryd/state.json` / `debug.json`
+- 当前实现中，daemon 先通过 libpq 连接扩展并复用 debug helper
+  触发 build/cleanup，因此当前启动应显式提供 `--conninfo`
+- frontend-safe builder 抽离仍在后续阶段
+
+当前进度视图口径补充：
+
+- external daemon state 场景下，`pg_flashback_summary_progress`
+  会锚定已发布 snapshot 边界，避免 `stable_newest_segno` /
+  `missing_segments` 随实时 tail 候选来回跳动
+- preload/shmem 场景继续按 session-local 候选集统计，
+  避免后台全局 snapshot 污染本地测试和 gap fixture 语义
+
+该迁移的核心目标是：
+
+- 去除 `shared_preload_libraries` 依赖
+- 不要求 PostgreSQL 重启
+- 保持完整 summary 用户体验不变
 
 ### `fb_progress`
 
@@ -528,12 +543,12 @@ Custom Scan (FbCountAggScan)
 
 职责：
 
-- 处理 `PG10-18` 间 locator / xlogreader / catalog 等差异
+- 处理 `PG14-18` 间 locator / xlogreader / catalog 等差异
 
 当前版本口径：
 
-- 源码/构建目标：`PG10-18`
-- 本机实际验证矩阵：`PG12-18`
+- 源码/构建目标：`PG14-18`
+- 本机实际验证矩阵：`PG14-18`
 
 ## 三、关键数据结构
 

@@ -10,8 +10,134 @@
 - [x] 库内全表闪回落地新表的正式承接面固定为 `CTAS AS SELECT * FROM pg_flashback(...)`
 - [x] `COPY (SELECT * FROM pg_flashback(...)) TO ...` 仅作为导出路径
 
+## summary daemon / 无重启
+
+- [x] 新增库外 daemon 路径，使完整 summary 体验不再依赖重启 PostgreSQL
+- [x] 新增独立可执行文件 `pg_flashback-summaryd`
+- [x] 顶层 `Makefile` 默认同时构建扩展与 daemon
+- [x] `make install` 默认同时安装扩展与 daemon
+- [x] 将 `pg_flashback_summary_progress` / `pg_flashback_summary_service_debug`
+      改为优先读取 daemon 状态文件
+- [x] 修复 external summary state 场景下
+      `pg_flashback_summary_progress`
+      把已发布 snapshot 与实时 WAL 候选集混算导致的跳动
+  - [x] 新增回归锁住“snapshot 比实时候选多 1 个尾段”时
+        `stable_newest_segno` / `missing_segments` 不再回缩
+  - [x] 保持 preload/shmem 路径继续使用 session-local 候选集统计，
+        避免 `fb_summary_service.sql` 的 gap fixture 被后台服务全局 snapshot 污染
+- [x] 将最近查询 summary 观测从 shared memory 改为 runtime hint 文件
+- [x] 保持 query-side summary-first / fallback 行为不变
+- [x] 为开源用户补齐 daemon 的 README / sample config / systemd unit
+- [x] 修复 external daemon state 下 `estimated_completion_at` 仍长期为 `NULL`
+      或直接因空时间戳报错的缺口
+  - [x] 空字符串时间戳按缺失值处理，不再让 progress/debug 视图报错
+  - [x] daemon 跨 iteration 保留 throughput sample window，
+        空扫不再把 ETA 输入清空
+- [ ] 将 daemon 的 build/cleanup 从当前 `libpq + debug helper` 继续抽离为
+      默认不连接数据库的 frontend-safe core
+  - [ ] 收口为 daemon 本地文件/WAL 路径驱动，不再要求 `--conninfo`
+  - [ ] 保持 `state.json` / `debug.json` / SQL 视图口径不变
+  - [ ] README 与开源 README 明确补齐：
+        - 构建命令
+        - 产物路径
+        - `pg_flashback/` 目录何时创建
+        - daemon 启动命令
+
 ## 本轮已完成
 
+- [x] 修复 PG14 `documents @ 2026-04-09 06:25:40.377546+00`
+  的 `failed to replay heap insert`，并完成 `PG14-18` 运行时确认
+  - 根因已确认：
+    - 现场失败块落在 TOAST relation `1663/319744/319813 blk=92684`
+    - 同块更早存在 `HEAP2 PRUNE`，会先释放 dead slot，再承接后续 insert
+    - `src/fb_replay.c` 的 pre-PG17 `fb_replay_heap2_prune()`
+      旧逻辑只推进 `page_lsn`，没有真正执行 prune
+    - 结果是 PG14-16 上该页 free space 没被释放，
+      后续 `heap insert off=42` 误报“目标 offset 不可插”
+  - 当前修复已落地：
+    - 为 pre-PG17 `HEAP2_PRUNE` 补齐 payload 解析、
+      `future guard` 收敛与 `fb_page_prune_execute()` 真正回放
+    - 为 `FB_WAL_RECORD_HEAP2_PRUNE`
+      的 future compose 补齐 pre-PG17 `nowunused` slot release
+    - 额外修正 string GUC canonicalize 路径对 boot/default `*newval`
+      的非法 `free()`，并补齐 `< PG15` 的
+      `fb_guc_malloc_compat()` / `fb_guc_strdup_compat()` 返回路径
+    - 为 PG17+ 保留 `heap_execute_freeze_tuple()` 的本地兼容实现，
+      避免运行时符号缺失
+  - 当前验证已完成：
+    - `PG14-18` 均可成功 `LOAD 'pg_flashback'`
+      并读取 `current_setting('pg_flashback.memory_limit') = '1GB'`
+    - `PG14-18` 均可执行
+      `fb_replay_prune_releases_space_debug()`
+      并返回
+      `prune_releases_space=true free_before=28 free_after=124 insert1=true insert2=true`
+    - PG14 live case
+      `select count(*) from pg_flashback(NULL::scenario_oa_50t_50000r.documents, '2026-04-09 06:25:40.377546+00')`
+      已完整返回 `1950041`
+
+- [x] 清理当前 18pg 测试残留，并把 release gate 默认测试口径切到 14pg
+  - 当前变更已落地：
+    - `tests/release_gate/bin/common.sh`
+      默认 `PG major` 已切到 `14`
+    - `tests/release_gate/bin/common.sh`
+      现会优先解析 `/home/<major>pg/wal_arch` 的 realpath
+      作为 release gate 归档目录
+    - `tests/release_gate/bin/selftest.sh`
+      已同步改成版本感知断言，并覆盖 PG14 默认连接口径
+    - `tests/release_gate/README.md`
+      已同步更新默认连接参数与 archive 目录说明
+  - 当前环境清理已完成：
+    - 删除当前 18pg 的 `alldb` / `contrib_regression` / `fb_*` / `pgfb_*` 测试库
+    - 清空 `tests/release_gate/output/latest/`
+    - 清空 `/walstorage/18waldata/*`
+    - 清空 `/isoTest/18pgdata/pg_flashback/{runtime,recovered_wal,meta/summary/*}`
+      与 `meta/*.meta`
+  - 当前验证已完成：
+    - `bash -n tests/release_gate/bin/common.sh tests/release_gate/bin/run_release_gate.sh tests/release_gate/bin/prepare_empty_instance.sh tests/release_gate/bin/run_flashback_matrix.sh tests/release_gate/bin/evaluate_gate.sh tests/release_gate/bin/render_report.sh tests/release_gate/bin/selftest.sh`
+    - `bash tests/release_gate/bin/selftest.sh`：`PASS`
+- [x] 删除 release gate 的 golden baseline / 性能评估机制，改为只记录单次执行耗时
+  - 当前变更已落地：
+    - `tests/release_gate/bin/run_flashback_matrix.sh`
+      不再写出 `baseline_key`
+    - `tests/release_gate/bin/evaluate_gate.sh`
+      只汇总 correctness 与 `gate_elapsed_ms` / `measured_elapsed_ms`
+    - `tests/release_gate/bin/render_report.sh`
+      只展示正确性结论与场景矩阵中的单次耗时
+    - `tests/release_gate/bin/run_release_gate.sh`
+      阶段描述已切到“记录单次耗时”
+    - `tests/release_gate/README.md`
+      已改成“单次耗时记录，不做 golden baseline 或性能回归评估”
+  - 当前验证已完成：
+    - `bash -n tests/release_gate/bin/run_release_gate.sh tests/release_gate/bin/run_flashback_matrix.sh tests/release_gate/bin/evaluate_gate.sh tests/release_gate/bin/render_report.sh tests/release_gate/bin/selftest.sh`
+    - `bash tests/release_gate/bin/selftest.sh`：`PASS`
+    - 已用新脚本重写 `tests/release_gate/output/latest/json/gate_evaluation.json`
+      与 `tests/release_gate/output/latest/reports/release_gate_report.md`
+- [x] 修复 PG14 / release gate 在 `PGOPTIONS=-c pg_flashback.memory_limit=6GB`
+  下的 backend startup 崩溃
+  - 根因已确认：
+    - pre-PG15 的 `fb_guc_malloc_compat()` / `fb_guc_strdup_compat()`
+      旧实现把 string GUC 的 canonical value / extra 分配在
+      `TopMemoryContext`
+    - PG14 核心 `guc.c` 对 string / extra 字段收口使用 libc `free()`
+    - 分配/释放语义不一致，最终在 backend 启动处理
+      `pg_flashback.memory_limit`
+      时触发 `free(): invalid pointer`
+  - 当前修复已落地：
+    - `src/fb_compat.c`
+      已将 pre-PG15 GUC compat 分配统一改成 `malloc/free`
+    - 新增回归 `fb_guc_startup`
+      锁住“子 `psql` 通过
+      `PGOPTIONS=-cpg_flashback.memory_limit=6GB`
+      启动新 backend 不再崩溃”
+  - 当前验证已完成：
+    - RED：旧 postmaster 上
+      `PGUSER=14pg make PG_CONFIG=/home/14pg/local/bin/pg_config installcheck REGRESS='fb_guc_startup'`
+      稳定失败
+    - GREEN：安装并重启 14pg 后，
+      同命令 `All 1 tests passed.`
+    - 手工
+      `env PGOPTIONS='-cpg_flashback.memory_limit=6GB' psql ...`
+      已返回 `current_setting = 6GB`
 - [x] 按对外开源发布口径补齐许可证与 README
   - 根目录新增 `Apache-2.0` 许可证文件 `LICENSE`
   - 根目录新增发布版本文件 `VERSION`，当前版本为 `0.2.0`
@@ -24,7 +150,7 @@
     - 基础调用方式
     - 使用前提条件
     - 几个常用参数的作用与最小用法
-  - README 中 PostgreSQL 版本口径当前按本机已验证的 `PG12-18` 书写
+  - README 中 PostgreSQL 版本口径当前按本机已验证的 `PG14-18` 书写
   - `scripts/sync_open_source.sh` 已把 `LICENSE` / `VERSION` 纳入镜像白名单
 - [x] 开源项目公开 Markdown 切到单文件中英双语
   - 范围包括：
@@ -46,17 +172,27 @@
   - 当前修复已落地：
     - 新增 GUC `pg_flashback.target_snapshot`
     - WAL record index 现会解析 `txid_current_snapshot()::text`
-      的 active xid 列表，并把这些 xid 视为 target 时刻“仍未提交”
+      的 `xmin/xmax/xip_list`
+    - 除了 `xip_list` 中仍 in-progress 的 xid，
+      现也会把 `xid >= snapshot_xmax`
+      统一视为 target snapshot 时刻不可见
     - `tests/release_gate/bin/capture_truth_snapshots.sh`
       现会把 `target_snapshot` 写入 truth manifest
     - `tests/release_gate/bin/run_flashback_matrix.sh`
       现会把 `target_snapshot` 注入 query / COPY / CTAS-create
       的 flashback 命令
+    - 新增最小回归 `fb_target_snapshot`
+      锁住“commit_ts 早于 target_ts、但 xid 已落在 snapshot_xmax 之后”
+      仍必须按 snapshot 不可见处理
   - 当前已验证：
     - 手工对 `random_flashback_1.users` 失败行注入 snapshot 后，
       已恢复 truth 值
     - 手工对 `random_flashback_1.meetings` 失败行注入 snapshot 后，
       已恢复 truth 值
+    - 手工对 `random_flashback_2.users @ 2026-04-08 13:50:06.909167+00`
+      全量导出后，与 truth CSV 按行比较 `50021` 行全部一致
+    - `PGHOST=/tmp PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_target_snapshot fb_flashback_keyed pg_flashback'`
+      `All 3 tests passed.`
     - `bash -n tests/release_gate/bin/capture_truth_snapshots.sh`
       / `bash -n tests/release_gate/bin/run_flashback_matrix.sh`
       已通过
@@ -265,6 +401,21 @@
     - 在 `run_flashback_matrix.sh` 即时输出 correctness 结果
     - 保留 `evaluate_gate.sh` 的最终汇总职责
   - [ ] 彻底收敛 release gate `run_flashback_checks` 的 `3/9 build record index`
+    - [x] 修复 PG14 `documents @ 2026-04-09 06:25:40.377546+00` 的 residual xact fallback 串行热点
+      - 根因已确认：
+        - `metadata_fallback_windows=0`，query-local `xact_summary_log` 未产出
+        - `summary_xid_fallback=77` 仍需 raw WAL fallback
+        - `fb_wal_fill_xact_statuses_parallel()` 当前被硬编码禁用
+      - 已完成修复：
+        - 启用 bounded raw xact fallback worker 路径
+        - 保持 unresolved xid / unsafe 判定语义不变
+        - 调度改成 leader + workers 共同扫描
+        - worker 启动改成 all-or-fallback
+      - 当前补充：
+        - live case 已确认新路径可以拉起 `pg_flashback wal xact` worker
+        - 修复后 leader 已确认参与扫描，不再只等待 worker 退出
+        - 原 SQL 在 `6GB` 口径下已越过 `3/9` 并进入 `4/9`
+    - [ ] 继续补稳定回归，锁住 PG14 `fb_recordref` 的重路径验证
   - [x] 先补最小 RED / 观测，锁住 `summary-span` 与 `xact-status` 的新 counters
   - [x] 将 `summary-span` 从“query 时现拷 spans”升级成 cache 期 stable public slice
   - [x] 在 query-side `summary-span` 规划中加入 segment 去重与更早 merge，避免窗口爆炸
@@ -614,7 +765,7 @@
   - 不把表层 NOTICE 子相位直接当成最终结论
   - 必须继续用 debug counter、`pg_stat_activity`、`gdb/perf` 等证据确认真实热点归属
   - 不接受停在“summary 没起作用”或“看起来卡在 metadata/xact-status/payload”这类表层判断
-- [x] 修复 `scenario_oa_50t_50000r.documents @ '2026-04-08 13:33:00.700288+00'`
+  - [x] 修复 `scenario_oa_50t_50000r.documents @ '2026-04-08 13:33:00.700288+00'`
       的 `summary_xid_fallback=110`
   - 根因已确认：
     - 下午 `summary_xid_fallback=21` 是 stale summary identity，属于 phantom xid
@@ -634,6 +785,10 @@
       - `fallback_windows=0`
     - live query `count(*) from pg_flashback(...)` 当前完整返回
       且 `3/9 55% xact-status` 已降到 `+301.502 ms`
+    - PG14 live probe 样本 `39930` / `40681` 已进一步坐实：
+      - 旧 summary 在场时会出现“summary 命中但 xid outcome 缺失”
+      - 清空后先变成缺 summary，再由当前代码现建恢复为
+        `unresolved_after_summary=false`
 - [x] 修复验证期引入的 `fb_wal_fill_xact_statuses_serial()` cleanup crash
   - 根因已确认：
     - `FbWalSerialXactVisitorState state` 旧代码在多个 `goto cleanup` 之前未初始化
@@ -1098,9 +1253,25 @@
 
 - [x] 将 `README.md` 改写为正式客户使用手册
 - [x] 抽取 `fb_compat` 并去掉当前 `PG18` 专属构建假设
-- [x] 收敛到源码/构建目标 `PG10-18`
-- [x] 跑通本机 `PG12-18` 编译矩阵
-- [x] 在文档中明确 `PG10/11` 为“待补环境复验”
+- [x] 收敛到源码/构建目标 `PG14-18`
+- [x] 跑通本机 `PG14-18` 编译矩阵
+- [x] 打通 PG14 扩展加载与 `CREATE EXTENSION`
+  - [x] 兼容 `XLogFindNextRecord` 非导出场景
+  - [x] 兼容 `pg_mkdir_p` 非导出场景
+  - [x] 修正 PG14 GUC boot/default 字符串释放崩溃
+- [x] 打开 PG14 summary service 主链
+  - [x] 去掉 `fb_summary_service.c` 的 PG14 全量 stub
+  - [x] 改成 PG14 preload 期直接申请 addin shmem / named LWLock tranche
+  - [x] 配置 `/home/14pg/data/postgresql.conf` 启用 `shared_preload_libraries = 'pg_flashback'`
+  - [x] 重启后确认 launcher / worker 进程存在
+- [x] 完成 PG14 summary 开启状态下的 `xman` 闪回闭环验证
+  - [x] `pg_flashback_summary_progress.service_enabled = true`
+  - [x] `last_query_summary_ready = true`
+  - [x] `ts1_ok .. ts6_ok` 全部通过
+  - [x] 修正 PG14 缺失 `io_workers` GUC 的执行期报错
+  - [x] 修正 target 前建表被 `invalid xid + smgr_create` 误判为 `storage_change`
+  - [x] 修正 summary unsafe fact 回灌时 `scope=none` 导致的同类误判
+  - [ ] 评估是否去掉当前对 `track_commit_timestamp` 的实例配置依赖
 
 ### deep / 正确性
 

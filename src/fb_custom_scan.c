@@ -5,6 +5,21 @@
 
 #include "postgres.h"
 
+#if PG_VERSION_NUM < 180000
+
+#include "fb_custom_scan.h"
+
+void
+fb_custom_scan_init(void)
+{
+	/*
+	 * PG14-17 use the SRF ValuePerCall execution path.
+	 * Keep newer CustomScan planner/executor plumbing disabled there.
+	 */
+}
+
+#else
+
 #include "access/genam.h"
 #include "access/relation.h"
 #include "access/stratnum.h"
@@ -13,9 +28,7 @@
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_am_d.h"
 #include "commands/explain.h"
-#include "commands/explain_format.h"
 #include "executor/executor.h"
-#include "executor/execScan.h"
 #include "executor/nodeCustom.h"
 #include "executor/tuptable.h"
 #include "funcapi.h"
@@ -2620,3 +2633,5 @@ fb_custom_scan_init(void)
 	create_upper_paths_hook = fb_flashback_create_upper_paths;
 	initialized = true;
 }
+
+#endif

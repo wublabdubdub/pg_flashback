@@ -17,6 +17,7 @@
 #include "storage/fd.h"
 #include "utils/elog.h"
 
+#include "fb_compat.h"
 #include "fb_runtime.h"
 
 PG_FUNCTION_INFO_V1(fb_runtime_create_test_artifacts_debug);
@@ -78,6 +79,36 @@ fb_runtime_meta_summary_dir(void)
 	return fb_runtime_join_path("meta/summary");
 }
 
+char *
+fb_runtime_meta_summaryd_dir(void)
+{
+	return fb_runtime_join_path("meta/summaryd");
+}
+
+char *
+fb_runtime_summaryd_state_path(void)
+{
+	return fb_runtime_join_path("meta/summaryd/state.json");
+}
+
+char *
+fb_runtime_summaryd_debug_path(void)
+{
+	return fb_runtime_join_path("meta/summaryd/debug.json");
+}
+
+char *
+fb_runtime_summary_hint_dir(void)
+{
+	return fb_runtime_join_path("runtime/summary-hints");
+}
+
+char *
+fb_runtime_summary_last_query_hint_path(void)
+{
+	return fb_runtime_join_path("runtime/summary-hints/last-query.json");
+}
+
 /*
  * fb_runtime_ensure_directory
  *    Runtime helper.
@@ -89,7 +120,7 @@ fb_runtime_ensure_directory(const char *path, const char *label)
 	char *mutable_path;
 
 	mutable_path = pstrdup(path);
-	if (pg_mkdir_p(mutable_path, pg_dir_create_mode) != 0)
+	if (fb_mkdir_p_compat(mutable_path, pg_dir_create_mode) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not initialize pg_flashback %s directory", label),
@@ -101,6 +132,21 @@ fb_runtime_ensure_directory(const char *path, const char *label)
 				(errcode_for_file_access(),
 				 errmsg("pg_flashback %s directory is not writable", label),
 				 errdetail("path=%s: %m", path)));
+}
+
+void
+fb_runtime_ensure_summary_daemon_dirs(void)
+{
+	char *summaryd_dir;
+	char *hint_dir;
+
+	fb_runtime_ensure_initialized();
+	summaryd_dir = fb_runtime_meta_summaryd_dir();
+	hint_dir = fb_runtime_summary_hint_dir();
+	fb_runtime_ensure_directory(summaryd_dir, "summary daemon meta");
+	fb_runtime_ensure_directory(hint_dir, "summary hint");
+	pfree(summaryd_dir);
+	pfree(hint_dir);
 }
 
 static bool

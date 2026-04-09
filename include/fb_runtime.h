@@ -33,12 +33,18 @@ char *fb_runtime_recovered_wal_dir(void);
 
 char *fb_runtime_meta_dir(void);
 char *fb_runtime_meta_summary_dir(void);
+char *fb_runtime_meta_summaryd_dir(void);
+char *fb_runtime_summaryd_state_path(void);
+char *fb_runtime_summaryd_debug_path(void);
+char *fb_runtime_summary_hint_dir(void);
+char *fb_runtime_summary_last_query_hint_path(void);
 /*
  * fb_runtime_ensure_initialized
  *    Runtime API.
  */
 
 void fb_runtime_ensure_initialized(void);
+void fb_runtime_ensure_summary_daemon_dirs(void);
 void fb_runtime_cleanup_stale(void);
 void fb_runtime_cleanup_current_backend(void);
 

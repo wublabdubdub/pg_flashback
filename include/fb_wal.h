@@ -139,6 +139,7 @@ typedef struct FbWalScanContext
 	uint32 xact_summary_spool_hits;
 	uint32 xact_fallback_windows;
 	uint32 xact_fallback_covered_segments;
+	uint32 xact_parallel_workers;
 	uint32 summary_unsafe_hits;
 	uint32 metadata_fallback_windows;
 	uint64 payload_sparse_reader_resets;
@@ -300,6 +301,8 @@ typedef struct FbWalRecordIndex
 	bool tail_inline_payload;
 	XLogRecPtr tail_cutover_lsn;
 	HTAB *xid_statuses;
+	TransactionId target_snapshot_xmin;
+	TransactionId target_snapshot_xmax;
 	HTAB *target_snapshot_xids;
 	FbSpoolSession *spool_session;
 	FbSpoolLog *record_log;

@@ -928,7 +928,7 @@ fb_recordref_debug(PG_FUNCTION_ARGS)
 
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
-						 "anchor=%s unsafe=%s reason=%s meta_refs=%llu payload_refs=%u kept=%llu target_dml=%llu commits=%llu aborts=%llu tail_inline=%s head_gap_refs=%u tail_refs=%u parallel=%s prefilter=%s visited_segments=%u/%u payload_windows=%u payload_scan_mode=%s payload_parallel_workers=%u payload_covered_segments=%u payload_scanned_records=%llu payload_kept_records=%llu payload_sparse_reader_resets=%llu payload_sparse_reader_reuses=%llu xact_summary_spool_records=%u xact_summary_spool_hits=%u summary_payload_locator_records=%llu summary_payload_locator_segments_read=%u summary_payload_locator_public_builds=%llu summary_payload_locator_fallback_segments=%u summary_span_windows=%u summary_span_segments_read=%u summary_span_public_builds=%llu summary_xid_hits=%u summary_xid_exact_hits=%u summary_xid_fallback=%u summary_xid_segments_read=%u summary_xid_exact_segments_read=%u xact_fallback_windows=%u xact_fallback_covered_segments=%u summary_unsafe_hits=%u metadata_fallback_windows=%u anchor_redo=%X/%08X",
+						 "anchor=%s unsafe=%s reason=%s meta_refs=%llu payload_refs=%u kept=%llu target_dml=%llu commits=%llu aborts=%llu tail_inline=%s head_gap_refs=%u tail_refs=%u parallel=%s prefilter=%s visited_segments=%u/%u payload_windows=%u payload_scan_mode=%s payload_parallel_workers=%u payload_covered_segments=%u payload_scanned_records=%llu payload_kept_records=%llu payload_sparse_reader_resets=%llu payload_sparse_reader_reuses=%llu xact_summary_spool_records=%u xact_summary_spool_hits=%u summary_payload_locator_records=%llu summary_payload_locator_segments_read=%u summary_payload_locator_public_builds=%llu summary_payload_locator_fallback_segments=%u summary_span_windows=%u summary_span_segments_read=%u summary_span_public_builds=%llu summary_xid_hits=%u summary_xid_exact_hits=%u summary_xid_fallback=%u summary_xid_segments_read=%u summary_xid_exact_segments_read=%u xact_fallback_windows=%u xact_fallback_covered_segments=%u xact_parallel_workers=%u summary_unsafe_hits=%u metadata_fallback_windows=%u anchor_redo=%X/%08X",
 						 index.anchor_found ? "true" : "false",
 						 index.unsafe ? "true" : "false",
 						 fb_wal_unsafe_reason_name(index.unsafe_reason),
@@ -969,6 +969,7 @@ fb_recordref_debug(PG_FUNCTION_ARGS)
 						 scan_ctx.summary_xid_exact_segments_read,
 						 scan_ctx.xact_fallback_windows,
 						 scan_ctx.xact_fallback_covered_segments,
+						 scan_ctx.xact_parallel_workers,
 						 scan_ctx.summary_unsafe_hits,
 						 scan_ctx.metadata_fallback_windows,
 						 LSN_FORMAT_ARGS(index.anchor_redo_lsn));

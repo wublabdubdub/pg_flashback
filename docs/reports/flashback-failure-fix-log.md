@@ -115,6 +115,75 @@
     - `3/9 55% xact-status` 收敛到约 `301 ms`
     - 查询已完整返回 `count = 1950007`
 
+### 记录 2：`free(): invalid pointer`（PG14 GUC startup）
+
+- 时间：
+  - 2026-04-09
+- 报错现象：
+  - release gate `run_flashback_checks`
+    首条
+    `random_flashback_1.documents`
+    query case
+    在 backend 启动阶段直接中断连接：
+    - 客户端表现为
+      `server closed the connection unexpectedly`
+    - postmaster 日志表现为
+      `free(): invalid pointer`
+      与
+      `server process ... was terminated by signal 6: Aborted`
+- 原因：
+  - release gate 会通过
+    `PGOPTIONS=-c pg_flashback.memory_limit=6GB`
+    在新 backend 启动时设置自定义 string GUC
+  - pre-PG15 兼容层旧实现错误用
+    `TopMemoryContext`
+    为 string GUC 的 canonical value / extra 分配内存
+  - 但 PG14 核心 `guc.c`
+    对 string / extra 字段收口使用的是 libc `free()`
+  - 分配/释放语义不一致，最终在
+    `set_string_field()` / `set_extra_field()`
+    触发 invalid free
+- 修复方式：
+  - 将 pre-PG15 的
+    `fb_guc_malloc_compat()` /
+    `fb_guc_strdup_compat()` /
+    `fb_guc_free_compat()`
+    统一改成与 PostgreSQL GUC 核心一致的
+    `malloc/free`
+  - 新增回归 `fb_guc_startup`，
+    用子 `psql` 真实覆盖
+    `PGOPTIONS=-cpg_flashback.memory_limit=6GB`
+    的 backend 启动路径
+
+### 记录 3：pre-PG17 `HEAP2_PRUNE` 漏回放导致 `failed to replay heap insert`
+
+- 时间：
+  - 2026-04-09
+- 报错现象：
+  - `scenario_oa_50t_50000r.documents @ '2026-04-09 06:25:40.377546+00'`
+    在 PG14 稳定报：
+    - `ERROR: failed to replay heap insert`
+    - `rel=1663/319744/319813 blk=92684 off=42`
+- 原因：
+  - 失败块位于 TOAST relation，后续 insert 前同块存在
+    `HEAP2 PRUNE`
+  - pre-PG17 `fb_replay_heap2_prune()` 旧逻辑只推进 `page_lsn`，
+    没有真正释放 `nowunused` slot / free space
+  - 于是后续同块 insert 在错误页态上执行，最终误报
+    `failed to replay heap insert`
+- 修复方式：
+  - 为 pre-PG17 `HEAP2_PRUNE`
+    补齐 payload 解析、future guard 收敛与
+    `fb_page_prune_execute()` 真实回放
+  - 为 `FB_WAL_RECORD_HEAP2_PRUNE`
+    的 future compose
+    补齐 pre-PG17 `nowunused` slot release 语义
+  - 新增/扩展 `fb_replay_prune_releases_space_debug()`
+    合约，确认 prune 后 free space 确实增长且后续 insert 可落盘
+  - 最终在 `PG14-18` 全部完成 clean build/install、
+    runtime load 与 prune contract 复核，
+    PG14 live case 重新返回 `count = 1950041`
+
 ---
 
 ## 2026-04-06

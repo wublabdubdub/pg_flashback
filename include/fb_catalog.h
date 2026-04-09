@@ -14,6 +14,7 @@
  */
 
 void fb_catalog_load_relation_info(Oid relid, FbRelationInfo *info);
+bool fb_catalog_relation_creation_precedes_target(Oid relid,
+												  TimestampTz target_ts);
 
 #endif
-
