@@ -423,7 +423,7 @@ summaryd_run_core_iteration(const SummarydConfig *config,
 	if (publish_hook != NULL)
 		(void) publish_hook(config, state);
 
-	for (i = 0; i < candidate_count; i++)
+	for (i = candidate_count - 1; i >= 0; i--)
 	{
 		if (fb_summary_candidate_summary_exists(&candidates[i]))
 			continue;

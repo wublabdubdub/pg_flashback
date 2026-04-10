@@ -4,18 +4,15 @@
 #include <stdbool.h>
 
 #define SUMMARYD_PATH_MAX 4096
-#define SUMMARYD_CONNINFO_MAX 2048
 
 typedef struct SummarydConfig
 {
 	char pgdata[SUMMARYD_PATH_MAX];
 	char archive_dest[SUMMARYD_PATH_MAX];
 	char config_path[SUMMARYD_PATH_MAX];
-	char conninfo[SUMMARYD_CONNINFO_MAX];
 	int interval_ms;
 	bool foreground;
 	bool once;
-	bool conninfo_present;
 } SummarydConfig;
 
 typedef struct SummarydState

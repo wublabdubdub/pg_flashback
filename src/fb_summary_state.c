@@ -275,6 +275,7 @@ fb_summary_state_load_common(const char *path, FbSummaryDaemonState *state)
 	if (state != NULL)
 	{
 		state->present = true;
+		state->published_at = time_t_to_timestamptz((pg_time_t) st.st_mtime);
 		(void) fb_summary_state_parse_bool(json, "service_enabled", &state->service_enabled);
 		(void) fb_summary_state_parse_int(json, "daemon_pid", &state->daemon_pid);
 		(void) fb_summary_state_parse_int(json, "registered_workers", &state->registered_workers);

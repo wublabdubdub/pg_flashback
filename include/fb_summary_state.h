@@ -13,6 +13,7 @@ typedef struct FbSummaryDaemonState
 	bool present;
 	bool stale;
 	bool service_enabled;
+	TimestampTz published_at;
 	int daemon_pid;
 	int registered_workers;
 	int active_workers;

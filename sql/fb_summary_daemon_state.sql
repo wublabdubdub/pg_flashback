@@ -75,12 +75,19 @@ BEGIN
 END;
 $$;
 
+RESET pg_flashback.archive_dir;
+RESET pg_flashback.archive_dest;
+
 SELECT service_enabled,
 	   last_query_observed_at = '2026-04-09 12:34:56+00'::timestamptz AS last_query_ts_ok,
 	   last_query_summary_ready = false AS last_query_ready_ok,
 	   last_query_summary_span_fallback_segments = 3 AS span_fallback_ok,
 	   last_query_metadata_fallback_segments = 4 AS metadata_fallback_ok,
-	   estimated_completion_at IS NOT NULL AS eta_present
+	   estimated_completion_at IS NOT NULL AS eta_present,
+	   state_source = 'external' AS state_source_ok,
+	   daemon_state_present = true AS daemon_state_present_ok,
+	   daemon_state_stale = false AS daemon_state_stale_ok,
+	   daemon_state_published_at IS NOT NULL AS daemon_state_published_at_ok
 FROM pg_flashback_summary_progress;
 
 SELECT service_enabled,
@@ -90,7 +97,11 @@ SELECT service_enabled,
 	   scan_count = 99 AS scan_count_ok,
 	   build_count = 88 AS build_count_ok,
 	   cleanup_count = 77 AS cleanup_count_ok,
-	   last_scan_at IS NOT NULL AS last_scan_at_ok
+	   last_scan_at IS NOT NULL AS last_scan_at_ok,
+	   state_source = 'external' AS debug_state_source_ok,
+	   daemon_state_present = true AS debug_daemon_state_present_ok,
+	   daemon_state_stale = false AS debug_daemon_state_stale_ok,
+	   daemon_state_published_at IS NOT NULL AS debug_daemon_state_published_at_ok
 FROM pg_flashback_summary_service_debug;
 
 DO $$

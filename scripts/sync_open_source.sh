@@ -13,6 +13,8 @@ REQUIRED_PATHS=(
   "LICENSE"
   "VERSION"
   "pg_flashback.control"
+  "scripts/b_pg_flashback.sh"
+  "scripts/pg_flashback_summary.sh"
   "summaryd"
   "include"
   "src"
@@ -26,6 +28,8 @@ PUBLIC_FILES=(
   "LICENSE"
   "VERSION"
   "pg_flashback.control"
+  "scripts/b_pg_flashback.sh"
+  "scripts/pg_flashback_summary.sh"
 )
 
 PUBLIC_DIRS=(
@@ -89,6 +93,10 @@ verify_excluded_paths() {
     [[ ! -e "${DEST_ROOT}/${relpath}" ]] || fail "excluded path leaked into mirror: ${relpath}"
   done
   [[ ! -e "${DEST_ROOT}/summaryd/pg_flashback-summaryd" ]] || fail "built daemon binary leaked into mirror"
+  [[ ! -e "${DEST_ROOT}/summaryd/pg_flashback-summaryd.conf" ]] || fail "generated summaryd config leaked into mirror"
+  if find "${DEST_ROOT}" -type f \( -name '*.o' -o -name '*.so' -o -name '*.bc' \) | grep -q .; then
+    fail "build artifacts leaked into mirror"
+  fi
 }
 
 verify_required_outputs() {
@@ -99,6 +107,8 @@ verify_required_outputs() {
     "LICENSE"
     "VERSION"
     "pg_flashback.control"
+    "scripts/b_pg_flashback.sh"
+    "scripts/pg_flashback_summary.sh"
     "summaryd"
     "include"
     "src"
@@ -128,8 +138,10 @@ main() {
     copy_dir "${relpath}"
   done
 
-  find "${DEST_ROOT}/src" -type f \( -name '*.o' -o -name '*.so' -o -name '*.bc' \) -delete
-  rm -f "${DEST_ROOT}/summaryd/pg_flashback-summaryd"
+  find "${DEST_ROOT}" -type f \( -name '*.o' -o -name '*.so' -o -name '*.bc' \) -delete
+  rm -f \
+    "${DEST_ROOT}/summaryd/pg_flashback-summaryd" \
+    "${DEST_ROOT}/summaryd/pg_flashback-summaryd.conf"
 
   write_mirror_gitignore
 

@@ -168,13 +168,18 @@ SELECT to_regclass('pg_flashback_summary_progress') IS NOT NULL
 	   to_regclass('pg_flashback_summary_service_debug') IS NOT NULL
 	   AS has_debug_progress_view;
 
-SELECT count(*) = 20 AS sane_user_columns
+SELECT count(*) = 24 AS sane_user_columns
 FROM information_schema.columns
 WHERE table_schema = 'public'
   AND table_name = 'pg_flashback_summary_progress';
 
 SELECT pg_typeof(estimated_completion_at) = 'timestamp with time zone'::regtype
 	   AS eta_column_type_ok
+FROM pg_flashback_summary_progress;
+
+SELECT state_source IN ('external', 'shmem', 'none') AS state_source_enum_ok,
+	   pg_typeof(daemon_state_published_at) = 'timestamp with time zone'::regtype
+	   AS daemon_state_published_at_type_ok
 FROM pg_flashback_summary_progress;
 
 SELECT stable_oldest_segno <= stable_newest_segno AS sane_stable_segno_range,
@@ -432,10 +437,10 @@ SELECT (
 		   ORDER BY enqueue_order
 		   LIMIT 1
 	   ) = (
-		   SELECT min(candidate_no)
+		   SELECT max(candidate_no)
 		   FROM fb_summary_service_schedule_debug(64, 32, 40)
 		   WHERE queue_kind = 'cold'
-	   ) AS cold_queue_starts_from_oldest_backlog;
+	   ) AS cold_queue_starts_from_newest_backlog;
 
 DO $$
 DECLARE

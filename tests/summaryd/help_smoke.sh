@@ -20,5 +20,6 @@ grep -Fq -- "--pgdata" <<<"${HELP_OUTPUT}" || fail "help missing --pgdata"
 grep -Fq -- "--archive-dest" <<<"${HELP_OUTPUT}" || fail "help missing --archive-dest"
 grep -Fq -- "--interval-ms" <<<"${HELP_OUTPUT}" || fail "help missing --interval-ms"
 grep -Fq -- "--once" <<<"${HELP_OUTPUT}" || fail "help missing --once"
+! grep -Fq -- "--conninfo" <<<"${HELP_OUTPUT}" || fail "help should not mention --conninfo"
 
 echo "[summaryd:help_smoke] PASS"

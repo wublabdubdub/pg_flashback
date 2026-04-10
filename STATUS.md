@@ -137,6 +137,412 @@
 
 ## 当前进行中
 
+- 2026-04-11 已完成 summary runner 脚本化与 recent-first 调度收口：
+  - 已完成：
+    - 新增 `scripts/pg_flashback_summary.sh`，固定提供：
+      - `start`
+      - `stop`
+      - `status`
+      - `run-once`
+    - `scripts/b_pg_flashback.sh`
+      已完全去掉 bootstrap 主路径上的 `service/systemd` 生命周期管理，
+      改为只写 config 并调用脚本 runner
+    - bootstrap 当前固定约束为：
+      - 非 root
+      - 当前 OS 用户必须拥有 `PGDATA`
+      - config / pid / log 固定落到
+        `~/.config/pg_flashback/`
+    - `summaryd/fb_summaryd_core.c`
+      与 `src/fb_summary_service.c`
+      已统一切到 `archive_dest + pg_wal` 合并候选后的 recent-first
+    - 已删除当前交付面中不再保留的：
+      - `summaryd/pg_flashback-summaryd.service`
+      - `tests/summaryd/bootstrap_service_scope_smoke.sh`
+      - `tests/summaryd/bootstrap_no_user_bus_smoke.sh`
+  - 验证：
+    - `PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS=fb_summary_service`
+    - `PG_CONFIG=/home/18pg/local/bin/pg_config make check-summaryd`
+    - `bash scripts/sync_open_source.sh`
+    - 本机 `18pg` runner 实机验证：
+      - `run-once` 使用 `pg_wal` recent-tail 临时 config 可成功退出
+      - `start/status/stop` 可成功返回
+  - 下一步：
+    - 继续在 deep / release 场景观察 summary recent-first 下的追平速度与 ETA 口径
+
+- 2026-04-10 已完成 bootstrap 无 user bus 场景修复：
+  - 当前已确认 root cause：
+    - 在 `CentOS 8/9` 默认 `user scope` 路径下，
+      `scripts/b_pg_flashback.sh`
+      即使没有可用的 user bus，
+      仍会继续执行 `systemctl --user`
+    - 本机 `18pg` 当前现场为：
+      - `Linger=yes`
+      - `XDG_RUNTIME_DIR` 为空
+      - `/run/user/<uid>/bus` 不存在
+      - setup 在 `Service Setup` 阶段稳定报
+        `Failed to connect to bus: No such file or directory`
+  - 当前修复已完成：
+    - 新增 `user systemd` 可用性探测
+    - 默认 `user scope` 且无可用 user bus 时，
+      自动回落到 `direct manager`
+    - direct manager 当前直接拉起：
+      - `pg_flashback-summaryd --config ... --foreground`
+    - 已补齐：
+      - direct manager 的“已初始化完成”判定
+      - direct manager 的 setup 就绪等待
+      - direct manager 的 remove 进程清理与 pid/log 清理
+    - README / `summaryd/README.md`
+      已补齐无 user bus 自动回落说明
+    - 新增回归：
+      - `tests/summaryd/bootstrap_no_user_bus_smoke.sh`
+  - 当前验证已完成：
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config check-summaryd`
+    - 本机 `18pg` 真实 setup/remove 验证：
+      - setup 输出 `service_manager=direct`
+      - 已生成
+        `PGDATA/pg_flashback/meta/summaryd/{state.json,debug.json}`
+      - 造 WAL + `pg_switch_wal()` 后，
+        `PGDATA/pg_flashback/meta/summary/`
+        已生成 `66` 个 `summary-*.meta`
+      - remove 后已确认：
+        - 不残留 `pg_flashback-summaryd` 进程
+        - `/home/18pg/.config/pg_flashback/pg_flashback-summaryd.conf`
+          已删除
+        - `/home/18pg/.config/pg_flashback/pg_flashback-summaryd.pid`
+          已删除
+  - 下一步：
+    - 继续保持 `systemd manager` / `direct manager`
+      两条 bootstrap 路径的 smoke 与实机验证口径一致
+
+- 2026-04-10 已完成 bootstrap `archive_dest` 默认来源修复：
+  - 当前已确认 root cause：
+    - `scripts/b_pg_flashback.sh`
+      在未显式传入 `--archive-dest` 时，
+      直接把 `ARCHIVE_DEST` 写成 `${PGDATA}/pg_wal`
+    - 这会覆盖 PostgreSQL 已配置的 `archive_command`
+      归档目录 autodiscovery
+    - 结果是 `pg_flashback_summary_progress`
+      只统计 `pg_wal` recent tail，
+      而不是完整 archive
+  - 当前修复已完成：
+    - bootstrap 默认优先查询 PostgreSQL：
+      - `archive_library`
+      - `archive_command`
+    - 当 `archive_command` 可识别为本地归档路径时，
+      自动把该目录写入：
+      - summaryd config `archive_dest=...`
+      - `ALTER DATABASE ... SET pg_flashback.archive_dest = ...`
+    - 仅在 autodiscovery 不可用时，
+      才回退到 `${PGDATA}/pg_wal`
+    - 已新增回归：
+      - `tests/summaryd/bootstrap_archive_autodiscovery_smoke.sh`
+    - `README.md` / `summaryd/README.md`
+      已同步更新默认 archive 来源说明
+  - 当前验证已完成：
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config check-summaryd`
+    - 本机 `18pg` / `alldb` 真实复核：
+      - 修复前：
+        - `current_setting('pg_flashback.archive_dest')`
+          为 `/isoTest/18pgdata/pg_wal`
+        - `pg_wal` 实际只有 `129` 段
+        - `pg_flashback_summary_progress`
+          显示 `completed_segments=129`
+      - 修复后重新 bootstrap：
+        - `current_setting('pg_flashback.archive_dest')`
+          变为 `/walstorage/18waldata`
+        - `debug.json` 中 `archive_dest`
+          变为 `/walstorage/18waldata`
+        - `pg_flashback_summary_progress`
+          变为：
+          - `stable_oldest_segno=50177`
+          - `stable_newest_segno=51574`
+          - `completed_segments=1`
+          - `missing_segments=1397`
+          - `progress_pct=0.0715307582260372`
+      - 已确认当前统计窗口已切到完整 archive，而不再误报为
+        `pg_wal` recent tail 的 `129 / 129`
+  - 下一步：
+    - 继续观察大 backlog archive 下的 summary 追平速度与 ETA 口径
+
+- 2026-04-10 已启动 summary backlog recent-first 调度修复：
+  - 当前已确认现场表现：
+    - `archive_dest + pg_wal` 候选窗口虽然已合并
+    - 但 backlog 很大时，`pg_flashback_summary_progress`
+      主要表现为 `first_gap_from_oldest_segno` 向新推进
+    - 最新端 `first_gap_from_newest_segno`
+      长时间不动，用户感知等价于“先做最远的，再慢慢往近推进”
+  - 当前已确认 root cause：
+    - 内嵌 `fb_summary_service`
+      的 cold backlog enqueue 当前按 oldest-first 填充
+    - 外置 `summaryd` standalone core
+      当前也按 oldest-first 串行扫描候选
+  - 本轮目标固定为：
+    - `archive_dest + pg_wal` 合并候选后，统一改成 recent-first
+    - 最近段优先进入 summary，避免 backlog 先消化最老端
+    - 保持当前并发模型不退化，必要时同步收口 debug / 回归断言
+
+- 2026-04-10 已启动 summary daemon 交付面重构：
+  - 当前已确认新要求：
+    - 不再保留 bootstrap 中的 `service/systemd` 生命周期管理
+    - 用户入口改为脚本式手动启停
+    - 需要保留一键：
+      - `start`
+      - `stop`
+      - `status`
+      - `run-once`
+  - 本轮目标固定为：
+    - 完全删除 bootstrap 中的 systemd/service 相关逻辑
+    - 保留 `pg_flashback-summaryd` 二进制本体
+    - 新增纯脚本式 summary runner
+    - setup/remove 改为围绕脚本 runner 管理 config / pid / log / extension
+
+- 2026-04-10 已完成仓库产物清理：
+  - 已删除当前口径下永不会被用户使用的构建/运行残留
+  - 已清理范围包括：
+    - 根仓库中的 `*.o` / `*.so` / 本地二进制 / `results/`
+      / `cron_daily_update.log`
+      / `summaryd/pg_flashback-summaryd.conf`
+      / release gate 单次运行输出
+    - 开源镜像中误带入的 `summaryd/*.o`
+      / `summaryd/vendor/*.o`
+      / `summaryd/pg_flashback-summaryd.conf`
+  - 已补齐防回流：
+    - `.gitignore` 新增运行生成配置、cron 日志与 release gate 输出忽略
+    - `scripts/sync_open_source.sh`
+      已改为全镜像删除 `*.o` / `*.so` / `*.bc`
+      与生成态 `summaryd/pg_flashback-summaryd.conf`
+    - `Makefile` 的 `check-summaryd`
+      已新增 `tests/summaryd/open_source_artifacts_smoke.sh`
+  - 当前验证已完成：
+    - `bash -n tests/summaryd/open_source_artifacts_smoke.sh scripts/sync_open_source.sh`
+    - `bash scripts/sync_open_source.sh`
+    - `bash tests/summaryd/open_source_artifacts_smoke.sh`
+    - 已确认根仓库与 `open_source/pg_flashback/`
+      不再残留目标产物
+
+- 2026-04-10 已完成 bootstrap 交付面收口：
+  - 根 README / 开源 README 已改为只保留 `scripts/b_pg_flashback.sh`
+    的交互式使用方式
+  - `scripts/bootstrap_pg_flashback.sh` 已直接改名为
+    `scripts/b_pg_flashback.sh`
+  - 新脚本当前默认通过交互式提示收集
+    `pg_config` / `PGDATA` / `dbname` / `dbuser` / `db-password`
+  - 已补重复初始化判定：
+    - 若目标环境已经具备同名 service、对应 config/unit 文件、
+      扩展已安装到当前版本、且数据库级 `pg_flashback.archive_dest`
+      已等于目标值，则再次执行 setup 返回 `already_initialized`
+      并直接退出
+    - 若只满足其中一部分，则视为半初始化现场，继续按 setup 修复
+  - `summaryd/README.md`、开源镜像同步脚本与 smoke test
+    已同步切到新脚本名与新入口
+  - 当前验证已完成：
+    - `bash -n scripts/b_pg_flashback.sh tests/summaryd/bootstrap_help_smoke.sh tests/summaryd/readme_surface_smoke.sh scripts/sync_open_source.sh`
+    - `bash tests/summaryd/bootstrap_help_smoke.sh`
+    - `bash tests/summaryd/readme_surface_smoke.sh`
+    - `bash scripts/sync_open_source.sh`
+
+- 2026-04-10 已启动 bootstrap 交互输入即时校验修复：
+  - 当前已确认 root cause：
+    - `scripts/b_pg_flashback.sh`
+      的 `prompt_value_if_needed()` 只校验“非空”
+    - 对 `pg_config` / `PGDATA`
+      没有在输入当下执行可执行性/目录存在性校验
+    - 因此错误路径会继续进入下一轮 prompt，
+      而不是立刻报错退出
+  - 本轮目标固定为：
+    - 对每个交互输入在可判断的范围内立即校验
+    - `pg_config` 错误时，不再继续提示 `PGDATA`
+    - `PGDATA` 错误时，不再继续提示数据库参数
+  - 当前修复已完成：
+    - 新增字段级即时校验：
+      - `pg_config` 必须“存在且可执行”
+      - `PGDATA` 必须“目录存在”
+      - 交互输入的数据库密码不能为空
+    - 错误输入当前会在该字段读取后立刻 `die`
+      ，不再继续进入下一轮 prompt
+    - 已新增回归：
+      - `tests/summaryd/bootstrap_prompt_validation_smoke.sh`
+    - `Makefile` 的 `check-summaryd`
+      已挂入该 smoke test
+    - README / 开源 README 已补充“交互输入即时校验”说明
+
+- 2026-04-10 已完成 bootstrap 数据库端口交互修复：
+  - 已确认 root cause：
+    - `scripts/b_pg_flashback.sh`
+      启动时把 `DB_PORT` 预设成 `${PGPORT:-5432}`
+    - 导致交互模式不会再提示数据库端口
+    - `--remove` 等路径会直接沿用默认 `5432`
+      去连接本地 socket
+  - 当前修复已完成：
+    - 交互模式新增 `Database port` 提示
+    - `DB_PORT` 改为仅在交互读取或显式 `--db-port`
+      时赋值，不再静默写死
+
+- 2026-04-10 已完成 bootstrap service scope / 启动校验修复：
+  - 已确认 root cause：
+    - `scripts/b_pg_flashback.sh`
+      在 `CentOS 8/9` 上只按平台默认 `user scope`
+      ，没有额外核对当前 OS 用户是否拥有目标 `PGDATA`
+    - root 下对 `18pg` 集群执行 setup 时，
+      会把 config/unit 写到 root 的 user manager，
+      再尝试拉起第二个 `summaryd`
+    - 若同一 `PGDATA` 已有 `18pg` 自己的 daemon 持有 cluster lock，
+      新服务会持续 `auto-restart`
+    - 旧脚本又只执行 `enable --now`
+      ，没有校验 service 是否真的进入 `active`
+      ，最终把失败现场误报成 `bootstrap_result=ok`
+  - 当前修复已完成：
+    - 新增 `PGDATA` owner 识别：
+      - 默认 `user scope` 仅在“当前 OS 用户就是 `PGDATA` owner”时保留
+      - 否则自动回落到 `system scope`
+    - `system scope` unit 当前统一按 `PGDATA` owner 身份运行，
+      不再错误使用当前 shell 用户
+    - setup 在 `enable --now` 后会轮询校验 service 是否进入 `active`
+      ；未成功时直接报错并附带 `systemctl status`
+    - dry-run / setup / remove 输出当前已补 `service_os_user`
+      观测字段
+    - 已新增 smoke：
+    - `tests/summaryd/bootstrap_service_scope_smoke.sh`
+        覆盖 foreign-owner `PGDATA` 的 scope 回落
+      - 同时锁住“服务未真正 active 时 bootstrap 不得返回 ok”
+
+- 2026-04-10 已完成 bootstrap 非 root 执行约束收口：
+  - 当前新增要求已落实：
+    - `scripts/b_pg_flashback.sh`
+      必须在非 root OS 用户下执行
+    - root 运行会在任何 prompt / build / systemd / psql
+      动作之前直接报错退出
+  - 当前修复已完成：
+    - 新增早期 `EUID` 拦截，连 `--help` 也不再允许 root 进入
+    - 新增 smoke：
+      - `tests/summaryd/bootstrap_nonroot_smoke.sh`
+        锁住“root 运行立即失败”
+    - 现有 bootstrap smoke
+      已统一改为在 `18pg` 用户上下文中执行
+    - `README.md` / `summaryd/README.md`
+      已补齐“必须以非 root 用户运行”的对外说明
+
+- 2026-04-10 已完成 bootstrap 固定服务名收口：
+  - 当前新增要求已落实：
+    - `b_pg_flashback.sh` 生成/管理的 service 名称固定为
+      `pg_flashback-summaryd`
+    - 不再按 `PGDATA basename` 派生不同 service 名
+  - 当前修复已完成：
+    - 脚本内部固定 `SERVICE_NAME=pg_flashback-summaryd`
+    - `setup/remove/status` 输出当前统一使用固定 service 名
+    - `--service-name` 覆盖入口已移除
+    - `README.md` / `summaryd/README.md`
+      已补齐固定 service 名说明
+    - `bootstrap_help_smoke`
+      已锁住固定 service 名口径
+
+- 2026-04-10 已完成 bootstrap 交互默认值收口：
+  - 当前新增要求已落实：
+    - 交互式执行 `./b_pg_flashback.sh`
+      时，能从环境拿到的字段会先作为 `[默认]` 展示
+    - 用户直接回车采用默认，手工输入则覆盖默认
+    - `PG_CONFIG_BIN`
+      的默认值当前只取 `which pg_config`
+      ，不读取环境变量
+    - 端口默认值当前只取 `PGPORT`
+      （无值时再回落 `5432`）
+    - 提示顺序当前固定为：
+      - `pg_config`
+      - `PGDATA`
+      - `dbname`
+      - `dbuser`
+      - `db-password`
+      - `db-port`
+  - 当前修复已完成：
+    - 新增 env/default 解析：
+      - `PGDATA`
+      - `PGDATABASE`
+      - `PGUSER`
+      - `PGPASSWORD`
+      - `PGPORT`
+      - `PGHOST`
+      - `PGFLASHBACK_ARCHIVE_DEST`
+      - `PGFLASHBACK_INTERVAL_MS`
+      - `PGFLASHBACK_SYSTEMD_SCOPE`
+    - 新增 smoke：
+      - `tests/summaryd/bootstrap_prompt_defaults_smoke.sh`
+        锁住环境默认值与
+        `dbuser -> db-password -> db-port`
+        提示顺序
+    - `README.md` / `summaryd/README.md`
+      已补齐默认值来源与提示顺序说明
+
+- 2026-04-10 已完成 bootstrap 启动失败诊断输出补齐：
+  - 当前新增要求已落实：
+    - 当 `summaryd` service 启动失败时，
+      终端输出直接打印可执行的诊断命令
+  - 当前修复已完成：
+    - 失败输出当前会打印：
+      - `systemctl status`
+      - `journalctl`
+      - 前台 `--foreground` 启动命令
+    - `user scope` 失败时，额外打印：
+      - `XDG_RUNTIME_DIR`
+      - `DBUS_SESSION_BUS_ADDRESS`
+        导出命令
+    - `tests/summaryd/bootstrap_service_scope_smoke.sh`
+      已锁住上述输出
+
+- 2026-04-10 已完成 bootstrap remove 的 legacy daemon 清理修复：
+  - 已确认 root cause：
+    - `--remove`
+      只处理当前固定名 `pg_flashback-summaryd.service`
+    - 旧命名规则留下的
+      `pg_flashback-summaryd-*.service/.conf`
+      与其运行中的 daemon
+      不会被覆盖
+    - 已安装的 `$(pg_config --bindir)/pg_flashback-summaryd`
+      也不会删除
+  - 当前修复已完成：
+    - remove 当前会扫描同一 `PGDATA`
+      下的 legacy `pg_flashback-summaryd*.conf`
+    - 对命中的 legacy service：
+      - stop
+      - disable
+      - 删除 unit/config
+    - 额外按 `--config <path>` 识别并终止同一 `PGDATA`
+      的残留 `pg_flashback-summaryd` 进程
+    - remove 当前会删除已安装的
+      `$(pg_config --bindir)/pg_flashback-summaryd`
+    - 已新增回归：
+      - `tests/summaryd/bootstrap_remove_legacy_service_smoke.sh`
+    - 新增即时校验：
+      - `DB_PORT` 必须是纯数字
+    - README / `summaryd/README.md`
+      已同步补充端口提示说明
+  - 当前验证已完成：
+    - `bash tests/summaryd/bootstrap_help_smoke.sh`
+    - 已确认 `--remove` 交互输入 `5832`
+      后，脚本会把 `-p 5832` 传给 `psql`
+
+- 2026-04-10 已完成 bootstrap 数据目录保留与安全清理收口：
+  - 当前行为已改为：
+    - `--remove` 不再删除 `PGDATA/pg_flashback`
+    - remove 结束时会单独打印保留目录与“需手工删除”的提示块
+    - setup 若发现已有 `PGDATA/pg_flashback`
+      ，只做受限安全清理：
+      - 清空 `runtime/`
+      - 清理 `meta/summaryd` 的 stale `state/debug/lock`
+      - 清理 `meta/summary` 的临时 `.tmp.*`
+      - 保留 `recovered_wal/` 与正式 summary/meta 文件
+  - 终端输出当前已改为分阶段展示：
+    - `Preflight`
+    - `Existing Data Directory Check`
+    - `Safe Cleanup`
+    - `Build / Install`
+    - `Database Changes`
+    - `Service Setup`
+    - `Retained Data Directory`
+  - 当前验证已完成：
+    - `bash tests/summaryd/bootstrap_data_dir_safety_smoke.sh`
+    - 已确认 remove 保留 `PGDATA/pg_flashback`
+      且 setup 只做受限安全清理
+
 - 已确认下一条 summary 主线架构变更：
   - 目标改为把当前 preload/bgworker 形态的 summary 服务外移为库外
     daemon `pg_flashback-summaryd`
@@ -174,17 +580,16 @@
       - `alldb` 现场连续 `SELECT * FROM pg_flashback_summary_progress`
         在人为 `pg_switch_wal()` 扰动后已确认只出现
         `190/1 -> 191/0` 的单次收敛，不再出现用户先前贴出的来回跳动
-  - 2026-04-09 晚间已继续推进下一阶段：
-    - 目标固定为把 daemon 的 `build/cleanup`
-      从当前 `libpq + debug helper` 形态继续抽离
-      为真正不依赖数据库连接的 core
-    - 当前实现策略固定为：
+  - 2026-04-09 晚间已完成下一阶段主改造：
+    - daemon 的 `build/cleanup`
+      已从 `libpq + debug helper` 形态下沉为真正不依赖数据库连接的 core
+    - 当前实现固定为：
       - 保持 query-side / SQL 面不变
-      - daemon 改为直接读取 `PGDATA` / `archive_dest` / `pg_wal`
+      - daemon 直接读取 `PGDATA` / `archive_dest` / `pg_wal`
       - 优先复用现有 `fb_summary.c` 的 build 主链
       - 通过独立 frontend-safe / standalone shim
         提供 runtime path、内存、WAL reader 与 cleanup 所需依赖
-      - README / 开源 README 最终必须同步明确写清：
+      - README / 开源 README 已同步明确写清：
         - 如何编译
         - 编译产物在哪里
         - `PGDATA/pg_flashback/` 目录与产物何时生成
@@ -218,11 +623,190 @@
       - `make PG_CONFIG=/home/18pg/local/bin/pg_config PGPORT=5832 PGUSER=18pg installcheck REGRESS='fb_summary_daemon_state'`
       - `alldb` 现场复测：
         - daemon state 已正常发布
+  - 2026-04-10 清晨已补 daemon 交付路径文档澄清：
+    - `README.md` / `summaryd/README.md`
+      已明确区分：
+      - `make` 后仓库内产物 `summaryd/pg_flashback-summaryd`
+      - `make install` 后安装产物
+        `$(pg_config --bindir)/pg_flashback-summaryd`
+  - 2026-04-10 已追加下一条 summary 视图可观测性改造：
+    - 当前缺口已确认：
+      - 仅看现有 `service_enabled` /
+        `pg_flashback_summary_service_debug`
+        仍无法明确分辨“当前是否由 external daemon 供数”
+      - 外部 daemon 已启动时，也缺少单独的心跳时间列用于观察实时状态刷新
+    - 当前目标固定为：
+      - 在 summary 视图中显式暴露状态来源 `external/shmem/none`
+      - 显式暴露 external state 是否存在、是否 stale
+      - 显式暴露 external daemon 最近一次状态发布时间
+  - 2026-04-10 上午已完成 summary 视图 external daemon 可观测性补齐：
+    - 当前修复已落地：
+      - `pg_flashback_summary_progress`
+        / `pg_flashback_summary_service_debug`
+        已新增：
+        - `state_source`
+        - `daemon_state_present`
+        - `daemon_state_stale`
+        - `daemon_state_published_at`
+      - `src/fb_summary_state.c`
+        已把 external state file 的 `st_mtime`
+        收口为 `published_at`
+      - `src/fb_summary_service.c`
+        已将 external/shmem/none 作为显式状态来源写入 public SQL 面
+      - `src/fb_summary_service.c`
+        同时修复了无 preload 场景下
+        `fb_summary_cleanup_plan_debug()`
+        / `fb_summary_service_cleanup_debug()`
+        对空 `fb_summary_service_lock`
+        直接取锁导致 backend crash 的缺口
+      - 扩展版本已前滚到 `0.2.1`，
+        并补齐 `0.2.0 -> 0.2.1` 升级链，
+        避免 public 视图签名漂移
+      - `README.md` / `summaryd/README.md`
+        / 开源 README
+        已补外部 daemon 观测字段说明
+    - 当前验证已完成：
+      - `make PG_CONFIG=/home/18pg/local/bin/pg_config PGPORT=5832 PGUSER=18pg installcheck REGRESS='fb_summary_daemon_state fb_summary_service fb_extension_upgrade'`
+      - `su - 18pg -c '/home/18pg/local/bin/pg_flashback-summaryd --pgdata /isoTest/18pgdata --archive-dest /isoTest/18pgdata/pg_wal --once --foreground'`
+      - `su - 18pg -c "/home/18pg/local/bin/psql -p 5832 -d contrib_regression -x -c \"select service_enabled, state_source, daemon_state_present, daemon_state_stale, daemon_state_published_at, estimated_completion_at from pg_flashback_summary_progress; select service_enabled, launcher_pid, state_source, daemon_state_present, daemon_state_stale, daemon_state_published_at, scan_count, build_count, cleanup_count, last_scan_at from pg_flashback_summary_service_debug;\""`
+    - 当前现场结果已确认：
+      - `pg_flashback_summary_progress`
+        可直接看到
+        `service_enabled=t`
+        `state_source=external`
+        `daemon_state_present=t`
+        `daemon_state_stale=f`
+      - `pg_flashback_summary_service_debug`
+        可直接看到
+        `launcher_pid`
+        `scan_count/build_count/cleanup_count`
+        与 `last_scan_at`
+    - 因该改动触及公开 SQL 视图签名，当前要求同步前滚扩展版本并补升级链
           `throughput_window_started_at` / `last_build_at`
         - `pg_flashback_summary_progress`
           已从 `service_enabled=f, estimated_completion_at=NULL`
           恢复为
           `service_enabled=t, estimated_completion_at=2026-04-09 23:53:33.421168+08`
+  - 2026-04-10 上午已接受新的交付面需求：
+    - 目标固定为：
+      - 新增数据库 OS 用户可直接执行的一键 bootstrap 脚本
+      - 用户只需提供数据库、账号与密码，
+        即可自动完成 build/install、扩展安装升级、summary daemon 注册与启动
+    - 当前实现策略已拍板：
+      - 采用 `systemd` 形态，不再使用临时 `nohup/pidfile`
+      - 按 CentOS 主版本做默认适配：
+        - `CentOS 7` 默认 `system scope`
+        - `CentOS 8/9` 默认 `user scope`
+      - 同时保留 `--systemd-scope=user|system` 显式覆盖
+  - 2026-04-10 上午用户继续补充 bootstrap 删除语义：
+    - 同一脚本除一键搭建外，还必须提供一键删除
+    - 删除动作的最小范围固定为：
+      - 关闭并禁用 summary daemon 进程
+      - 删除 bootstrap 生成的 systemd unit / config 文件
+      - 在目标数据库执行 `DROP EXTENSION pg_flashback`
+  - 2026-04-10 上午已完成 bootstrap script + CentOS systemd 适配：
+    - 当前实现已落地：
+      - 新增 `scripts/bootstrap_pg_flashback.sh`
+      - 默认 `setup` 动作会执行：
+        - `make` / `make install`
+        - `CREATE EXTENSION IF NOT EXISTS pg_flashback`
+        - `ALTER EXTENSION pg_flashback UPDATE TO '0.2.1'`
+        - 生成 summaryd config / systemd unit
+        - 注册并启动 `pg_flashback-summaryd`
+      - 新增 `--remove` 动作会执行：
+        - `stop + disable` summary daemon
+        - 删除 bootstrap 生成的 config / unit 文件
+        - `DROP EXTENSION IF EXISTS pg_flashback CASCADE`
+      - CentOS 默认适配固定为：
+        - `CentOS 7 -> system scope`
+        - `CentOS 8/9 -> user scope`
+      - 同时支持：
+        - `--systemd-scope=user|system`
+        - `--dry-run`
+        - `--db-password` 或交互式密码输入
+      - 开源镜像同步规则已补：
+        - `scripts/bootstrap_pg_flashback.sh`
+          现会进入 `open_source/pg_flashback/`
+    - 当前验证已完成：
+      - `bash -n scripts/bootstrap_pg_flashback.sh tests/summaryd/bootstrap_help_smoke.sh`
+      - `bash tests/summaryd/bootstrap_help_smoke.sh`
+      - `make PG_CONFIG=/home/18pg/local/bin/pg_config check-summaryd`
+      - `scripts/bootstrap_pg_flashback.sh --dry-run --pg-config /home/18pg/local/bin/pg_config --pgdata /isoTest/18pgdata --dbname contrib_regression --dbuser 18pg --db-password secret`
+      - `scripts/bootstrap_pg_flashback.sh --dry-run --remove --pg-config /home/18pg/local/bin/pg_config --pgdata /isoTest/18pgdata --dbname contrib_regression --dbuser 18pg --db-password secret`
+      - `su - 18pg -c '/root/pg_flashback/scripts/bootstrap_pg_flashback.sh --dry-run --pg-config /home/18pg/local/bin/pg_config --pgdata /isoTest/18pgdata --dbname contrib_regression --dbuser 18pg --db-password secret'`
+  - 2026-04-10 上午已补 fresh-cluster bootstrap 缺口并完成真实 setup/remove 手测：
+    - 根因已确认有三层：
+      - `src/fb_summary.c`
+        的 `fb_summary_collect_selected_segments()`
+        在 external state 存在、但 session 未显式设置
+        `archive_dest/archive_dir` 时，
+        会对空目录字符串直接 `pfree()`，
+        导致 fresh cluster 查询
+        `pg_flashback_summary_progress`
+        backend crash
+      - bootstrap 旧逻辑只把 `archive_dest`
+        写给 daemon config，
+        没把查询侧默认 GUC 一并落到数据库，
+        导致新会话直接查 progress/debug 视图时
+        无法按 daemon 实际归档路径统计
+      - `CentOS 8/9 user scope`
+        在 `su - 18pg` 场景下，
+        若仅有 `/run/user/<uid>/bus`、
+        但环境里缺 `DBUS_SESSION_BUS_ADDRESS`，
+        `systemctl --user` 会误判不可用
+    - 当前修复已落地：
+      - `src/fb_summary.c`
+        已对 `archive_dir` / `pg_wal_dir` / `recovered_dir`
+        的释放改为先判空
+      - `scripts/bootstrap_pg_flashback.sh`
+        `setup` 现会自动执行
+        `ALTER DATABASE ... SET pg_flashback.archive_dest = ...`
+      - `scripts/bootstrap_pg_flashback.sh`
+        `remove` 现会自动
+        `RESET pg_flashback.archive_dest/archive_dir`
+      - `scripts/bootstrap_pg_flashback.sh`
+        已在 `user scope`
+        自动补 `XDG_RUNTIME_DIR`
+        与 `DBUS_SESSION_BUS_ADDRESS`
+      - `sql/fb_summary_daemon_state.sql`
+        / `expected/fb_summary_daemon_state.out`
+        已补回归锁住：
+        - `RESET archive_dir/archive_dest`
+          后 external state 仍可安全读视图
+        - external state 场景下
+          `state_source/daemon_state_*`
+          继续按预期返回
+    - 当前验证已完成：
+      - `bash tests/summaryd/bootstrap_help_smoke.sh`
+      - `make PG_CONFIG=/home/18pg/local/bin/pg_config PGPORT=5840 PGUSER=18pg installcheck REGRESS='fb_summary_daemon_state'`
+      - fresh PG18 临时集群真实 `setup`：
+        - `systemctl --user status pg_flashback-summaryd-bootstrap-temp`
+          显示 `active (running)`
+        - `pg_flashback_summary_progress`
+          返回：
+          - `completed_segments = 2`
+          - `missing_segments = 0`
+          - `progress_pct = 100`
+          - `state_source = external`
+        - `pg_flashback_summary_service_debug`
+          返回：
+          - `summary_files = 2`
+          - `completed_summaries = 2`
+          - `missing_summaries = 0`
+      - 同一临时集群真实 `remove`：
+        - `systemctl --user status pg_flashback-summaryd-bootstrap-temp`
+          返回 `Unit ... could not be found`
+        - `/home/18pg/.config/systemd/user/pg_flashback-summaryd-bootstrap-temp.service`
+          与
+          `/home/18pg/.config/pg_flashback/pg_flashback-summaryd-bootstrap-temp.conf`
+          已删除
+        - `pg_extension` 中已无 `pg_flashback`
+        - `current_setting('pg_flashback.archive_dest', true)` /
+          `current_setting('pg_flashback.archive_dir', true)`
+          均为空
+        - `select * from pg_flashback_summary_progress`
+          返回
+          `ERROR: relation "pg_flashback_summary_progress" does not exist`
 
 - 已完成修复 PG14 `documents @ 2026-04-09 06:25:40.377546+00`
   的 `failed to replay heap insert`，并已确认 `PG14-18` 全部带上运行时修复：
@@ -3125,6 +3709,63 @@
       - `documents` 首条大表 truth 已过
       - `users` 的 summary payload/cached lookup 路径与无-summary backtracking/FPI
         都还存在独立 blocker
+  - 2026-04-10 下午 release gate `18pg` 新增下一条 correctness blocker：
+    - 现场：
+      - `random_flashback_1.documents @ 2026-04-10 04:05:44.660105+00`
+      - `3/9 55% xact-status` 约 `+37349.947 ms`
+      - `3/9 100% payload` 约 `+69069.254 ms`
+      - 随后在 `4/9 replay discover precomputed`
+        直接报
+        `ERROR: too many shared backtracking rounds while resolving missing FPI`
+    - 当前结论：
+      - 这条 case 同时暴露两层问题：
+        - `xact-status` 仍存在 summary/exact-fill 未命中的 residual tail
+        - residual tail 后续又把 replay discover 推进到 shared backtracking 上限
+      - 本轮必须把
+        `xact-status 未命中`
+        与
+        `shared backtracking rounds` 这两层一起对齐，
+        不能只改表层报错或单独放大回溯轮次
+  - 2026-04-10 下午已对齐上述 `documents` 双重 blocker 的主根因：
+    - 根因已确认：
+      - release gate 已注入 `pg_flashback.target_snapshot`
+      - 但 `xact-status` 旧逻辑对“summary/WAL 都拿不到 outcome、
+        但 clog 已能确认 committed/aborted”的 xid
+        仍直接留成 unresolved
+      - 这些 xid 在 target snapshot 口径下本可直接判定
+        `before target` / `after target`
+      - unresolved xid 会把大量本不该继续保留的 records 留到 replay 输入，
+        最终把 `discover precomputed`
+        推到 `shared backtracking rounds` 上限
+    - 当前修复已落地：
+      - `src/fb_wal.c`
+        已新增 target snapshot + clog fallback：
+        - 当 xid 在 WAL outcome 中缺失时，
+          改为直接用 `TransactionIdDidCommit/Abort`
+          + snapshot 可见性补齐状态
+        - 同时把该补位接入
+          `fb_wal_xid_committed_after_target()`
+          / `fb_wal_set_record_status()`
+          与 serial unresolved fallback 收口
+      - 新增 debug contract
+        `fb_target_snapshot_clog_status_debug`
+      - `sql/fb_target_snapshot.sql`
+        / `expected/fb_target_snapshot.out`
+        已补最小回归锁住：
+        - committed xid 且 snapshot 可见
+          => `committed_before_target`
+        - committed xid 且 snapshot 不可见
+          => `committed_after_target`
+    - 当前验证已完成：
+      - `make PG_CONFIG=/home/18pg/local/bin/pg_config PGPORT=5832 PGUSER=18pg PGHOST=/tmp installcheck REGRESS='fb_target_snapshot'`
+      - 18pg `alldb` 现场复跑同一条 release gate query：
+        - `3/9 55% xact-status`
+          已从约 `+37349.947 ms`
+          降到约 `+1409.804 ms`
+        - 原先在 `4/9 replay discover precomputed`
+          立即报出的
+          `ERROR: too many shared backtracking rounds while resolving missing FPI`
+          在本轮观察窗口内未再复现
 
 ## 下一步
 
@@ -3154,6 +3795,12 @@
     的 correctness blocker 拆开并修掉：
     - 有 summary 时为什么会触发 invalid `pfree`
     - 无 summary 时为什么 shared backtracking/FPI 仍过不去
+  - 紧接着处理
+    `random_flashback_1.documents @ 2026-04-10 04:05:44.660105+00`
+    的新 blocker：
+    - 先追清 `3/9 xact-status` residual unresolved xid
+    - 再追清为什么 discover/precomputed 会把相同 case 推到
+      `too many shared backtracking rounds while resolving missing FPI`
   - 修完后再继续 correctness-only 口径把整套 truth compare 跑完
   - 继续推进 metadata 并行第二版实现
     - leader 共享 resolved segment snapshot，去掉 worker 侧重复 resolver/prepare
@@ -3551,7 +4198,7 @@
 - `pg_flashback-summaryd` 已落地到顶层构建、安装与开源镜像
   - `make` / `make install` 会同时生成并安装 daemon
   - daemon 已支持 `--config` / `--pgdata` / `--archive-dest` /
-    `--conninfo` / `--once` / `--foreground`
+    `--once` / `--foreground`
   - 已增加单实例 `lock`、`state.json` / `debug.json` 发布、
     runtime hint 写入与 SQL 视图适配
   - 已确认：
@@ -3559,8 +4206,6 @@
     - `make ... installcheck REGRESS='fb_summary_daemon_state fb_summary_service fb_summary_prefilter fb_summary_v3'`
     - `su - 18pg -c '/home/18pg/local/bin/pg_flashback-summaryd ... --once --foreground'`
       均通过
-- 继续把 daemon 内部 build/cleanup 从当前 `libpq + extension debug helper`
-  下沉为真正 frontend-safe 的 summary core
 - 继续逐步从 preload/shared memory summary 服务迁移到 daemon 状态快照
 - 在 PG14 上补一条最小 summary service 回归，锁住“preload 生效后 launcher/worker 真注册”的行为
 - 评估是否要把 relation birth 判定从当前 `track_commit_timestamp` 路径继续下沉为不依赖实例配置的实现

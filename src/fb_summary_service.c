@@ -145,9 +145,20 @@ typedef struct FbSummaryServiceScheduleDebugContext
 	int index;
 } FbSummaryServiceScheduleDebugContext;
 
+typedef enum FbSummaryStateSource
+{
+	FB_SUMMARY_STATE_SOURCE_NONE = 0,
+	FB_SUMMARY_STATE_SOURCE_EXTERNAL,
+	FB_SUMMARY_STATE_SOURCE_SHMEM
+} FbSummaryStateSource;
+
 typedef struct FbSummaryServiceProgressStats
 {
 	bool service_enabled;
+	int state_source;
+	bool daemon_state_present;
+	bool daemon_state_stale;
+	TimestampTz daemon_state_published_at;
 	int queue_capacity;
 	int registered_workers;
 	int active_workers;
@@ -246,6 +257,7 @@ static void fb_summary_service_run_cleanup(void);
 static void fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats,
 												bool prefer_debug_state);
 static void fb_summary_service_compute_eta(FbSummaryServiceProgressStats *stats);
+static const char *fb_summary_state_source_name(int state_source);
 static bool fb_summary_service_build_candidate_safe(const FbSummaryBuildCandidate *candidate);
 static bool fb_summary_service_candidate_in_snapshot(bool snapshot_valid,
 													 TimeLineID snapshot_timeline_id,
@@ -475,9 +487,9 @@ fb_summary_service_compare_priority(int queue_kind_a,
 	if (queue_kind_a == FB_SUMMARY_SERVICE_QUEUE_COLD)
 	{
 		if (segno_a < segno_b)
-			return 1;
-		if (segno_a > segno_b)
 			return -1;
+		if (segno_a > segno_b)
+			return 1;
 	}
 	else
 	{
@@ -762,7 +774,7 @@ fb_summary_service_claim_tasks(FbSummaryBuildCandidate *candidates_out,
 		first_queue_kind = task->queue_kind;
 		batch_timeline_id = task->candidate.timeline_id;
 		next_batch_segno = (first_queue_kind == FB_SUMMARY_SERVICE_QUEUE_COLD) ?
-			task->candidate.segno + 1 :
+			task->candidate.segno - 1 :
 			task->candidate.segno - 1;
 		claim_count++;
 	}
@@ -873,7 +885,7 @@ fb_summary_service_run_scan(void)
 			continue;
 	}
 
-	for (i = 0; i < candidate_count; i++)
+	for (i = candidate_count - 1; i >= 0; i--)
 	{
 		int recent_rank = fb_summary_service_recent_rank_for_index(i, candidate_count);
 		int queue_kind = fb_summary_service_queue_kind_for_rank(recent_rank, hot_window);
@@ -1027,9 +1039,12 @@ fb_summary_service_run_cleanup(void)
 			if (unlink(path) == 0)
 			{
 				total_bytes -= Min(total_bytes, (uint64) st.st_size);
-				LWLockAcquire(fb_summary_service_lock, LW_EXCLUSIVE);
-				fb_summary_service->cleanup_count++;
-				LWLockRelease(fb_summary_service_lock);
+				if (fb_summary_service != NULL && fb_summary_service_lock != NULL)
+				{
+					LWLockAcquire(fb_summary_service_lock, LW_EXCLUSIVE);
+					fb_summary_service->cleanup_count++;
+					LWLockRelease(fb_summary_service_lock);
+				}
 			}
 			continue;
 		}
@@ -1086,9 +1101,12 @@ fb_summary_service_run_cleanup(void)
 		if (unlink(entries[i].path) != 0)
 			continue;
 		total_bytes -= Min(total_bytes, entries[i].size_bytes);
-		LWLockAcquire(fb_summary_service_lock, LW_EXCLUSIVE);
-		fb_summary_service->cleanup_count++;
-		LWLockRelease(fb_summary_service_lock);
+		if (fb_summary_service != NULL && fb_summary_service_lock != NULL)
+		{
+			LWLockAcquire(fb_summary_service_lock, LW_EXCLUSIVE);
+			fb_summary_service->cleanup_count++;
+			LWLockRelease(fb_summary_service_lock);
+		}
 	}
 
 	pfree(entries);
@@ -1142,6 +1160,17 @@ fb_summary_service_collect_progress(FbSummaryServiceProgressStats *stats,
 	else
 		external_state_loaded = use_external_state;
 	authoritative_snapshot = external_state_loaded;
+
+	stats->daemon_state_present = external_state.present;
+	stats->daemon_state_stale = external_state.present && external_state.stale;
+	stats->daemon_state_published_at =
+		external_state.present ? external_state.published_at : 0;
+	if (external_state_loaded)
+		stats->state_source = FB_SUMMARY_STATE_SOURCE_EXTERNAL;
+	else if (fb_summary_service != NULL)
+		stats->state_source = FB_SUMMARY_STATE_SOURCE_SHMEM;
+	else
+		stats->state_source = FB_SUMMARY_STATE_SOURCE_NONE;
 
 	stats->service_enabled = external_state_loaded && external_state.service_enabled;
 	stats->queue_capacity = external_state_loaded ? external_state.queue_capacity : 0;
@@ -1537,6 +1566,20 @@ fb_summary_service_compute_eta(FbSummaryServiceProgressStats *stats)
 	stats->estimated_completion_at = eta_at;
 }
 
+static const char *
+fb_summary_state_source_name(int state_source)
+{
+	switch (state_source)
+	{
+		case FB_SUMMARY_STATE_SOURCE_EXTERNAL:
+			return "external";
+		case FB_SUMMARY_STATE_SOURCE_SHMEM:
+			return "shmem";
+		default:
+			return "none";
+	}
+}
+
 static bool
 fb_summary_service_candidate_in_snapshot(bool snapshot_valid,
 										 TimeLineID snapshot_timeline_id,
@@ -1711,9 +1754,9 @@ fb_summary_service_collect_protected_hashes(uint64 **hashes_out,
 	if (count_out != NULL)
 		*count_out = 0;
 
-	LWLockAcquire(fb_summary_service_lock, LW_SHARED);
-	if (fb_summary_service != NULL)
+	if (fb_summary_service != NULL && fb_summary_service_lock != NULL)
 	{
+		LWLockAcquire(fb_summary_service_lock, LW_SHARED);
 		snapshot_valid = fb_summary_service->snapshot_valid;
 		snapshot_timeline_id = fb_summary_service->snapshot_timeline_id;
 		snapshot_oldest_segno = fb_summary_service->snapshot_oldest_segno;
@@ -1731,8 +1774,8 @@ fb_summary_service_collect_protected_hashes(uint64 **hashes_out,
 				continue;
 			hashes[hash_count++] = task->file_identity_hash;
 		}
+		LWLockRelease(fb_summary_service_lock);
 	}
-	LWLockRelease(fb_summary_service_lock);
 
 	if (!include_snapshot)
 	{
@@ -1875,8 +1918,8 @@ fb_summary_progress_internal(PG_FUNCTION_ARGS)
 	FbSummaryServiceProgressStats stats;
 	TupleDesc tupdesc;
 	HeapTuple tuple;
-	Datum values[20];
-	bool nulls[20];
+	Datum values[24];
+	bool nulls[24];
 	double progress_pct;
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -1962,6 +2005,13 @@ fb_summary_progress_internal(PG_FUNCTION_ARGS)
 		nulls[19] = true;
 	else
 		values[19] = TimestampTzGetDatum(stats.estimated_completion_at);
+	values[20] = CStringGetTextDatum(fb_summary_state_source_name(stats.state_source));
+	values[21] = BoolGetDatum(stats.daemon_state_present);
+	values[22] = BoolGetDatum(stats.daemon_state_stale);
+	if (stats.daemon_state_published_at == 0)
+		nulls[23] = true;
+	else
+		values[23] = TimestampTzGetDatum(stats.daemon_state_published_at);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
@@ -1973,8 +2023,8 @@ fb_summary_service_debug_internal(PG_FUNCTION_ARGS)
 	FbSummaryServiceProgressStats stats;
 	TupleDesc tupdesc;
 	HeapTuple tuple;
-	Datum values[27];
-	bool nulls[27];
+	Datum values[31];
+	bool nulls[31];
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		ereport(ERROR,
@@ -2028,6 +2078,13 @@ fb_summary_service_debug_internal(PG_FUNCTION_ARGS)
 		nulls[26] = true;
 	else
 		values[26] = TimestampTzGetDatum(stats.last_scan_at);
+	values[27] = CStringGetTextDatum(fb_summary_state_source_name(stats.state_source));
+	values[28] = BoolGetDatum(stats.daemon_state_present);
+	values[29] = BoolGetDatum(stats.daemon_state_stale);
+	if (stats.daemon_state_published_at == 0)
+		nulls[30] = true;
+	else
+		values[30] = TimestampTzGetDatum(stats.daemon_state_published_at);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
@@ -2077,7 +2134,9 @@ fb_summary_service_plan_debug(PG_FUNCTION_ARGS)
 				ctx->enqueued[i] = true;
 				ctx->enqueue_order[i] = ++enqueue_count;
 			}
-			for (i = 0; i < ctx->candidate_count && enqueue_count < enqueue_limit; i++)
+			for (i = ctx->candidate_count - 1;
+				 i >= 0 && enqueue_count < enqueue_limit;
+				 i--)
 			{
 				int recent_rank = fb_summary_service_recent_rank_for_index(i,
 																		  ctx->candidate_count);
@@ -2272,7 +2331,9 @@ fb_summary_service_schedule_debug(PG_FUNCTION_ARGS)
 				ctx->enqueued[i] = true;
 				ctx->enqueue_order[i] = ++enqueue_count;
 			}
-			for (i = 0; i < ctx->total_candidates && enqueue_count < enqueue_limit; i++)
+			for (i = ctx->total_candidates - 1;
+				 i >= 0 && enqueue_count < enqueue_limit;
+				 i--)
 			{
 				int recent_rank = fb_summary_service_recent_rank_for_index(i,
 																		  ctx->total_candidates);

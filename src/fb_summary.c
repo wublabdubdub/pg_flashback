@@ -948,9 +948,12 @@ fb_summary_collect_selected_segments(FbSummarySegmentEntry **selected_out,
 	}
 
 done:
-	pfree(archive_dir);
-	pfree(pg_wal_dir);
-	pfree(recovered_dir);
+	if (archive_dir != NULL)
+		pfree(archive_dir);
+	if (pg_wal_dir != NULL)
+		pfree(pg_wal_dir);
+	if (recovered_dir != NULL)
+		pfree(recovered_dir);
 	if (candidates != NULL)
 		pfree(candidates);
 

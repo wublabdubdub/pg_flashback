@@ -64,16 +64,8 @@
 
 ### 2. 运行时边界
 
-当前落地版本中，daemon 允许通过 `--conninfo` 连接数据库，
-调用扩展导出的 debug helper 完成 build/cleanup。
-
-这意味着当前实现的最小启动参数变为：
-
-- `--pgdata`
-- `--archive-dest`
-- `--conninfo`（当前实现必需）
-
-后续 Phase B 再把 `--conninfo` 降为可选甚至移除。
+当前落地版本中，daemon 已直接读取文件系统和 WAL，
+不再要求数据库连接，也不再保留 `--conninfo`。
 
 daemon 的必需输入改为显式配置：
 
@@ -87,8 +79,6 @@ daemon 仅直接读取：
 - `PGDATA/pg_flashback/meta/summary`
 - archive 目录
 - `pg_control` / WAL 文件头中可直接解析的信息
-
-长期目标里，`--conninfo` 只作为可选增强能力，不作为 daemon 工作前提。
 
 ### 3. 状态总线
 
@@ -180,8 +170,7 @@ make PG_CONFIG=/path/to/pg_config install
 ```bash
 pg_flashback-summaryd \
   --pgdata /path/to/pgdata \
-  --archive-dest /path/to/archive \
-  --conninfo "host=/tmp port=5432 dbname=postgres user=postgres connect_timeout=2"
+  --archive-dest /path/to/archive
 ```
 
 也支持：
@@ -191,8 +180,6 @@ pg_flashback-summaryd \
   --config /path/to/pg_flashback-summaryd.conf \
   --foreground
 ```
-
-但当前 config 中同样应显式写入 `conninfo=...`。
 
 ## 兼容迁移
 

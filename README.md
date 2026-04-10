@@ -32,65 +32,96 @@ FROM pg_flashback(
 
 ### 2. 这个东西怎么用
 
-先构建并安装扩展：
+当前 README 只保留 bootstrap 入口。`git clone` 后直接执行：
 
 ```bash
-make PG_CONFIG=/path/to/pg_config
-make PG_CONFIG=/path/to/pg_config install
+scripts/b_pg_flashback.sh
 ```
 
-当前顶层构建也会同时安装独立可执行文件 `pg_flashback-summaryd`
-到 PostgreSQL `bindir`，作为库外 summary daemon 形态的统一交付入口。
+脚本当前强制要求以非 root OS 用户执行；root 运行会直接报错退出。
 
-然后在数据库里创建或升级扩展：
+脚本会交互式提示输入：
 
-```sql
-CREATE EXTENSION pg_flashback;
-```
+- `pg_config` 路径，默认取 `which pg_config`
+- `PGDATA` 路径，默认取环境变量 `PGDATA`
+- 数据库名，默认取环境变量 `PGDATABASE`，否则 `postgres`
+- 数据库用户名，默认取环境变量 `PGUSER`
+- 数据库密码，默认取环境变量 `PGPASSWORD`（提示中隐藏）
+- 数据库端口，默认取环境变量 `PGPORT`，否则 `5432`
 
-```sql
-ALTER EXTENSION pg_flashback UPDATE TO '0.2.0';
-```
+交互顺序固定为：
 
-如果你要在“不重启 PostgreSQL”的前提下获得完整 summary 体验，
-当前可用方式是启动独立 daemon。
+- `pg_config`
+- `PGDATA`
+- `dbname`
+- `dbuser`
+- `db-password`
+- `db-port`
 
-当前实现注意点：
+执行完成后，脚本会自动完成：
 
-- `pg_flashback-summaryd` 目前仍通过 libpq 连接扩展内部 debug helper
-  触发 build / cleanup
-- 因此当前启动时应显式提供 `--conninfo`
-- 如果不写 `--conninfo`，daemon 会退回 libpq 默认连接参数，
-  很容易因为默认 `dbname/user` 不匹配而启动失败
+- 若已存在 `PGDATA/pg_flashback`，先只做受限安全清理：
+  - 清理 `runtime/`
+  - 清理 `meta/summaryd` 下的 stale `state/debug/lock`
+  - 清理 `meta/summary` 下的临时 `.tmp.*`
+  - 保留 `recovered_wal/` 与正式 summary/meta 文件
+- build / install
+- `CREATE EXTENSION` 或 `ALTER EXTENSION UPDATE`
+- 写入 `pg_flashback-summaryd` 的 config
+- 通过 `scripts/pg_flashback_summary.sh` 启动 `pg_flashback-summaryd`
+- 若未显式传 `--archive-dest`，
+  默认优先自动识别 PostgreSQL `archive_command`
+  的本地归档目录；
+  识别不了时才回退到 `PGDATA/pg_wal`
+- 对目标数据库执行
+  `ALTER DATABASE ... SET pg_flashback.archive_dest = ...`
 
-推荐直接按完整参数启动：
+bootstrap 后，summary daemon 的手工入口固定为：
 
 ```bash
-pg_flashback-summaryd \
-  --pgdata /path/to/pgdata \
-  --archive-dest /path/to/archive \
-  --conninfo "host=/tmp port=5432 dbname=postgres user=postgres connect_timeout=2" \
-  --foreground
+scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf start
+scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf stop
+scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf status
+scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf run-once
 ```
 
-也可以改成配置文件方式，但 sample config 中同样应写入 `conninfo=...`。
+注意：
 
-WAL 来源建议：
+- root 用户不能执行该脚本；请切到目标 PostgreSQL OS 用户后再运行
+- 当前 OS 用户必须就是 `PGDATA` owner
+- 终端输出当前会按阶段分隔显示，方便区分：
+  `Preflight` / `Safe Cleanup` / `Build / Install` /
+  `Database Changes` / `Runner Setup`
+- 交互输入会在可判断范围内立即校验：
+  `pg_config` 会校验“存在且可执行”，`PGDATA` 会校验“目录存在”
+- 如果目标环境已经完成同一套初始化，重复执行 setup
+  会返回 `already_initialized` 并直接退出，不会重复改动
+- `--remove` 不会自动删除 `PGDATA/pg_flashback`
+  这个数据目录；脚本会在结束时明确打印保留路径，
+  由用户手工决定是否执行删除
+- `--remove` 当前会额外清理同一 `PGDATA`
+  下的 legacy `pg_flashback-summaryd*.service/.conf`
+  与已安装的 `pg_flashback-summaryd` 二进制
 
-- 若本机 `archive_command` 属于当前支持的本地模式，可依赖 autodiscovery
-- 若归档路径复杂、远程或想避免歧义，显式设置 `pg_flashback.archive_dest`
-
-例如：
-
-```sql
-SET pg_flashback.archive_dest = '/path/to/archive';
-```
-
-启动后先确认 summary 服务状态面已经可见：
+执行完 bootstrap 后，先确认 summary 服务状态面已经可见：
 
 ```sql
 SELECT *
 FROM pg_flashback_summary_progress;
+```
+
+外部 daemon 观测建议重点看这几列：
+
+- `state_source`: 当前状态来自 `external` / `shmem` / `none`
+- `daemon_state_present`: 是否已经发现 external daemon 发布的状态文件
+- `daemon_state_stale`: external 状态文件是否已经过期
+- `daemon_state_published_at`: external daemon 最近一次发布时间
+
+需要看更细的 worker / scan / build / cleanup 实时计数时：
+
+```sql
+SELECT *
+FROM pg_flashback_summary_service_debug;
 ```
 
 建议先检查目标表是否受支持：
@@ -168,7 +199,6 @@ SET pg_flashback.parallel_workers = 4;
 如果使用库外 summary daemon，当前额外需要：
 
 - `pg_flashback-summaryd` 进程能访问 `PGDATA`
-- 显式提供可用的 `--conninfo`
 - 可读的 archive 路径，通常与 `pg_flashback.archive_dest` 一致
 
 当前这些场景不在支持范围内：
@@ -217,65 +247,74 @@ FROM pg_flashback(
 
 ### 2. How To Use It
 
-Build and install the extension:
+This README only keeps the bootstrap entrypoint. After `git clone`, run:
 
 ```bash
-make PG_CONFIG=/path/to/pg_config
-make PG_CONFIG=/path/to/pg_config install
+scripts/b_pg_flashback.sh
 ```
 
-The top-level build also installs a standalone executable,
-`pg_flashback-summaryd`, into PostgreSQL's `bindir` as the delivery entry point
-for the external summary-daemon mode.
+The script must be run as a non-root OS user. Root execution fails immediately.
 
-Create or upgrade the extension in the database:
+The script will prompt interactively for:
 
-```sql
-CREATE EXTENSION pg_flashback;
-```
+- the `pg_config` path, defaulting to `which pg_config`
+- the `PGDATA` path, defaulting to environment `PGDATA`
+- the database name, defaulting to environment `PGDATABASE` or `postgres`
+- the database user, defaulting to environment `PGUSER`
+- the database password, defaulting to environment `PGPASSWORD` (hidden in the prompt)
+- the database port, defaulting to environment `PGPORT` or `5432`
 
-```sql
-ALTER EXTENSION pg_flashback UPDATE TO '0.2.0';
-```
+The prompt order is fixed as:
 
-To get the full summary experience without restarting PostgreSQL, use the
-standalone daemon.
+- `pg_config`
+- `PGDATA`
+- `dbname`
+- `dbuser`
+- `db-password`
+- `db-port`
 
-Current implementation notes:
+After setup, it will automatically:
 
-- `pg_flashback-summaryd` still connects through libpq and reuses
-  extension-exposed debug helpers for build / cleanup
-- because of that, you should currently pass `--conninfo` explicitly
-- if `--conninfo` is omitted, libpq defaults may choose the wrong
-  `dbname/user`, which often makes startup fail
+- if `PGDATA/pg_flashback` already exists, run bounded safe cleanup first:
+  - clear `runtime/`
+  - clear stale `state/debug/lock` files under `meta/summaryd`
+  - clear temporary `.tmp.*` files under `meta/summary`
+  - preserve `recovered_wal/` and committed summary/meta files
+- build and install the extension
+- run `CREATE EXTENSION` or `ALTER EXTENSION UPDATE`
+- write the `pg_flashback-summaryd` config
+- start `pg_flashback-summaryd` through `scripts/pg_flashback_summary.sh`
+- run
+  `ALTER DATABASE ... SET pg_flashback.archive_dest = ...`
+  for the target database
 
-Recommended full command:
+After bootstrap, the manual daemon entrypoints are fixed as:
 
 ```bash
-pg_flashback-summaryd \
-  --pgdata /path/to/pgdata \
-  --archive-dest /path/to/archive \
-  --conninfo "host=/tmp port=5432 dbname=postgres user=postgres connect_timeout=2" \
-  --foreground
+scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf start
+scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf stop
+scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf status
+scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf run-once
 ```
 
-You can also use `--config`, but the config file should still include
-`conninfo=...` in the current implementation.
+Notes:
 
-WAL source guidance:
+- root must not run this script; switch to the target PostgreSQL OS user first
+- the current OS user must own `PGDATA`
+- terminal output is now grouped into explicit stages so setup/remove progress
+  is easier to read
+- interactive inputs are validated immediately when possible:
+  `pg_config` must exist and be executable, and `PGDATA` must be an existing directory
+- if the target environment is already initialized with the same config,
+  rerunning setup returns `already_initialized` and exits without reapplying
+- `--remove` does not automatically delete the `PGDATA/pg_flashback`
+  data directory; the script prints the retained path and leaves final deletion
+  to the operator
+- `--remove` also cleans legacy `pg_flashback-summaryd*.service/.conf`
+  entries for the same `PGDATA` and removes the installed
+  `pg_flashback-summaryd` binary
 
-- if your local `archive_command` matches one of the supported local patterns,
-  autodiscovery can be enough
-- if the archive path is complex, remote, or you want deterministic behavior,
-  set `pg_flashback.archive_dest` explicitly
-
-For example:
-
-```sql
-SET pg_flashback.archive_dest = '/path/to/archive';
-```
-
-After startup, verify that the summary status surface is visible:
+After bootstrap, verify that the summary status surface is visible:
 
 ```sql
 SELECT *
@@ -359,7 +398,6 @@ Before using it, make sure the following conditions are true:
 If you use the external summary daemon, the current implementation also needs:
 
 - a `pg_flashback-summaryd` process that can access `PGDATA`
-- an explicit working `--conninfo`
 - a readable archive path, usually the same path used by
   `pg_flashback.archive_dest`
 

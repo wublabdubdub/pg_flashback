@@ -13,3 +13,7 @@ tmp_check/
 .worktrees/
 open_source/
 summaryd/pg_flashback-summaryd
+summaryd/pg_flashback-summaryd.conf
+cron_daily_update.log
+tests/release_gate/output/latest/
+tests/release_gate/output/*_releasegate_*

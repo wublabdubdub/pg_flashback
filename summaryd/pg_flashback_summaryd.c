@@ -32,7 +32,6 @@ static void summaryd_handle_signal(int sig);
 static int summaryd_mkdir_p(const char *path);
 static void summaryd_build_path(char *out, size_t out_len,
 								const char *root, const char *suffix);
-static void summaryd_format_timestamp_utc(char *out, size_t out_len);
 static void summaryd_format_state_timestamp(long long ts, char *out, size_t out_len);
 static bool summaryd_write_file_atomic(const char *path, const char *contents);
 static bool summaryd_prepare_runtime_dirs(const SummarydConfig *config);
@@ -145,7 +144,7 @@ static bool
 summaryd_load_config_file(const char *path, SummarydConfig *config)
 {
 	FILE   *file;
-	char	line[SUMMARYD_CONNINFO_MAX];
+	char	line[SUMMARYD_PATH_MAX];
 	int		lineno = 0;
 
 	if (path == NULL || path[0] == '\0')
@@ -476,16 +475,6 @@ summaryd_build_path(char *out, size_t out_len, const char *root, const char *suf
 		fprintf(stderr, "path too long for %s/%s\n", root, suffix);
 		exit(2);
 	}
-}
-
-static void
-summaryd_format_timestamp_utc(char *out, size_t out_len)
-{
-	time_t now = time(NULL);
-	struct tm tm_utc;
-
-	gmtime_r(&now, &tm_utc);
-	strftime(out, out_len, "%Y-%m-%d %H:%M:%S+00", &tm_utc);
 }
 
 static bool

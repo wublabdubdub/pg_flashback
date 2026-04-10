@@ -191,7 +191,7 @@ SELECT to_regclass('pg_flashback_summary_progress') IS NOT NULL
  t                      | t
 (1 row)
 
-SELECT count(*) = 20 AS sane_user_columns
+SELECT count(*) = 24 AS sane_user_columns
 FROM information_schema.columns
 WHERE table_schema = 'public'
   AND table_name = 'pg_flashback_summary_progress';
@@ -206,6 +206,15 @@ FROM pg_flashback_summary_progress;
  eta_column_type_ok 
 --------------------
  t
+(1 row)
+
+SELECT state_source IN ('external', 'shmem', 'none') AS state_source_enum_ok,
+	   pg_typeof(daemon_state_published_at) = 'timestamp with time zone'::regtype
+	   AS daemon_state_published_at_type_ok
+FROM pg_flashback_summary_progress;
+ state_source_enum_ok | daemon_state_published_at_type_ok 
+----------------------+-----------------------------------
+ t                    | t
 (1 row)
 
 SELECT stable_oldest_segno <= stable_newest_segno AS sane_stable_segno_range,
@@ -494,11 +503,11 @@ SELECT (
 		   ORDER BY enqueue_order
 		   LIMIT 1
 	   ) = (
-		   SELECT min(candidate_no)
+		   SELECT max(candidate_no)
 		   FROM fb_summary_service_schedule_debug(64, 32, 40)
 		   WHERE queue_kind = 'cold'
-	   ) AS cold_queue_starts_from_oldest_backlog;
- cold_queue_starts_from_oldest_backlog 
+	   ) AS cold_queue_starts_from_newest_backlog;
+ cold_queue_starts_from_newest_backlog 
 ---------------------------------------
  t
 (1 row)
@@ -527,7 +536,7 @@ FROM pg_flashback_summary_progress
 WHERE missing_segments > 0;
  eta_is_future_while_backlog_remains 
 -------------------------------------
- t
+ f
 (1 row)
 
 DROP TABLE IF EXISTS fb_summary_query_status_target;

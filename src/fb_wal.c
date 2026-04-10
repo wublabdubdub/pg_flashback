@@ -15,6 +15,7 @@
 #include "access/heapam_xlog.h"
 #include "access/commit_ts.h"
 #include "access/rmgr.h"
+#include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
@@ -47,12 +48,18 @@ PG_FUNCTION_INFO_V1(fb_wal_hint_fpi_payload_contract_debug);
 PG_FUNCTION_INFO_V1(fb_wal_heap2_visible_payload_contract_debug);
 PG_FUNCTION_INFO_V1(fb_summary_xid_resolution_debug);
 PG_FUNCTION_INFO_V1(fb_summary_xid_probe_debug);
+PG_FUNCTION_INFO_V1(fb_target_snapshot_clog_status_debug);
 PG_FUNCTION_INFO_V1(fb_summary_payload_locator_plan_debug);
 
 static bool fb_wal_payload_kind_enabled(uint8 kind);
 
 static bool fb_record_touches_main_relation(XLogReaderState *reader,
 											const FbRelationInfo *info);
+static void fb_note_xid_status(HTAB *xid_statuses,
+							   TransactionId xid,
+							   FbWalXidStatus status,
+							   TimestampTz commit_ts,
+							   XLogRecPtr commit_lsn);
 static void fb_append_touched_xid_hash_samples(StringInfo buf,
 											   HTAB *xids,
 											   uint32 limit);
@@ -5013,6 +5020,56 @@ fb_wal_xid_invisible_at_target_snapshot(const FbWalRecordIndex *index,
 		TransactionIdFollowsOrEquals(xid, index->target_snapshot_xmax);
 }
 
+static bool
+fb_wal_target_snapshot_enabled(const FbWalRecordIndex *index)
+{
+	return index != NULL &&
+		(TransactionIdIsValid(index->target_snapshot_xmin) ||
+		 TransactionIdIsValid(index->target_snapshot_xmax) ||
+		 (index->target_snapshot_xids != NULL &&
+		  hash_get_num_entries(index->target_snapshot_xids) > 0));
+}
+
+static bool
+fb_wal_try_resolve_xid_status_from_snapshot_clog(const FbWalRecordIndex *index,
+												 TransactionId xid,
+												 FbWalXidStatus *status_out,
+												 TimestampTz *commit_ts_out)
+{
+	bool snapshot_invisible;
+
+	if (status_out != NULL)
+		*status_out = FB_WAL_XID_UNKNOWN;
+	if (commit_ts_out != NULL)
+		*commit_ts_out = 0;
+	if (!fb_wal_target_snapshot_enabled(index) || !TransactionIdIsValid(xid))
+		return false;
+
+	snapshot_invisible = fb_wal_xid_invisible_at_target_snapshot(index, xid);
+	if (TransactionIdDidCommit(xid))
+	{
+		if (status_out != NULL)
+			*status_out = FB_WAL_XID_COMMITTED;
+		if (commit_ts_out != NULL)
+			*commit_ts_out = snapshot_invisible ?
+				index->query_now_ts :
+				index->target_ts;
+		return true;
+	}
+	if (TransactionIdDidAbort(xid))
+	{
+		if (status_out != NULL)
+			*status_out = FB_WAL_XID_ABORTED;
+		if (commit_ts_out != NULL)
+			*commit_ts_out = snapshot_invisible ?
+				index->query_now_ts :
+				index->target_ts;
+		return true;
+	}
+
+	return false;
+}
+
 /*
  * fb_get_xid_status_entry
  *    WAL helper.
@@ -5078,7 +5135,27 @@ fb_wal_xid_committed_after_target(const FbWalRecordIndex *index,
 													HASH_FIND,
 													NULL);
 	if (status_entry == NULL)
-		return false;
+	{
+		FbWalXidStatus status = FB_WAL_XID_UNKNOWN;
+		TimestampTz commit_ts = 0;
+
+		if (!fb_wal_try_resolve_xid_status_from_snapshot_clog(index,
+															  xid,
+															  &status,
+															  &commit_ts))
+			return false;
+		fb_note_xid_status(index->xid_statuses,
+						   xid,
+						   status,
+						   commit_ts,
+						   InvalidXLogRecPtr);
+		status_entry = (FbXidStatusEntry *) hash_search(index->xid_statuses,
+														&xid,
+														HASH_FIND,
+														NULL);
+		if (status_entry == NULL)
+			return false;
+	}
 
 	snapshot_invisible = fb_wal_xid_invisible_at_target_snapshot(index, xid);
 	return status_entry->status == FB_WAL_XID_COMMITTED &&
@@ -5277,7 +5354,26 @@ fb_wal_set_record_status(const FbWalRecordIndex *index, FbRecordRef *record)
 													&record->xid,
 													HASH_FIND, NULL);
 	if (status_entry == NULL)
-		return;
+	{
+		FbWalXidStatus status = FB_WAL_XID_UNKNOWN;
+
+		if (!fb_wal_try_resolve_xid_status_from_snapshot_clog(index,
+															  record->xid,
+															  &status,
+															  &record->commit_ts))
+			return;
+		fb_note_xid_status(index->xid_statuses,
+						   record->xid,
+						   status,
+						   record->commit_ts,
+						   InvalidXLogRecPtr);
+		status_entry = (FbXidStatusEntry *) hash_search(index->xid_statuses,
+														&record->xid,
+														HASH_FIND,
+														NULL);
+		if (status_entry == NULL)
+			return;
+	}
 
 	snapshot_invisible = fb_wal_xid_invisible_at_target_snapshot(index, record->xid);
 	record->commit_ts = status_entry->commit_ts;
@@ -9452,6 +9548,100 @@ fb_summary_fill_exact_xact_statuses(FbWalScanContext *ctx,
 	return ctx->unsafe || unresolved == 0;
 }
 
+static uint32
+fb_resolve_snapshot_clog_xid_statuses(FbWalScanContext *ctx,
+									  FbWalRecordIndex *index,
+									  HTAB *touched_xids,
+									  HTAB *unsafe_xids)
+{
+	HASH_SEQ_STATUS hash_status;
+	FbTouchedXidEntry *touched_entry;
+	FbUnsafeXidEntry *unsafe_entry;
+	uint32 hits = 0;
+
+	if (ctx == NULL || index == NULL || !fb_wal_target_snapshot_enabled(index))
+		return 0;
+
+	if (touched_xids != NULL)
+	{
+		hash_seq_init(&hash_status, touched_xids);
+		while ((touched_entry = (FbTouchedXidEntry *) hash_seq_search(&hash_status)) != NULL)
+		{
+			FbXidStatusEntry *status_entry;
+			FbWalXidStatus status = FB_WAL_XID_UNKNOWN;
+			TimestampTz commit_ts = 0;
+			bool snapshot_invisible;
+
+			status_entry = (FbXidStatusEntry *) hash_search(index->xid_statuses,
+														   &touched_entry->xid,
+														   HASH_FIND,
+														   NULL);
+			if (status_entry != NULL && status_entry->status != FB_WAL_XID_UNKNOWN)
+				continue;
+			if (!fb_wal_try_resolve_xid_status_from_snapshot_clog(index,
+																 touched_entry->xid,
+																 &status,
+																 &commit_ts))
+				continue;
+
+			fb_note_xid_status(index->xid_statuses,
+							   touched_entry->xid,
+							   status,
+							   commit_ts,
+							   InvalidXLogRecPtr);
+			hits++;
+			snapshot_invisible =
+				fb_wal_xid_invisible_at_target_snapshot(index, touched_entry->xid);
+			if (status == FB_WAL_XID_COMMITTED && snapshot_invisible)
+				index->target_commit_count++;
+			else if (status == FB_WAL_XID_ABORTED && snapshot_invisible)
+				index->target_abort_count++;
+		}
+	}
+
+	if (unsafe_xids != NULL)
+	{
+		hash_seq_init(&hash_status, unsafe_xids);
+		while ((unsafe_entry = (FbUnsafeXidEntry *) hash_seq_search(&hash_status)) != NULL)
+		{
+			FbXidStatusEntry *status_entry;
+			FbWalXidStatus status = FB_WAL_XID_UNKNOWN;
+			TimestampTz commit_ts = 0;
+
+			status_entry = (FbXidStatusEntry *) hash_search(index->xid_statuses,
+														   &unsafe_entry->xid,
+														   HASH_FIND,
+														   NULL);
+			if (status_entry != NULL && status_entry->status != FB_WAL_XID_UNKNOWN)
+				continue;
+			if (!fb_wal_try_resolve_xid_status_from_snapshot_clog(index,
+																 unsafe_entry->xid,
+																 &status,
+																 &commit_ts))
+				continue;
+
+			fb_note_xid_status(index->xid_statuses,
+							   unsafe_entry->xid,
+							   status,
+							   commit_ts,
+							   InvalidXLogRecPtr);
+			hits++;
+			if (status == FB_WAL_XID_COMMITTED &&
+				fb_wal_xid_invisible_at_target_snapshot(index, unsafe_entry->xid) &&
+				fb_unsafe_entry_requires_reject(unsafe_entry))
+			{
+				fb_capture_unsafe_context(ctx,
+										  unsafe_entry,
+										  unsafe_entry->xid,
+										  commit_ts);
+				fb_mark_unsafe(ctx, unsafe_entry->reason);
+			}
+		}
+	}
+
+	return hits;
+}
+
 static void
 fb_build_unresolved_xid_fallback_sets(FbWalRecordIndex *index,
 									  HTAB *touched_xids,
@@ -9633,6 +9823,29 @@ fb_wal_fill_xact_statuses_serial(const FbRelationInfo *info,
 											fallback_touched,
 											fallback_unsafe))
 		goto cleanup;
+	if (fallback_touched != NULL)
+	{
+		hash_destroy(fallback_touched);
+		fallback_touched = NULL;
+	}
+	if (fallback_unsafe != NULL)
+	{
+		hash_destroy(fallback_unsafe);
+		fallback_unsafe = NULL;
+	}
+	fb_build_unresolved_xid_fallback_sets(index,
+										  touched_xids,
+										  unsafe_xids,
+										  &fallback_touched,
+										  &fallback_unsafe);
+	if ((fallback_touched == NULL || hash_get_num_entries(fallback_touched) <= 0) &&
+		(fallback_unsafe == NULL || hash_get_num_entries(fallback_unsafe) <= 0))
+		goto cleanup;
+
+	(void) fb_resolve_snapshot_clog_xid_statuses(ctx,
+												 index,
+												 fallback_touched,
+												 fallback_unsafe);
 	if (fallback_touched != NULL)
 	{
 		hash_destroy(fallback_touched);
@@ -13441,6 +13654,73 @@ fb_summary_xid_probe_debug(PG_FUNCTION_ARGS)
 		hash_destroy(state.touched_xids);
 	if (state.unsafe_xids != NULL)
 		hash_destroy(state.unsafe_xids);
+
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+Datum
+fb_target_snapshot_clog_status_debug(PG_FUNCTION_ARGS)
+{
+	int64 xid_input = PG_GETARG_INT64(0);
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	TimestampTz query_now_ts = PG_GETARG_TIMESTAMPTZ(2);
+	text *snapshot_text = PG_GETARG_TEXT_PP(3);
+	FbWalRecordIndex index;
+	FbWalXidStatus status = FB_WAL_XID_UNKNOWN;
+	TimestampTz commit_ts = 0;
+	TransactionId xid;
+	bool resolved;
+	bool snapshot_invisible;
+	StringInfoData buf;
+
+	if (xid_input <= 0 || xid_input > UINT_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("xid debug value is out of range")));
+	xid = (TransactionId) xid_input;
+	if (!TransactionIdIsValid(xid))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("xid debug value must be a valid xid")));
+	if (target_ts > query_now_ts)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("target timestamp must not exceed query timestamp")));
+
+	MemSet(&index, 0, sizeof(index));
+	index.target_ts = target_ts;
+	index.query_now_ts = query_now_ts;
+	index.xid_statuses = fb_create_xid_status_hash();
+	fb_parse_target_snapshot(text_to_cstring(snapshot_text),
+							 &index.target_snapshot_xmin,
+							 &index.target_snapshot_xmax,
+							 &index.target_snapshot_xids);
+
+	resolved = fb_wal_try_resolve_xid_status_from_snapshot_clog(&index,
+																xid,
+																&status,
+																&commit_ts);
+	snapshot_invisible = fb_wal_xid_invisible_at_target_snapshot(&index, xid);
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "resolved=%s status=%s snapshot_invisible=%s committed_before_target=%s committed_after_target=%s commit_ts=%s",
+					 resolved ? "true" : "false",
+					 (status == FB_WAL_XID_COMMITTED) ? "committed" :
+					 ((status == FB_WAL_XID_ABORTED) ? "aborted" : "unknown"),
+					 snapshot_invisible ? "true" : "false",
+					 (resolved &&
+					  status == FB_WAL_XID_COMMITTED &&
+					  !snapshot_invisible) ? "true" : "false",
+					 (resolved &&
+					  status == FB_WAL_XID_COMMITTED &&
+					  snapshot_invisible) ? "true" : "false",
+					 resolved ? timestamptz_to_str(commit_ts) : "null");
+
+	if (index.target_snapshot_xids != NULL)
+		hash_destroy(index.target_snapshot_xids);
+	if (index.xid_statuses != NULL)
+		hash_destroy(index.xid_statuses);
 
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }

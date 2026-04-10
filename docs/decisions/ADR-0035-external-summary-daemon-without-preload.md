@@ -29,19 +29,25 @@ Accepted
 当前落地分两层：
 
 - 新增独立进程 `pg_flashback-summaryd`
-- 过渡期 daemon 曾通过 libpq 连接数据库，复用扩展内
-  `fb_summary_build_available_debug()` /
-  `fb_summary_service_cleanup_debug()` 来完成 build/cleanup
-- 当前决议继续前推到下一阶段：
-  - daemon 的 build/cleanup 必须继续下沉为真正不依赖数据库连接的
-    frontend-safe / standalone core
-  - `--conninfo` 不再作为最终长期接口保留
+- daemon 的 build/cleanup 已下沉为真正不依赖数据库连接的
+  frontend-safe / standalone core
+- `--conninfo` 不再作为接口保留
 - daemon 负责：
   - archive / `pg_wal` / `recovered_wal` 扫描
   - hot / cold 调度
   - summary build
   - `meta/summary` 自动清理
   - 状态快照发布
+- daemon 生命周期当前固定由脚本管理，而不是 systemd/service 注册：
+  - 推荐入口收口为 `scripts/pg_flashback_summary.sh`：
+    - `start`
+    - `stop`
+    - `status`
+    - `run-once`
+  - `run-once` 语义固定为：
+    - 扫描一次 `archive_dest + pg_wal + recovered_wal`
+    - 完成一轮 summary build / state publish / cleanup
+    - 然后退出
 - 扩展内保留：
   - query-side summary reader
   - `pg_flashback()` 的 summary-first / fallback
@@ -60,13 +66,12 @@ Accepted
 - 不要求 PostgreSQL 重启
 - 不占用 PostgreSQL bgworker 配额
 - 仍保留完整 summary 用户体验
-- 当前已经满足“不落库”；本 ADR 现在进一步要求
-  “默认不连接数据库”从后续目标前移为落地项
+- 当前已经满足“不落库”与“默认不连接数据库”
 
 代价：
 
 - 服务状态从 shared memory 改为文件快照，进度视图变为最终一致
-- 需要维护 daemon 生命周期、锁文件与状态文件兼容性
+- 需要维护脚本 runner、daemon 锁文件与状态文件兼容性
 - 需要将现有 summary builder 继续抽离出 backend 专属依赖
 
 ## 语义要求
@@ -77,12 +82,11 @@ Accepted
   - `pg_wal`
   - `recovered_wal`
   - `meta/summary`
-- `--conninfo` 仅允许作为过渡期兼容项存在；完成 core 迁移后移除
 - README 与开源 README 必须明确写清：
   - 如何编译
   - 编译产物落点
   - `PGDATA/pg_flashback/` 目录和文件何时生成
-  - daemon 的启动方式
+  - daemon 的脚本启动方式
 - `PGDATA` 是实例唯一锚点
 - 从源码构建时，daemon 必须由顶层 `Makefile` 一并生成与安装
 - `pg_flashback_summary_progress` / `pg_flashback_summary_service_debug` 对外对象名保持不变

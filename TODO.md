@@ -12,6 +12,74 @@
 
 ## summary daemon / 无重启
 
+- [x] 修复 `scripts/b_pg_flashback.sh` 在默认 `user scope`
+      但无可用 user bus 时的 setup/remove 路径
+  - [x] setup 不再直接卡死在 `systemctl --user`
+  - [x] `18pg` 用户可完成创建并看到 summary 状态文件
+  - [x] 清理后不残留 `pg_flashback-summaryd` 进程
+- [x] 修复 `scripts/b_pg_flashback.sh` 未显式传
+      `--archive-dest` 时误写 `${PGDATA}/pg_wal`
+  - [x] setup 默认优先识别 `archive_command` 的本地归档目录
+  - [x] autodiscovery 不可用时才回退到 `${PGDATA}/pg_wal`
+  - [x] `pg_flashback_summary_progress` 默认覆盖范围与 archive 实际目录一致
+- [x] 调整 summary backlog 调度优先级为 recent-first
+  - [x] 内嵌 `fb_summary_service` 的 cold backlog 不再 oldest-first
+  - [x] 外置 `summaryd` standalone core 改成 recent-first
+  - [x] 回归锁住“cold queue 从 newest backlog 开始”
+- [x] 将 summary daemon 交付面改为纯脚本式启动
+  - [x] 删除 bootstrap 中的 systemd/service 生命周期逻辑
+  - [x] 新增 `start/stop/status/run-once` 脚本入口
+  - [x] setup/remove 改为围绕脚本 runner 管理 config / pid / log / extension
+  - [x] README / summaryd README / smoke test 同步切换到脚本入口
+- [x] 删除根仓库和开源镜像中当前口径下永不会被用户使用的产物
+- [x] 补齐 `scripts/sync_open_source.sh`，避免构建/运行残留再次进入开源镜像
+- [x] 为 `scripts/b_pg_flashback.sh` 增加交互输入的即时校验
+  - [x] `pg_config` 输入后立即校验“存在且可执行”
+  - [x] `PGDATA` 输入后立即校验“目录存在”
+  - [x] 错误输入时立刻报错，不再继续进入下一轮 prompt
+- [x] 为 `scripts/b_pg_flashback.sh` 的交互模式补齐数据库端口提示
+  - [x] 不再静默默认使用 `5432`
+  - [x] `--remove` 交互路径会把用户输入端口传给 `psql`
+  - [x] `DB_PORT` 输入后立即校验“纯数字端口”
+- [x] 修复 `scripts/b_pg_flashback.sh` 在 root + foreign `PGDATA` owner
+      场景下误建 `user scope` service 且 setup 未校验服务真实启动
+  - [x] 当前用户不拥有 `PGDATA` 时自动回落到 `system scope`
+  - [x] `system scope` unit 统一按 `PGDATA` owner 身份运行
+  - [x] `enable --now` 后必须确认 service 真实进入 `active`
+- [x] 收口 `scripts/b_pg_flashback.sh` 的执行用户约束
+  - [x] root 用户执行时必须立刻报错退出
+  - [x] 现有 bootstrap smoke 统一改为非 root 用户执行
+  - [x] README / `summaryd/README.md` 明确补齐该约束
+- [x] 收口 bootstrap service 名称
+  - [x] 固定为 `pg_flashback-summaryd`
+  - [x] 不再按 `PGDATA` 派生不同 service 名
+  - [x] README / smoke test 同步切到固定 service 名
+- [x] 收口 bootstrap 交互默认值与提示顺序
+  - [x] 环境变量值作为交互 `[默认]`
+  - [x] `PG_CONFIG_BIN` 默认只取 `which pg_config`
+  - [x] `DB_PORT` 默认只取 `PGPORT`，否则 `5432`
+  - [x] 提示顺序固定为 `dbuser -> db-password -> db-port`
+- [x] 补齐 bootstrap 启动失败时的终端诊断命令输出
+  - [x] 打印 `systemctl status`
+  - [x] 打印 `journalctl`
+  - [x] 打印前台 `--foreground` 启动命令
+- [x] 修复 `--remove` 未清理 legacy summaryd unit/process/binary
+  - [x] 同一 `PGDATA` 下的 legacy `pg_flashback-summaryd*.service/.conf`
+        也必须 stop/disable/remove
+  - [x] 同一 `PGDATA` 下的残留 `pg_flashback-summaryd` 进程必须终止
+  - [x] 已安装的 `pg_flashback-summaryd` 二进制必须删除
+- [x] 将 bootstrap 的 remove/setup 数据目录行为收口为安全口径
+  - [x] `--remove` 不自动删除 `PGDATA/pg_flashback`
+  - [x] remove 明确提示用户手工删除保留目录
+  - [x] setup 发现已有 `PGDATA/pg_flashback` 时只做受限安全清理
+  - [x] setup/remove 终端输出按阶段分隔显示
+- [x] 将 bootstrap 脚本改名为 `scripts/b_pg_flashback.sh`
+- [x] 将 bootstrap 默认入口收口为交互式输入
+      `pg_config` / `PGDATA` / `dbname` / `dbuser` / `db-password`
+- [x] 为重复 setup 增加“已初始化完成”判定与跳过逻辑
+- [x] 将根 README / 开源 README / `summaryd/README.md`
+      收口为只保留 `b_pg_flashback.sh` 的使用方式
+- [x] 同步 smoke test 与开源镜像同步脚本到 `b_pg_flashback.sh`
 - [x] 新增库外 daemon 路径，使完整 summary 体验不再依赖重启 PostgreSQL
 - [x] 新增独立可执行文件 `pg_flashback-summaryd`
 - [x] 顶层 `Makefile` 默认同时构建扩展与 daemon
@@ -28,20 +96,53 @@
 - [x] 将最近查询 summary 观测从 shared memory 改为 runtime hint 文件
 - [x] 保持 query-side summary-first / fallback 行为不变
 - [x] 为开源用户补齐 daemon 的 README / sample config / systemd unit
+- [x] README 明确写清 daemon 的两层产物路径：
+      - `make` 后 `summaryd/pg_flashback-summaryd`
+      - `make install` 后 `$(pg_config --bindir)/pg_flashback-summaryd`
+- [x] 为 summary 视图补 external daemon 可观测性列
+  - [x] 显式显示当前状态来源：`external` / `shmem` / `none`
+  - [x] 显式显示 external state 是否存在、是否 stale
+  - [x] 显式显示 external daemon 最近一次状态发布时间
+  - [x] 前滚扩展版本并补升级链，避免同版本接口漂移
 - [x] 修复 external daemon state 下 `estimated_completion_at` 仍长期为 `NULL`
       或直接因空时间戳报错的缺口
   - [x] 空字符串时间戳按缺失值处理，不再让 progress/debug 视图报错
   - [x] daemon 跨 iteration 保留 throughput sample window，
         空扫不再把 ETA 输入清空
-- [ ] 将 daemon 的 build/cleanup 从当前 `libpq + debug helper` 继续抽离为
+- [x] 将 daemon 的 build/cleanup 从当前 `libpq + debug helper` 继续抽离为
       默认不连接数据库的 frontend-safe core
-  - [ ] 收口为 daemon 本地文件/WAL 路径驱动，不再要求 `--conninfo`
-  - [ ] 保持 `state.json` / `debug.json` / SQL 视图口径不变
-  - [ ] README 与开源 README 明确补齐：
+  - [x] 收口为 daemon 本地文件/WAL 路径驱动，不再要求 `--conninfo`
+  - [x] 保持 `state.json` / `debug.json` / SQL 视图口径不变
+  - [x] README 与开源 README 明确补齐：
         - 构建命令
         - 产物路径
         - `pg_flashback/` 目录何时创建
         - daemon 启动命令
+- [x] 新增一键 bootstrap 脚本，面向数据库 OS 用户自动完成：
+      - build / install
+      - `CREATE EXTENSION` / `ALTER EXTENSION UPDATE`
+      - systemd 注册并启动 `pg_flashback-summaryd`
+      - 一键删除：停止进程、删除 systemd 文件、`DROP EXTENSION`
+- [x] 按 CentOS `7/8/9` 做 systemd 适配
+  - [x] `CentOS 7` 默认走 `system scope`
+  - [x] `CentOS 8/9` 默认走 `user scope`
+  - [x] 保留 `--systemd-scope` 显式覆盖
+  - [x] README / 开源 README 明确脚本用法、密码输入与 service 位置
+  - [x] README / 开源 README 明确脚本的 setup / remove 两种动作
+- [x] 修复 fresh-cluster bootstrap 下的 summary 视图与 user-scope 缺口
+  - [x] `pg_flashback_summary_progress`
+        在 external state 存在、但 session 未显式设置
+        `archive_dest/archive_dir` 时不再 backend crash
+  - [x] bootstrap `setup` 自动对目标数据库执行
+        `ALTER DATABASE ... SET pg_flashback.archive_dest = ...`
+  - [x] bootstrap `remove` 自动
+        `RESET pg_flashback.archive_dest/archive_dir`
+  - [x] `su - <db_os_user>` 的 `user scope`
+        自动补 `XDG_RUNTIME_DIR` /
+        `DBUS_SESSION_BUS_ADDRESS`
+  - [x] 已用 fresh PG18 临时集群完成真实 setup/remove 验证：
+        创建后 `progress_pct = 100`、
+        删除后视图对象不存在
 
 ## 本轮已完成
 
@@ -1117,6 +1218,16 @@
       - [ ] 若继续往下压，需要新的 per-segment xid presence/index
         - 当前仅靠 relation-scoped touched xid 或事务语义剪枝都不安全
         - 已验证“按 before-target/aborted xid 直接裁 payload”会破坏 replay 正确性，不能走这条捷径
+      - [x] 修复 release gate `random_flashback_1.documents @ 2026-04-10 04:05:44.660105+00`
+        的双重 blocker：
+        - `3/9 55% xact-status` 仍有 residual unresolved xid / exact-fill miss
+        - `4/9 replay discover precomputed`
+          继续报
+          `ERROR: too many shared backtracking rounds while resolving missing FPI`
+        - 已补回归锁住
+          `xact-status` 未命中
+          与
+          shared backtracking 过轮次
       - [x] 修复碎 summary-span 场景下的 payload scan-mode 误判：
         - 当前 live 现场：
           - `scenario_oa_50t_50000r.approval_comments @ '2026-04-04 23:40:13'`

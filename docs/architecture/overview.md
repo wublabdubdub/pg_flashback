@@ -255,9 +255,24 @@ Custom Scan (FbCountAggScan)
 - 构建 `meta/summary`
 - 对 `meta/summary` 做源 WAL 探活与自动清理
 - 发布 `meta/summaryd/state.json` / `debug.json`
-- 当前实现中，daemon 先通过 libpq 连接扩展并复用 debug helper
-  触发 build/cleanup，因此当前启动应显式提供 `--conninfo`
-- frontend-safe builder 抽离仍在后续阶段
+- 当前实现中，daemon 已直接读取 `PGDATA` / `archive_dest` / `pg_wal`
+  并独立完成 build/cleanup，不再要求数据库连接或 `--conninfo`
+- 后续阶段只剩 standalone core 的继续收敛与性能打磨
+
+当前交付面补充：
+
+- daemon 不再依赖 systemd/service 注册作为默认承载形式
+- 用户当前通过仓库脚本 `scripts/pg_flashback_summary.sh`
+  手动管理 daemon 生命周期：
+  - `start`
+  - `stop`
+  - `status`
+  - `run-once`
+- `b_pg_flashback.sh` 负责：
+  - build / install
+  - extension setup / remove
+  - 写 summaryd config
+  - 调用脚本 runner 启停 daemon
 
 当前进度视图口径补充：
 

@@ -372,6 +372,64 @@ SELECT (regexp_match(:'overflow_subxact_summary_resolution', 'summary_hits=([0-9
 	   (regexp_match(:'overflow_subxact_summary_resolution', 'fallback_windows=([0-9]+)'))[1]::integer = 0
 	   AS overflow_subxact_summary_avoids_fallback_windows;
 
+DROP TABLE IF EXISTS fb_recordref_cross_seg_subxact_target;
+DROP TABLE IF EXISTS fb_recordref_cross_seg_subxact_mark;
+
+CREATE TABLE fb_recordref_cross_seg_subxact_target (
+	id integer PRIMARY KEY,
+	payload integer
+);
+
+CHECKPOINT;
+
+INSERT INTO fb_recordref_cross_seg_subxact_target VALUES (1, 10);
+
+CREATE TABLE fb_recordref_cross_seg_subxact_mark (
+	target_ts timestamptz NOT NULL
+);
+
+INSERT INTO fb_recordref_cross_seg_subxact_mark VALUES (clock_timestamp());
+
+DO $$
+BEGIN
+	PERFORM pg_sleep(1.1);
+END;
+$$;
+
+BEGIN;
+SAVEPOINT fb_recordref_cross_seg_subxact_s1;
+UPDATE fb_recordref_cross_seg_subxact_target
+SET payload = 11
+WHERE id = 1;
+RELEASE SAVEPOINT fb_recordref_cross_seg_subxact_s1;
+SELECT pg_switch_wal();
+COMMIT;
+
+DO $$
+BEGIN
+	PERFORM pg_switch_wal();
+	PERFORM pg_switch_wal();
+	PERFORM fb_summary_build_available_debug();
+END;
+$$;
+
+SET pg_flashback.parallel_workers = 4;
+
+SELECT fb_summary_xid_resolution_debug(
+	'fb_recordref_cross_seg_subxact_target'::regclass,
+	(SELECT target_ts FROM fb_recordref_cross_seg_subxact_mark)
+) AS cross_seg_subxact_summary_resolution
+\gset
+
+SELECT (regexp_match(:'cross_seg_subxact_summary_resolution', 'summary_hits=([0-9]+)'))[1]::integer > 0
+	   AS cross_seg_subxact_summary_uses_xid_outcomes,
+	   (regexp_match(:'cross_seg_subxact_summary_resolution', 'summary_exact_hits=([0-9]+)'))[1]::integer > 0
+	   AS cross_seg_subxact_summary_uses_exact_hits,
+	   (regexp_match(:'cross_seg_subxact_summary_resolution', 'unresolved_touched=([0-9]+)'))[1]::integer = 0
+	   AS cross_seg_subxact_summary_resolves_all_touched_xids,
+	   (regexp_match(:'cross_seg_subxact_summary_resolution', 'fallback_windows=([0-9]+)'))[1]::integer > 0
+	   AS cross_seg_subxact_summary_needs_fallback_windows;
+
 CREATE TABLE fb_recordref_unsafe (
 	id integer PRIMARY KEY,
 	payload integer
