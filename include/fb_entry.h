@@ -6,7 +6,7 @@
 #ifndef FB_ENTRY_H
 #define FB_ENTRY_H
 
-#define FB_EXTENSION_VERSION "0.2.0"
+#define FB_EXTENSION_VERSION "0.2.4"
 
 #include "fb_common.h"
 #include "fb_reverse_ops.h"
@@ -36,19 +36,14 @@ Datum fb_version(PG_FUNCTION_ARGS);
 
 Datum fb_check_relation(PG_FUNCTION_ARGS);
 Datum fb_pg_flashback_support(PG_FUNCTION_ARGS);
+Datum pg_flashback_dml_profile(PG_FUNCTION_ARGS);
+Datum pg_flashback_dml_profile_detail(PG_FUNCTION_ARGS);
 /*
  * pg_flashback
  *    SQL entry API.
  */
 
 Datum pg_flashback(PG_FUNCTION_ARGS);
-/*
- * fb_export_undo
- *    SQL entry API.
- */
-
-Datum fb_export_undo(PG_FUNCTION_ARGS);
-
 /*
  * Internal flashback query session helpers shared by SRF and CustomScan.
  */

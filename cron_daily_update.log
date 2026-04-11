@@ -1,0 +1,33 @@
+[2026-04-11 01:00:01 CST] committing changes to origin/main
+[main 0d93c71] update
+ 58 files changed, 4679 insertions(+), 547 deletions(-)
+ rewrite cron_daily_update.log (100%)
+ create mode 100644 docs/superpowers/plans/2026-04-10-bootstrap-cleanup-safety-plan.md
+ create mode 100644 docs/superpowers/plans/2026-04-10-bootstrap-env-default-prompts.md
+ create mode 100644 docs/superpowers/plans/2026-04-10-bootstrap-nonroot-enforcement.md
+ create mode 100644 docs/superpowers/plans/2026-04-10-bootstrap-systemd-plan.md
+ create mode 100644 docs/superpowers/plans/2026-04-10-summary-runner-recent-first.md
+ delete mode 100644 perf.data
+ delete mode 100644 perf.data.old
+ create mode 100755 scripts/b_pg_flashback.sh
+ create mode 100755 scripts/pg_flashback_summary.sh
+ create mode 100644 sql/pg_flashback--0.2.0--0.2.1.sql
+ create mode 100644 sql/pg_flashback--0.2.1.sql
+ delete mode 100644 summaryd/pg_flashback-summaryd.service
+ delete mode 100755 tests/release_gate/output/latest/.gitignore
+ delete mode 100755 tests/release_gate/output/latest/logs/alldbsim.log
+ create mode 100644 tests/summaryd/bootstrap_archive_autodiscovery_smoke.sh
+ create mode 100644 tests/summaryd/bootstrap_data_dir_safety_smoke.sh
+ create mode 100644 tests/summaryd/bootstrap_help_smoke.sh
+ create mode 100644 tests/summaryd/bootstrap_manual_runner_smoke.sh
+ create mode 100644 tests/summaryd/bootstrap_nonroot_smoke.sh
+ create mode 100644 tests/summaryd/bootstrap_prompt_defaults_smoke.sh
+ create mode 100644 tests/summaryd/bootstrap_prompt_validation_smoke.sh
+ create mode 100644 tests/summaryd/bootstrap_remove_legacy_service_smoke.sh
+ create mode 100644 tests/summaryd/open_source_artifacts_smoke.sh
+ create mode 100644 tests/summaryd/readme_surface_smoke.sh
+ create mode 100644 tests/summaryd/summary_runner_smoke.sh
+[2026-04-11 01:00:01 CST] pushing to origin/main
+To github.com:wublabdubdub/pg_flashback.git
+   39c5876..0d93c71  main -> main
+[2026-04-11 01:00:06 CST] auto update finished

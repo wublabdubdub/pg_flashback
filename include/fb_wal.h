@@ -169,6 +169,8 @@ typedef enum FbWalRecordKind
 	FB_WAL_RECORD_XLOG_FPI_FOR_HINT
 } FbWalRecordKind;
 
+#define FB_WAL_RECORD_KIND_COUNT (FB_WAL_RECORD_XLOG_FPI_FOR_HINT + 1)
+
 typedef enum FbWalXidStatus
 {
 	FB_WAL_XID_UNKNOWN = 0,
@@ -279,6 +281,7 @@ typedef struct FbWalRecordIndex
 	uint64 target_insert_count;
 	uint64 target_delete_count;
 	uint64 target_update_count;
+	uint64 target_kind_counts[FB_WAL_RECORD_KIND_COUNT];
 	uint64 tracked_bytes;
 	uint64 memory_limit_bytes;
 	uint32 record_count;

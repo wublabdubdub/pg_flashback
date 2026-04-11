@@ -29,6 +29,28 @@ FROM pg_flashback(
   '2026-03-22 10:00:00+08'
 );
 
+SELECT *
+FROM pg_flashback_dml_profile(
+  NULL::public.t1,
+  '2026-04-11 10:00:00+08'
+);
+
+SELECT *
+FROM pg_flashback_dml_profile_detail(
+  NULL::public.t1,
+  '2026-04-11 10:00:00+08'
+)
+ORDER BY op_count DESC, op_kind;
+
+SELECT *
+FROM pg_flashback_debug_unresolv_xid(
+  'public.t1'::regclass,
+  '2026-04-11 10:00:00+08'
+);
+
+SELECT *
+FROM pg_flashback_summary_progress;
+
 扩展版本管理补充约束：
 
 - 不能再在同一个 `extversion` 下改变已安装 SQL 接口签名
@@ -54,6 +76,7 @@ FROM pg_flashback(
 - 支持 `INSERT/DELETE/UPDATE`
 - 支持归档 WAL 完整前提下的历史查询
 - 支持导出 undo SQL / reverse op
+- 支持对目标时间点的精确 DML / replay-op 分布统计
 
 ## 首版不支持
 
@@ -99,6 +122,8 @@ FROM pg_flashback(
   - `fb_version()`
   - `fb_check_relation(regclass)`
   - `pg_flashback(anyelement, text)`
+  - `pg_flashback_debug_unresolv_xid(regclass, timestamptz)`
+  - `pg_flashback_summary_progress`
 - 当前主链已落地：
   - `checkpoint -> RecordRef -> BlockReplayStore -> heap redo`
   - 从页级重放提取 `ForwardOp`
@@ -203,6 +228,13 @@ FROM pg_flashback(
 
 - 对外提供一个用户入口：
   - `pg_flashback(anyelement, text)`
+- 对外提供两个 profile 入口：
+  - `pg_flashback_dml_profile(anyelement, text)`
+  - `pg_flashback_dml_profile_detail(anyelement, text)`
+- 对外提供一个调试入口：
+  - `pg_flashback_debug_unresolv_xid(regclass, timestamptz)`
+- 对外提供一个 summary 进度观测入口：
+  - `pg_flashback_summary_progress`
 - 对“全表闪回另立新表”的正式承接方式：
   - `CTAS AS SELECT * FROM pg_flashback(...)`
 - 对“全表闪回导出”的正式承接方式：

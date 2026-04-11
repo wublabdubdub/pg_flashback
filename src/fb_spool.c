@@ -18,6 +18,7 @@
 #include "utils/elog.h"
 #include "utils/wait_event.h"
 
+#include "fb_compat.h"
 #include "fb_runtime.h"
 #include "fb_spool.h"
 
@@ -144,7 +145,8 @@ fb_spool_write_exact(FbSpoolLog *log, const void *data, size_t len, off_t offset
 	if (log == NULL || len == 0)
 		return;
 
-	if (FileWrite(log->file, data, len, offset, WAIT_EVENT_BUFFILE_WRITE) != (int) len)
+	if (fb_file_write_compat(log->file, data, len, offset,
+							 WAIT_EVENT_BUFFILE_WRITE) != (int) len)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not write fb spill file"),
@@ -179,11 +181,12 @@ fb_spool_writev_exact(FbSpoolLog *log,
 
 			if (part->iov_len == 0)
 				continue;
-			if (FileWrite(log->file,
-						  (char *) part->iov_base,
-						  (int) part->iov_len,
-						  current,
-						  WAIT_EVENT_BUFFILE_WRITE) != (int) part->iov_len)
+			if (fb_file_write_compat(log->file,
+									 part->iov_base,
+									 part->iov_len,
+									 current,
+									 WAIT_EVENT_BUFFILE_WRITE) !=
+				(int) part->iov_len)
 				ereport(ERROR,
 						(errcode_for_file_access(),
 						 errmsg("could not write fb spill file"),
@@ -223,7 +226,8 @@ fb_spool_read_exact(FbSpoolLog *log, void *data, size_t len, off_t offset)
 	if (log == NULL || len == 0)
 		return;
 
-	if (FileRead(log->file, data, len, offset, WAIT_EVENT_BUFFILE_READ) != (int) len)
+	if (fb_file_read_compat(log->file, data, len, offset,
+							WAIT_EVENT_BUFFILE_READ) != (int) len)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not read fb spill file"),

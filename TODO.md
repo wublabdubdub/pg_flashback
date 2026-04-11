@@ -2,16 +2,137 @@
 
 ## 当前公开接口
 
-- [ ] 公开安装面仅提供 `pg_flashback(anyelement, text)`
+- [ ] 新增公开 DML profile 用户入口
+  - [x] 提供 `pg_flashback_dml_profile(anyelement, text)` 单行汇总接口
+  - [x] 提供 `pg_flashback_dml_profile_detail(anyelement, text)` 多行明细接口
+  - [x] 统计口径固定为“精确 replay/WAL record kind 操作数”
+  - [x] 汇总层暴露 `total/insert/update/delete/vacuum/other` 计数与比例
+  - [x] 明细层暴露当前支持的 `FbWalRecordKind` 分布
+  - [x] 只建 record index，不进入 replay/apply
+  - [x] 前滚扩展版本并补升级链
+  - [ ] 补回归并同步开源镜像
+  - [ ] 补 fresh 14pg 完整 profile 通过证据
+
+- [x] 修复 14pg summary 驱动闪回遗漏 `XLOG_HEAP2_VACUUM`
+      导致 toast 页回放在 `heap insert` 阶段失败
+  - [x] 前滚 `FB_SUMMARY_VERSION` 并强制旧 sidecar 失效
+  - [x] 复跑 14pg 原始现场 SQL，确认不再报
+        `failed to replay heap insert`
+- [x] 修复 14pg parallel apply 过早释放 reverse/spool
+      导致 `could not open fb spill file`
+  - [x] 将 reverse/spool 生命周期延后到 query release
+  - [x] 复跑 14pg 原始现场 SQL，确认整条查询退出码为 `0`
+
+- [x] 公开安装面提供：
+  - `pg_flashback(anyelement, text)`
+  - `pg_flashback_debug_unresolv_xid(regclass, timestamptz)`
 - [x] 查询型调用形态固定为 `NULL::schema.table`
 - [x] `pg_flashback()` 不创建结果表
 - [x] `pg_flashback()` 不返回结果表名
 - [x] `FROM pg_flashback(...)` 不再经过 PostgreSQL `FunctionScan` / `tuplestore`
 - [x] 库内全表闪回落地新表的正式承接面固定为 `CTAS AS SELECT * FROM pg_flashback(...)`
 - [x] `COPY (SELECT * FROM pg_flashback(...)) TO ...` 仅作为导出路径
+- [x] 提供 xid 级 fallback / unresolved 诊断入口
+- [x] 删除 `pg_flashback_summary_service_debug`
+      与 `fb_summary_service_debug_internal()`
+  - [x] 用户侧 summary 观测只保留 `pg_flashback_summary_progress`
+  - [x] 前滚扩展版本并补删除该视图/函数的升级链
+  - [x] 更新 README / `summaryd/README.md` / 架构文档 / 开源镜像
+- [x] 删除共享库内默认不安装的自用 debug helper 导出
+  - [x] 只保留公开用户入口 / support function / `fb_summary_progress_internal()`
+  - [x] 收缩默认 `REGRESS`，移除仅依赖这些 helper 的回归入口
+  - [x] 用导出符号检查与临时 PG18 安装面复核清理结果
+- [x] 将 `fb_summary_service_debug_internal()` 从历史 SQL 链与共享库一并删除
+  - [x] 历史版本安装/升级脚本不再创建该函数/视图
+  - [x] 删除 `src/fb_summary_service.c` 中剩余 fmgr 导出与实现
+  - [x] 复核 `CREATE EXTENSION ... VERSION '0.1.0' -> UPDATE TO '0.2.3'`
+        不再依赖该符号
+- [x] replay 失败报错补稳定 record 诊断字段
+- [x] 修复 `pg_flashback_debug_unresolv_xid(...)`
+      把“全局 outcome 已存在、但 span window 未覆盖”的 xid
+      误报为 `summary_missing_assignment`
+- [x] 修复并行 payload merge 结束后
+      `fb_wal_finalize_record_stats()` 二次全量重扫导致的
+      `3/9 build record index` 过慢
+  - [x] 收口 root cause 到 worker spool merge 只拼接、不累计 payload 统计
+  - [x] 在 merge 时同步累计 kept/target DML 与 precomputed missing blocks
+  - [x] 补并行/串行 `payload_scanned_records` /
+        `payload_kept_records` 一致性回归
+- [ ] 继续收口 `locator-only payload stub` 路径在 payload 收尾阶段
+      落回 `fb_wal_finalize_record_stats()` 的残余场景
+  - [x] 复核 `scenario_oa_50t_50000r.documents @ 2026-04-11 07:40:40.223683+00`
+        的 `3/9 payload` 活体栈，锁定 `locator-only finalize reread`
+        为当前主热点
+  - [x] 第一阶段方案 A 收口：
+        保留 `locator-only stub`，
+        改为并行产出 `payload stats` / `missing-block` sidecar，
+        纯 `locator-only / 100% summary` 场景不再走 finalize 重扫
+  - [x] 复跑同一现场 SQL，确认 payload 期 leader
+        不再长时间停留在 `fb_wal_finalize_record_stats()`
+  - [ ] mixed `locator + fallback windows` 继续评估：
+        需要补齐 block init state 的跨边界 continuity，
+        才能安全去掉 finalize 兜底
+  - [ ] 冷跑优先：继续压纯 `locator-only / 100% summary`
+        场景里的 payload worker WAL 冷读放大
+    - [x] 严格约束 locator 路径：
+          不再通过 `fb_wal_prepare_payload_read_window()`
+          回退到 run 首 segment 头，也不再借前一整个 segment
+    - [x] 复核并收口 `fb_build_payload_locator_visit_windows()` +
+          `fb_wal_prepare_payload_read_window()` 组合导致的
+          “从 segment 头到 segment 尾” 粗粒度读取
+    - [x] payload locator 并行切分改成按 summary locator 数量，
+          并尽量在 segment 边界收口
+    - [ ] 下一轮冷跑热点：
+          exact locator 冷读的页复用 / 去重
+    - [ ] 下一轮冷跑热点：
+          `precomputed_missing_blocks` 的 hash 插入成本
+- [x] 收口 `3/9 build record index` 的 payload progress notice 语义
+  - [x] 确认 `70% payload` 与 `100% payload` 是否需要对外并存
+  - [x] 若可合并，仅保留单条对外 `payload` notice
+  - [x] 补 `fb_progress` 回归锁住新的 notice 口径
+- [x] 修复 `5/9 replay warm` 完成后到 `6/9 replay final and build forward ops`
+      之间的进度盲区
+  - [x] 收口 root cause 到 `fb_replay_build_prune_lookahead()` 发生在
+        `fb_replay_progress_enter(&final_control)` 之前
+  - [x] 将 final stage 入口前移到 prune lookahead 之前
+  - [x] 补 `fb_replay_final_progress` 合约回归，
+        锁住 “prune lookahead 启动时当前 stage 已经是 `6/9`”
 
 ## summary daemon / 无重启
 
+- [x] 修复 14pg standalone `summaryd` 构建空 summary 导致
+      `pg_flashback_summary_progress` 不显示 ts
+  - [x] 收口 root cause 到 standalone build chain 的跨 PG 残留对象 / vendor 版本错配
+  - [x] 让 external daemon 在 14pg 真环境产出非空 summary 并恢复 progress ts
+  - [x] 补最小防回归检查，锁住 standalone clean/build 源选择
+- [x] 收口 summary runner / bootstrap 到 watchdog + cron 自恢复模型
+  - [x] `scripts/pg_flashback_summary.sh` 对外入口只保留 `start/stop/status`
+  - [x] runner 改为固定读取 `~/.config/pg_flashback/pg_flashback-summaryd.conf`
+  - [x] `start` 启 shell watchdog，而不是直接只起一个 child daemon
+  - [x] watchdog 每秒检查一次 child，丢失时自动拉起
+  - [x] `status` 显式显示 watchdog / child 两层状态
+  - [x] `stop` 同时收掉 watchdog 与 child，并清理 stale pid
+- [x] 为 bootstrap 安装并清理 per-user cron 保活项
+  - [x] `setup` 安装 `* * * * * .../pg_flashback_summary.sh start`
+  - [x] `remove` 删除 bootstrap 写入的 cron block
+  - [x] 重复 setup/update 不得写出重复 cron entry
+- [x] 将 README / 开源 README 的安装说明拆成“一键安装 + 用户自定义手动安装”
+  - [x] 手动安装按 bootstrap 当前真实步骤展开
+  - [x] 手工运维口径按固定路径 watchdog + cron 书写
+- [x] 将 `summaryd` 缺 WAL 现场从失败/禁用收口为等待重试
+  - [x] 候选收集缺段不再把 `service_enabled` 打成 `false`
+  - [x] build 期缺 next segment / 打开段 `ENOENT` 收口为 wait，而非退出
+  - [x] `state/debug` 需要保留“正在等待缺 WAL”的可观测错误信息
+- [x] 补 watchdog / cron / wait-on-missing-wal smoke test
+  - [x] runner smoke 锁住 watchdog 自恢复
+  - [x] bootstrap smoke 锁住 cron install/remove 幂等
+  - [x] 缺 WAL smoke 锁住“进程不退出，只等待重试”
+
+- [x] 修复 standalone `summaryd` 在候选段收集阶段遇到 archive segment 消失时自杀退出
+  - [x] 补一个可稳定模拟“目录扫描后打开前 segment 已消失”的 summaryd smoke test
+  - [x] 将失踪 archive segment 从致命 `ERROR` 收口为跳过当前候选
+  - [x] 给 standalone candidate collection / cleanup 路径补 `PG_TRY` 防止进程直接 `abort`
+  - [x] 验证 crash 现场同类 `ENOENT` 不再导致 `summaryd` 进程丢失
 - [x] 修复 `scripts/b_pg_flashback.sh` 在默认 `user scope`
       但无可用 user bus 时的 setup/remove 路径
   - [x] setup 不再直接卡死在 `systemctl --user`
@@ -22,13 +143,23 @@
   - [x] setup 默认优先识别 `archive_command` 的本地归档目录
   - [x] autodiscovery 不可用时才回退到 `${PGDATA}/pg_wal`
   - [x] `pg_flashback_summary_progress` 默认覆盖范围与 archive 实际目录一致
+- [x] 修复 `scripts/b_pg_flashback.sh` 在旧构建产物残留场景下
+      可能把新 SQL 与旧 `pg_flashback.so` 混装
+  - [x] setup 前强制 `make clean`
+  - [x] release gate selftest 锁住 `make clean -> make -> make install`
+- [x] 修复 legacy `shared_preload_libraries = 'pg_flashback'`
+      导致 bootstrap 安装后仍命中旧预加载库映像
+  - [x] setup 检测到 legacy preload 时自动重写配置文件移除 `pg_flashback`
+  - [x] setup 在数据库变更前自动重启 PostgreSQL
+  - [x] 重启后再次校验 preload 已清掉
+  - [x] README / 开源 README 补充手工安装口径
 - [x] 调整 summary backlog 调度优先级为 recent-first
   - [x] 内嵌 `fb_summary_service` 的 cold backlog 不再 oldest-first
   - [x] 外置 `summaryd` standalone core 改成 recent-first
   - [x] 回归锁住“cold queue 从 newest backlog 开始”
 - [x] 将 summary daemon 交付面改为纯脚本式启动
   - [x] 删除 bootstrap 中的 systemd/service 生命周期逻辑
-  - [x] 新增 `start/stop/status/run-once` 脚本入口
+  - [x] 新增 `start/stop/status` 脚本入口
   - [x] setup/remove 改为围绕脚本 runner 管理 config / pid / log / extension
   - [x] README / summaryd README / smoke test 同步切换到脚本入口
 - [x] 删除根仓库和开源镜像中当前口径下永不会被用户使用的产物

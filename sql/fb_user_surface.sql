@@ -23,9 +23,17 @@ SELECT to_regprocedure('fb_runtime_dir_debug()') IS NULL AS no_runtime_debug,
 	   to_regprocedure('fb_replay_debug(regclass,timestamptz)') IS NULL AS no_replay_debug,
 	   to_regprocedure('fb_wal_window_debug(timestamptz)') IS NULL AS no_window_debug,
 	   to_regprocedure('fb_decode_insert_debug(regclass,timestamptz)') IS NULL AS no_decode_debug,
+	   to_regprocedure('fb_summary_service_debug_internal()') IS NULL AS no_summary_service_debug_internal,
+	   to_regclass('pg_flashback_summary_service_debug') IS NULL AS no_summary_service_debug_view,
 	   to_regprocedure('pg_flashback_to(regclass,text)') IS NULL AS no_to_entry,
 	   to_regprocedure('pg_flashback_rewind(regclass,text)') IS NULL AS no_rewind_entry,
 	   to_regprocedure('pg_flashback(anyelement,text)') IS NOT NULL AS has_query_entry,
+	   to_regprocedure('pg_flashback_dml_profile(anyelement,text)') IS NOT NULL
+	   AS has_dml_profile_entry,
+	   to_regprocedure('pg_flashback_dml_profile_detail(anyelement,text)') IS NOT NULL
+	   AS has_dml_profile_detail_entry,
+	   to_regprocedure('pg_flashback_debug_unresolv_xid(regclass,timestamptz)') IS NOT NULL
+	   AS has_unresolved_xid_debug_entry,
 	   to_regprocedure('pg_flashback(text,text,text)') IS NULL AS no_result_table_entry,
 	   to_regprocedure('fb_flashback_materialize(regclass,timestamptz,text)') IS NULL AS no_materialize_helper,
 	   to_regprocedure('fb_internal_flashback(regclass,timestamptz)') IS NULL AS no_internal_srf;

@@ -32,13 +32,15 @@ FROM pg_flashback(
 
 ### 2. 这个东西怎么用
 
-当前 README 只保留 bootstrap 入口。`git clone` 后直接执行：
+#### 一键安装
+
+在仓库根目录直接执行：
 
 ```bash
 scripts/b_pg_flashback.sh
 ```
 
-脚本当前强制要求以非 root OS 用户执行；root 运行会直接报错退出。
+脚本当前强制要求以非 root OS 用户执行；root 运行会直接报错退出，且当前 OS 用户必须就是 `PGDATA` owner。
 
 脚本会交互式提示输入：
 
@@ -58,7 +60,7 @@ scripts/b_pg_flashback.sh
 - `db-password`
 - `db-port`
 
-执行完成后，脚本会自动完成：
+setup 完成后，脚本会自动完成：
 
 - 若已存在 `PGDATA/pg_flashback`，先只做受限安全清理：
   - 清理 `runtime/`
@@ -66,9 +68,14 @@ scripts/b_pg_flashback.sh
   - 清理 `meta/summary` 下的临时 `.tmp.*`
   - 保留 `recovered_wal/` 与正式 summary/meta 文件
 - build / install
+- 若检测到旧环境仍把 `pg_flashback` 放在
+  `shared_preload_libraries`：
+  - 自动把它移出 `shared_preload_libraries`
+  - 自动重启一次 PostgreSQL，卸载旧预加载库映像
 - `CREATE EXTENSION` 或 `ALTER EXTENSION UPDATE`
 - 写入 `pg_flashback-summaryd` 的 config
-- 通过 `scripts/pg_flashback_summary.sh` 启动 `pg_flashback-summaryd`
+- 通过 `scripts/pg_flashback_summary.sh` 启动 shell watchdog，由其保活 `pg_flashback-summaryd`
+- 安装当前数据库 OS 用户的 cron 保活项，持续执行 `scripts/pg_flashback_summary.sh start`
 - 若未显式传 `--archive-dest`，
   默认优先自动识别 PostgreSQL `archive_command`
   的本地归档目录；
@@ -76,22 +83,27 @@ scripts/b_pg_flashback.sh
 - 对目标数据库执行
   `ALTER DATABASE ... SET pg_flashback.archive_dest = ...`
 
-bootstrap 后，summary daemon 的手工入口固定为：
+安装后，summary runner 的手工入口固定为：
 
 ```bash
-scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf start
-scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf stop
-scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf status
-scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf run-once
+scripts/pg_flashback_summary.sh start
+scripts/pg_flashback_summary.sh stop
+scripts/pg_flashback_summary.sh status
 ```
 
 注意：
 
-- root 用户不能执行该脚本；请切到目标 PostgreSQL OS 用户后再运行
-- 当前 OS 用户必须就是 `PGDATA` owner
+- shell runner 和 cron 都直接依赖当前仓库里的
+  `scripts/pg_flashback_summary.sh`，安装后不要删除这份 checkout
+- runner 固定读取 `~/.config/pg_flashback/pg_flashback-summaryd.conf`
+  并固定管理：
+  - `~/.config/pg_flashback/pg_flashback-summaryd.watchdog.pid`
+  - `~/.config/pg_flashback/pg_flashback-summaryd.pid`
+  - `~/.config/pg_flashback/pg_flashback-summaryd.log`
+- cron 只负责保证 watchdog 存在；`1s` 级 child 自恢复由 watchdog 承担
 - 终端输出当前会按阶段分隔显示，方便区分：
   `Preflight` / `Safe Cleanup` / `Build / Install` /
-  `Database Changes` / `Runner Setup`
+  `Database Changes` / `Runner Setup` / `Cron Keepalive`
 - 交互输入会在可判断范围内立即校验：
   `pg_config` 会校验“存在且可执行”，`PGDATA` 会校验“目录存在”
 - 如果目标环境已经完成同一套初始化，重复执行 setup
@@ -103,7 +115,160 @@ scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-sum
   下的 legacy `pg_flashback-summaryd*.service/.conf`
   与已安装的 `pg_flashback-summaryd` 二进制
 
-执行完 bootstrap 后，先确认 summary 服务状态面已经可见：
+如需一键移除，可执行：
+
+```bash
+scripts/b_pg_flashback.sh --remove
+```
+
+#### 用户自定义手动安装
+
+这一段就是把一键安装拆出来让用户自己执行。下面命令默认都在仓库根目录执行，并沿用当前 `summaryd` 的固定路径 watchdog + cron 模型。
+
+先准备变量：
+
+```bash
+export REPO_ROOT="$(pwd)"
+export PG_CONFIG_BIN=/path/to/pg_config
+export PGDATA=/path/to/pgdata
+export DB_NAME=postgres
+export DB_USER=postgres
+export DB_PASSWORD='your_password'
+export DB_PORT=5432
+export ARCHIVE_DEST=/path/to/archive
+
+export PSQL_BIN="$("${PG_CONFIG_BIN}" --bindir)/psql"
+export SUMMARYD_BIN="$("${PG_CONFIG_BIN}" --bindir)/pg_flashback-summaryd"
+export CONFIG_PATH="${HOME}/.config/pg_flashback/pg_flashback-summaryd.conf"
+export RUNNER_SCRIPT="${REPO_ROOT}/scripts/pg_flashback_summary.sh"
+```
+
+其中：
+
+- `ARCHIVE_DEST` 请手工填写能覆盖目标时间窗的 WAL 归档目录
+- 如果你就是要按 bootstrap 的兜底口径手工做，可以把它设成 `${PGDATA}/pg_wal`
+
+如果 `PGDATA/pg_flashback` 已存在，先按 bootstrap 的同一口径做受限安全清理，不要直接删整个目录：
+
+```bash
+mkdir -p \
+  "${PGDATA}/pg_flashback/runtime" \
+  "${PGDATA}/pg_flashback/meta/summary" \
+  "${PGDATA}/pg_flashback/meta/summaryd"
+
+find "${PGDATA}/pg_flashback/runtime" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+rm -f \
+  "${PGDATA}/pg_flashback/meta/summaryd/state.json" \
+  "${PGDATA}/pg_flashback/meta/summaryd/debug.json" \
+  "${PGDATA}/pg_flashback/meta/summaryd/"*.lock \
+  "${PGDATA}/pg_flashback/meta/summary/.tmp."*
+```
+
+然后手工执行 build / install：
+
+```bash
+make PG_CONFIG="${PG_CONFIG_BIN}" clean
+make PG_CONFIG="${PG_CONFIG_BIN}"
+make PG_CONFIG="${PG_CONFIG_BIN}" install
+```
+
+如果旧环境里仍有：
+
+```sql
+shared_preload_libraries = 'pg_flashback'
+```
+
+手工安装前还需要把它移除并重启 PostgreSQL。当前 `summaryd`
+已不依赖 preload，这一步只用于卸载旧预加载库映像，避免
+`CREATE EXTENSION pg_flashback` 命中旧版 `pg_flashback.so`。
+
+手工创建或升级扩展：
+
+```bash
+VERSION="$(cat VERSION)"
+
+PGPASSWORD="${DB_PASSWORD}" "${PSQL_BIN}" \
+  -v ON_ERROR_STOP=1 \
+  -U "${DB_USER}" \
+  -p "${DB_PORT}" \
+  -d "${DB_NAME}" <<SQL
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_flashback') THEN
+    CREATE EXTENSION pg_flashback;
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM pg_extension
+    WHERE extname = 'pg_flashback'
+      AND extversion <> '${VERSION}'
+  ) THEN
+    EXECUTE format('ALTER EXTENSION pg_flashback UPDATE TO %L', '${VERSION}');
+  END IF;
+END;
+$$;
+SQL
+```
+
+手工写数据库默认 `archive_dest`：
+
+```bash
+PGPASSWORD="${DB_PASSWORD}" "${PSQL_BIN}" \
+  -v ON_ERROR_STOP=1 \
+  -U "${DB_USER}" \
+  -p "${DB_PORT}" \
+  -d "${DB_NAME}" <<SQL
+ALTER DATABASE ${DB_NAME} SET pg_flashback.archive_dest = '${ARCHIVE_DEST}';
+SQL
+```
+
+手工写固定路径的 `summaryd` 配置文件：
+
+```bash
+mkdir -p "$(dirname "${CONFIG_PATH}")"
+cat > "${CONFIG_PATH}" <<EOF
+pgdata=${PGDATA}
+archive_dest=${ARCHIVE_DEST}
+interval_ms=1000
+EOF
+```
+
+手工启动 watchdog：
+
+```bash
+"${RUNNER_SCRIPT}" start
+```
+
+如果你希望得到与一键安装相同的保活效果，再手工安装当前 OS 用户的 `cron`：
+
+```bash
+CRON_BLOCK_BEGIN="# BEGIN pg_flashback-summaryd keepalive"
+CRON_BLOCK_END="# END pg_flashback-summaryd keepalive"
+CRON_LINE="* * * * * ${RUNNER_SCRIPT} start >/dev/null 2>&1"
+
+{
+  crontab -l 2>/dev/null | awk -v begin="${CRON_BLOCK_BEGIN}" -v end="${CRON_BLOCK_END}" '
+    $0 == begin { skip = 1; next }
+    $0 == end { skip = 0; next }
+    skip == 0 { print }
+  '
+  echo "${CRON_BLOCK_BEGIN}"
+  echo "${CRON_LINE}"
+  echo "${CRON_BLOCK_END}"
+} | crontab -
+```
+
+手工安装完成后，后续运维入口仍然是：
+
+```bash
+scripts/pg_flashback_summary.sh start
+scripts/pg_flashback_summary.sh stop
+scripts/pg_flashback_summary.sh status
+```
+
+#### 安装后验证
+
+先确认 summary 服务状态面已经可见：
 
 ```sql
 SELECT *
@@ -116,13 +281,6 @@ FROM pg_flashback_summary_progress;
 - `daemon_state_present`: 是否已经发现 external daemon 发布的状态文件
 - `daemon_state_stale`: external 状态文件是否已经过期
 - `daemon_state_published_at`: external daemon 最近一次发布时间
-
-需要看更细的 worker / scan / build / cleanup 实时计数时：
-
-```sql
-SELECT *
-FROM pg_flashback_summary_service_debug;
-```
 
 建议先检查目标表是否受支持：
 
@@ -247,13 +405,16 @@ FROM pg_flashback(
 
 ### 2. How To Use It
 
-This README only keeps the bootstrap entrypoint. After `git clone`, run:
+#### One-Command Install
+
+From the repository root, run:
 
 ```bash
 scripts/b_pg_flashback.sh
 ```
 
-The script must be run as a non-root OS user. Root execution fails immediately.
+The script must be run as a non-root OS user. Root execution fails immediately,
+and the current OS user must own `PGDATA`.
 
 The script will prompt interactively for:
 
@@ -283,24 +444,33 @@ After setup, it will automatically:
 - build and install the extension
 - run `CREATE EXTENSION` or `ALTER EXTENSION UPDATE`
 - write the `pg_flashback-summaryd` config
-- start `pg_flashback-summaryd` through `scripts/pg_flashback_summary.sh`
+- start a shell watchdog through `scripts/pg_flashback_summary.sh`,
+  which keeps `pg_flashback-summaryd` alive
+- install a per-user cron keepalive that repeatedly runs
+  `scripts/pg_flashback_summary.sh start`
 - run
   `ALTER DATABASE ... SET pg_flashback.archive_dest = ...`
   for the target database
 
-After bootstrap, the manual daemon entrypoints are fixed as:
+After installation, the manual runner entrypoints are fixed as:
 
 ```bash
-scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf start
-scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf stop
-scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf status
-scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf run-once
+scripts/pg_flashback_summary.sh start
+scripts/pg_flashback_summary.sh stop
+scripts/pg_flashback_summary.sh status
 ```
 
 Notes:
 
-- root must not run this script; switch to the target PostgreSQL OS user first
-- the current OS user must own `PGDATA`
+- the shell runner and cron keepalive both use
+  `scripts/pg_flashback_summary.sh` from this checkout, so do not remove the
+  repository after installation
+- the runner always uses `~/.config/pg_flashback/pg_flashback-summaryd.conf`
+  and fixed paths under the same directory:
+  - `~/.config/pg_flashback/pg_flashback-summaryd.watchdog.pid`
+  - `~/.config/pg_flashback/pg_flashback-summaryd.pid`
+  - `~/.config/pg_flashback/pg_flashback-summaryd.log`
+- cron only keeps the watchdog present; the watchdog handles 1-second child restarts
 - terminal output is now grouped into explicit stages so setup/remove progress
   is easier to read
 - interactive inputs are validated immediately when possible:
@@ -314,12 +484,166 @@ Notes:
   entries for the same `PGDATA` and removes the installed
   `pg_flashback-summaryd` binary
 
-After bootstrap, verify that the summary status surface is visible:
+If you want one-command removal later, run:
+
+```bash
+scripts/b_pg_flashback.sh --remove
+```
+
+#### Manual Custom Install
+
+This section is the one-command installer split into the exact manual steps.
+Run the commands below from the repository root and keep the current fixed-path
+watchdog + cron model for `summaryd`.
+
+Prepare the variables first:
+
+```bash
+export REPO_ROOT="$(pwd)"
+export PG_CONFIG_BIN=/path/to/pg_config
+export PGDATA=/path/to/pgdata
+export DB_NAME=postgres
+export DB_USER=postgres
+export DB_PASSWORD='your_password'
+export DB_PORT=5432
+export ARCHIVE_DEST=/path/to/archive
+
+export PSQL_BIN="$("${PG_CONFIG_BIN}" --bindir)/psql"
+export SUMMARYD_BIN="$("${PG_CONFIG_BIN}" --bindir)/pg_flashback-summaryd"
+export CONFIG_PATH="${HOME}/.config/pg_flashback/pg_flashback-summaryd.conf"
+export RUNNER_SCRIPT="${REPO_ROOT}/scripts/pg_flashback_summary.sh"
+```
+
+Notes for the variables:
+
+- set `ARCHIVE_DEST` to the WAL archive directory that covers the target window
+- if you want the same fallback semantics as the bootstrap script, you can set
+  it to `${PGDATA}/pg_wal`
+
+If `PGDATA/pg_flashback` already exists, do the same bounded safe cleanup first.
+Do not delete the whole directory:
+
+```bash
+mkdir -p \
+  "${PGDATA}/pg_flashback/runtime" \
+  "${PGDATA}/pg_flashback/meta/summary" \
+  "${PGDATA}/pg_flashback/meta/summaryd"
+
+find "${PGDATA}/pg_flashback/runtime" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+rm -f \
+  "${PGDATA}/pg_flashback/meta/summaryd/state.json" \
+  "${PGDATA}/pg_flashback/meta/summaryd/debug.json" \
+  "${PGDATA}/pg_flashback/meta/summaryd/"*.lock \
+  "${PGDATA}/pg_flashback/meta/summary/.tmp."*
+```
+
+Build and install manually:
+
+```bash
+make PG_CONFIG="${PG_CONFIG_BIN}"
+make PG_CONFIG="${PG_CONFIG_BIN}" install
+```
+
+Create or upgrade the extension manually:
+
+```bash
+VERSION="$(cat VERSION)"
+
+PGPASSWORD="${DB_PASSWORD}" "${PSQL_BIN}" \
+  -v ON_ERROR_STOP=1 \
+  -U "${DB_USER}" \
+  -p "${DB_PORT}" \
+  -d "${DB_NAME}" <<SQL
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_flashback') THEN
+    CREATE EXTENSION pg_flashback;
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM pg_extension
+    WHERE extname = 'pg_flashback'
+      AND extversion <> '${VERSION}'
+  ) THEN
+    EXECUTE format('ALTER EXTENSION pg_flashback UPDATE TO %L', '${VERSION}');
+  END IF;
+END;
+$$;
+SQL
+```
+
+Write the database default `archive_dest` manually:
+
+```bash
+PGPASSWORD="${DB_PASSWORD}" "${PSQL_BIN}" \
+  -v ON_ERROR_STOP=1 \
+  -U "${DB_USER}" \
+  -p "${DB_PORT}" \
+  -d "${DB_NAME}" <<SQL
+ALTER DATABASE ${DB_NAME} SET pg_flashback.archive_dest = '${ARCHIVE_DEST}';
+SQL
+```
+
+Write the fixed `summaryd` config file:
+
+```bash
+mkdir -p "$(dirname "${CONFIG_PATH}")"
+cat > "${CONFIG_PATH}" <<EOF
+pgdata=${PGDATA}
+archive_dest=${ARCHIVE_DEST}
+interval_ms=1000
+EOF
+```
+
+Start the watchdog manually:
+
+```bash
+"${RUNNER_SCRIPT}" start
+```
+
+If you want the same keepalive semantics as the one-command installer, add the
+per-user cron entry manually:
+
+```bash
+CRON_BLOCK_BEGIN="# BEGIN pg_flashback-summaryd keepalive"
+CRON_BLOCK_END="# END pg_flashback-summaryd keepalive"
+CRON_LINE="* * * * * ${RUNNER_SCRIPT} start >/dev/null 2>&1"
+
+{
+  crontab -l 2>/dev/null | awk -v begin="${CRON_BLOCK_BEGIN}" -v end="${CRON_BLOCK_END}" '
+    $0 == begin { skip = 1; next }
+    $0 == end { skip = 0; next }
+    skip == 0 { print }
+  '
+  echo "${CRON_BLOCK_BEGIN}"
+  echo "${CRON_LINE}"
+  echo "${CRON_BLOCK_END}"
+} | crontab -
+```
+
+After manual installation, the operational entrypoints are still:
+
+```bash
+scripts/pg_flashback_summary.sh start
+scripts/pg_flashback_summary.sh stop
+scripts/pg_flashback_summary.sh status
+```
+
+#### Post-Install Verification
+
+Verify that the summary status surface is visible:
 
 ```sql
 SELECT *
 FROM pg_flashback_summary_progress;
 ```
+
+When checking the external daemon, look at these columns first:
+
+- `state_source`
+- `daemon_state_present`
+- `daemon_state_stale`
+- `daemon_state_published_at`
 
 It is recommended to check that the target table is supported:
 

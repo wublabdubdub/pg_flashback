@@ -9,6 +9,7 @@
 #include "miscadmin.h"
 #include "access/genam.h"
 #include "access/xlogreader.h"
+#include "storage/fd.h"
 #include "storage/shm_mq.h"
 
 #if PG_VERSION_NUM >= 160000
@@ -60,6 +61,44 @@ fb_xlogrec_get_block_tag(XLogReaderState *reader,
 									  blkno, NULL);
 #else
 	return XLogRecGetBlockTag(reader, block_id, locator, forknum, blkno);
+#endif
+}
+
+static inline ssize_t
+fb_file_read_compat(File file,
+					void *buffer,
+					size_t amount,
+					off_t offset,
+					uint32 wait_event_info)
+{
+#if PG_VERSION_NUM >= 180000
+	struct iovec iov = {
+		.iov_base = buffer,
+		.iov_len = amount
+	};
+
+	return FileReadV(file, &iov, 1, offset, wait_event_info);
+#else
+	return FileRead(file, buffer, amount, offset, wait_event_info);
+#endif
+}
+
+static inline ssize_t
+fb_file_write_compat(File file,
+					 const void *buffer,
+					 size_t amount,
+					 off_t offset,
+					 uint32 wait_event_info)
+{
+#if PG_VERSION_NUM >= 180000
+	struct iovec iov = {
+		.iov_base = unconstify(void *, buffer),
+		.iov_len = amount
+	};
+
+	return FileWriteV(file, &iov, 1, offset, wait_event_info);
+#else
+	return FileWrite(file, buffer, amount, offset, wait_event_info);
 #endif
 }
 

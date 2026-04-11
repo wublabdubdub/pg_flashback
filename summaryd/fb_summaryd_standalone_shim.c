@@ -8,11 +8,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "access/transam.h"
+#include "access/xlog_internal.h"
 #include "storage/fd.h"
+#include "storage/s_lock.h"
 #include "utils/array.h"
 #include "utils/elog.h"
 #include "utils/palloc.h"
@@ -24,6 +27,8 @@
 #include "summaryd/fb_summaryd_core.h"
 
 #define SUMMARYD_PG_EPOCH_UNIX INT64CONST(946684800)
+
+typedef struct TransamVariablesData TransamVariablesData;
 
 char *DataDir = NULL;
 int MyProcPid = 0;
@@ -287,6 +292,44 @@ CloseTransientFile(int fd)
 	return close(fd);
 }
 
+#if PG_VERSION_NUM >= 180000
+ssize_t
+FileReadV(File file, const struct iovec *iov, int iovcnt, off_t offset,
+		  uint32 wait_event_info)
+{
+	(void) wait_event_info;
+	return preadv(file, iov, iovcnt, offset);
+}
+
+ssize_t
+FileWriteV(File file, const struct iovec *iov, int iovcnt, off_t offset,
+		   uint32 wait_event_info)
+{
+	(void) wait_event_info;
+	return pwritev(file, iov, iovcnt, offset);
+}
+#else
+int
+FileRead(File file, char *buffer, int amount, off_t offset, uint32 wait_event_info)
+{
+	(void) wait_event_info;
+	return pread(file, buffer, (size_t) amount, offset);
+}
+
+int
+FileWrite(File file, char *buffer, int amount, off_t offset, uint32 wait_event_info)
+{
+	(void) wait_event_info;
+	return pwrite(file, buffer, (size_t) amount, offset);
+}
+#endif
+
+void
+FileClose(File file)
+{
+	(void) close(file);
+}
+
 TimestampTz
 GetCurrentTimestamp(void)
 {
@@ -485,7 +528,74 @@ fb_runtime_cleanup_current_backend(void)
 XLogRecPtr
 fb_xlog_find_next_record_compat(XLogReaderState *state, XLogRecPtr recptr)
 {
+#if PG_VERSION_NUM >= 180000
 	return XLogFindNextRecord(state, recptr);
+#else
+	PGAlignedXLogBlock local_page;
+	XLogRecPtr	pageptr;
+	uint32		startoff;
+	uint32		page_header_size;
+	uint32		contlen = 0;
+	int			readlen;
+	char	   *errormsg = NULL;
+
+	if (state == NULL || XLogRecPtrIsInvalid(recptr))
+		return InvalidXLogRecPtr;
+
+	pageptr = recptr - (recptr % XLOG_BLCKSZ);
+
+	for (;;)
+	{
+		XLogPageHeader page_header;
+
+			readlen = state->routine.page_read(state,
+											   pageptr,
+											   SizeOfXLogShortPHD,
+											   recptr,
+											   local_page.data);
+			if (readlen < 0)
+				return InvalidXLogRecPtr;
+			memcpy(state->readBuf, local_page.data, readlen);
+
+			page_header = (XLogPageHeader) state->readBuf;
+			page_header_size = XLogPageHeaderSize(page_header);
+			if (readlen < (int) page_header_size)
+			{
+				readlen = state->routine.page_read(state,
+												   pageptr,
+												   page_header_size,
+												   recptr,
+												   local_page.data);
+				if (readlen < (int) page_header_size)
+					return InvalidXLogRecPtr;
+				memcpy(state->readBuf, local_page.data, readlen);
+				page_header = (XLogPageHeader) state->readBuf;
+			}
+
+		startoff = (pageptr == recptr - (recptr % XLOG_BLCKSZ)) ?
+			(uint32) (recptr % XLOG_BLCKSZ) : 0;
+		if (startoff < page_header_size)
+			startoff = page_header_size;
+
+		if ((page_header->xlp_info & XLP_FIRST_IS_CONTRECORD) != 0 &&
+			startoff == page_header_size)
+		{
+			contlen = Min((uint32) page_header->xlp_rem_len,
+						  (uint32) (XLOG_BLCKSZ - page_header_size));
+			startoff += contlen;
+		}
+
+		for (; startoff < XLOG_BLCKSZ; startoff++)
+		{
+			XLogBeginRead(state, pageptr + startoff);
+			if (XLogReadRecord(state, &errormsg) != NULL)
+				return state->ReadRecPtr;
+		}
+
+		pageptr += XLOG_BLCKSZ;
+		recptr = pageptr;
+	}
+#endif
 }
 
 void

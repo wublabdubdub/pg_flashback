@@ -34,6 +34,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
+#include "fb_compat.h"
 #include "fb_runtime.h"
 #include "fb_toast.h"
 
@@ -220,8 +221,8 @@ fb_toast_spill_chunk(FbToastStore *store,
 		return;
 
 	fb_toast_ensure_spill_file(store);
-	if (FileWrite(store->spill_file, data, len, store->spill_size,
-				  WAIT_EVENT_BUFFILE_WRITE) != len)
+	if (fb_file_write_compat(store->spill_file, data, len, store->spill_size,
+							 WAIT_EVENT_BUFFILE_WRITE) != len)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not write fb toast spill file"),
@@ -253,8 +254,9 @@ fb_toast_read_spilled_chunk(FbToastStore *store, const FbToastChunkEntry *entry)
 				 errmsg("fb toast spill file is not available for retired chunk")));
 
 	data = palloc(entry->len);
-	if (FileRead(store->spill_file, data, entry->len, entry->spill_offset,
-				 WAIT_EVENT_BUFFILE_READ) != entry->len)
+	if (fb_file_read_compat(store->spill_file, data, entry->len,
+							entry->spill_offset,
+							WAIT_EVENT_BUFFILE_READ) != entry->len)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not read fb toast spill file"),

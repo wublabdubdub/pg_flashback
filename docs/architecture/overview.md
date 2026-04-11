@@ -21,10 +21,14 @@ FROM pg_flashback(
 - `fb_version()`
 - `fb_check_relation(regclass)`
 - `pg_flashback(anyelement, text)`
+- `pg_flashback_dml_profile(anyelement, text)`
+- `pg_flashback_dml_profile_detail(anyelement, text)`
+- `pg_flashback_debug_unresolv_xid(regclass, timestamptz)`
+- `pg_flashback_summary_progress`
 
 对应安装脚本：
 
-- `sql/pg_flashback--0.1.0.sql`
+- `sql/pg_flashback--0.2.3.sql`
 
 ## 一、先记住主链
 
@@ -64,6 +68,17 @@ Custom Scan (FbCountAggScan)
 ```
 
 这条路径不再走 PostgreSQL 默认 `Aggregate -> FbApplyScan`，也不再发射整批历史行给上层聚合器。
+
+当前还会新增一条“只做 WAL/index 统计、不进入 replay/apply”的 profile 路径：
+
+```text
+pg_flashback_dml_profile(anyelement, text)
+  -> relation/runtime gate
+  -> WAL source resolve + scan context
+  -> RecordRef index / payload stats
+  -> per-kind op counters
+  -> SQL summary/detail rows
+```
 
 如果要再补一句当前大窗口实现特点，就是：
 
@@ -221,6 +236,9 @@ Custom Scan (FbCountAggScan)
 
 - `fb_wal_build_record_index()` 仍负责顺扫构建 `RecordRef` 索引
 - `FbWalRecordCursor` 负责从 spool 中恢复记录并向 replay 发射
+- 当前也承接 xid 调试入口：
+  - `pg_flashback_debug_unresolv_xid(regclass, timestamptz)`
+  - 复用 metadata / summary / exact-fill 诊断链路，发射 xid 级 fallback 行
 - 当前已拍板把 locator-only / deferred payload 的按需回填，
   收敛到 WAL 层内部统一的 reusable record materializer：
   - 复用 `XLogReaderState`
@@ -245,7 +263,6 @@ Custom Scan (FbCountAggScan)
   - 优先读取 daemon 发布的 `state.json` / `debug.json`
   - daemon 状态缺失或 stale 且 preload 服务存在时，回退读取 shmem 视图数据
   - 提供 `pg_flashback_summary_progress`
-  - 提供 `pg_flashback_summary_service_debug`
   - 写入并直接读取查询侧最近一次 summary 使用/降级观测 hint
 
 迁移中的 daemon 目标职责：
@@ -267,12 +284,27 @@ Custom Scan (FbCountAggScan)
   - `start`
   - `stop`
   - `status`
-  - `run-once`
+- 对外脚本入口固定不再暴露 `--config` / `--pid-file` /
+  `--log-file` / `--summaryd-bin`
+- 当前脚本承载模型已经拍板为两层：
+  - 外层 shell watchdog
+    - 固定读取 `~/.config/pg_flashback/pg_flashback-summaryd.conf`
+    - 固定管理 `watchdog.pid` / `pid` / `log`
+    - 每 `1s` 检查一次 child daemon
+    - child 异常丢失则自动拉起
+  - 内层 `pg_flashback-summaryd`
+    - 专注执行一次次 build / cleanup iteration
+    - 遇到缺 WAL / 缺 decode-tail segment 现场时只进入等待重试，
+      不把生命周期交给异常退出
 - `b_pg_flashback.sh` 负责：
   - build / install
   - extension setup / remove
   - 写 summaryd config
-  - 调用脚本 runner 启停 daemon
+  - 调用脚本 runner 启停 watchdog
+  - 安装/删除当前数据库 OS 用户的 `crontab` 保活项：
+    - `cron` 每分钟执行一次 `pg_flashback_summary.sh start`
+    - 只负责保证 watchdog 自身存在
+    - `1s` 级 daemon 自恢复仍由 watchdog 承担
 
 当前进度视图口径补充：
 

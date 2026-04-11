@@ -28,6 +28,11 @@ typedef struct SummarydCleanupEntry
 	long mtime_nsec;
 } SummarydCleanupEntry;
 
+static bool summaryd_core_try_collect_build_candidates(FbSummaryBuildCandidate **candidates_out,
+													   bool skip_unstable_tail,
+													   int *candidate_count_out);
+static bool summaryd_core_error_is_waitable(const char *message);
+
 static int
 summaryd_core_hot_window(int registered_workers)
 {
@@ -180,7 +185,9 @@ summaryd_core_collect_snapshot_hashes(TimeLineID snapshot_timeline_id,
 	if (count_out != NULL)
 		*count_out = 0;
 
-	candidate_count = fb_summary_collect_build_candidates(&candidates, true);
+	if (!summaryd_core_try_collect_build_candidates(&candidates, true,
+													&candidate_count))
+		return;
 	for (i = 0; i < candidate_count; i++)
 	{
 		uint64 hash;
@@ -237,7 +244,9 @@ summaryd_core_run_cleanup(TimeLineID snapshot_timeline_id,
 
 	total_bytes = fb_summary_meta_summary_size_bytes(NULL);
 	low_bytes = summaryd_core_meta_low_bytes();
-	candidate_count = fb_summary_collect_build_candidates(&candidates, false);
+	if (!summaryd_core_try_collect_build_candidates(&candidates, false,
+													&candidate_count))
+		return 0;
 	summaryd_core_collect_candidate_hashes(candidates,
 											 candidate_count,
 											 &live_hashes,
@@ -358,6 +367,60 @@ summaryd_core_try_build_candidate(const FbSummaryBuildCandidate *candidate)
 }
 
 static bool
+summaryd_core_try_collect_build_candidates(FbSummaryBuildCandidate **candidates_out,
+										   bool skip_unstable_tail,
+										   int *candidate_count_out)
+{
+	bool ok = true;
+	int candidate_count = 0;
+
+	if (candidates_out != NULL)
+		*candidates_out = NULL;
+	if (candidate_count_out != NULL)
+		*candidate_count_out = 0;
+
+	summaryd_core_clear_error();
+	PG_TRY();
+	{
+		candidate_count = fb_summary_collect_build_candidates(candidates_out,
+															 skip_unstable_tail);
+	}
+	PG_CATCH();
+	{
+		ok = false;
+		if (candidates_out != NULL && *candidates_out != NULL)
+		{
+			fb_summary_free_build_candidates(*candidates_out);
+			*candidates_out = NULL;
+		}
+		candidate_count = 0;
+	}
+	PG_END_TRY();
+
+	if (candidate_count_out != NULL)
+		*candidate_count_out = candidate_count;
+	return ok;
+}
+
+static bool
+summaryd_core_error_is_waitable(const char *message)
+{
+	if (message == NULL || message[0] == '\0')
+		return false;
+
+	if (strstr(message, "missing decode-tail segment") != NULL)
+		return true;
+	if (strstr(message, "could not open WAL segment") != NULL &&
+		strstr(message, "No such file or directory") != NULL)
+		return true;
+	if (strstr(message, "could not open file") != NULL &&
+		strstr(message, "No such file or directory") != NULL)
+		return true;
+
+	return false;
+}
+
+static bool
 summaryd_core_timestamp_difference_exceeds(TimestampTz start,
 										   TimestampTz stop,
 										   int msec)
@@ -382,6 +445,7 @@ summaryd_run_core_iteration(const SummarydConfig *config,
 	unsigned long long cleanup_count = 0;
 	int i;
 	bool ok = true;
+	bool waitable_error = false;
 	TimestampTz throughput_window_started_at =
 		(TimestampTz) state->throughput_window_started_at_internal;
 	TimestampTz last_build_at =
@@ -392,7 +456,26 @@ summaryd_run_core_iteration(const SummarydConfig *config,
 		return false;
 
 	summaryd_core_set_paths(config);
-	candidate_count = fb_summary_collect_build_candidates(&candidates, false);
+	if (!summaryd_core_try_collect_build_candidates(&candidates, false,
+													&candidate_count))
+	{
+		const char *last_error = summaryd_core_last_error();
+
+		state->service_enabled = summaryd_core_error_is_waitable(last_error);
+		state->daemon_pid = getpid();
+		state->registered_workers = 1;
+		state->active_workers = 0;
+		state->scan_count++;
+		state->last_scan_at_internal = (long long) GetCurrentTimestamp();
+		strlcpy(state->last_error,
+				last_error,
+				sizeof(state->last_error));
+		if (publish_hook != NULL)
+			(void) publish_hook(config, state);
+		if (state->service_enabled)
+			return true;
+		return false;
+	}
 	hot_window = summaryd_core_hot_window(1);
 	hot_candidates = Min(hot_window, candidate_count);
 
@@ -429,11 +512,18 @@ summaryd_run_core_iteration(const SummarydConfig *config,
 			continue;
 		if (!summaryd_core_try_build_candidate(&candidates[i]))
 		{
+			const char *last_error = summaryd_core_last_error();
+
+			strlcpy(state->last_error,
+					last_error,
+					sizeof(state->last_error));
+			if (summaryd_core_error_is_waitable(last_error))
+			{
+				waitable_error = true;
+				break;
+			}
 			ok = false;
 			state->service_enabled = false;
-			strlcpy(state->last_error,
-					summaryd_core_last_error(),
-					sizeof(state->last_error));
 			break;
 		}
 		{
@@ -470,7 +560,7 @@ summaryd_run_core_iteration(const SummarydConfig *config,
 												 (XLogSegNo) state->snapshot_newest_segno);
 
 	state->cleanup_count += cleanup_count;
-	if (ok)
+	if (ok && !waitable_error)
 		state->last_error[0] = '\0';
 	if (publish_hook != NULL)
 		(void) publish_hook(config, state);

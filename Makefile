@@ -22,18 +22,28 @@ OBJS = \
 	src/fb_apply_bag.o \
 	src/fb_toast.o
 
-DATA = sql/pg_flashback--0.1.0.sql sql/pg_flashback--0.1.1.sql sql/pg_flashback--0.2.0.sql sql/pg_flashback--0.2.1.sql sql/pg_flashback--0.1.0--0.1.1.sql sql/pg_flashback--0.1.1--0.2.0.sql sql/pg_flashback--0.2.0--0.2.1.sql
-REGRESS = fb_smoke fb_relation_gate fb_relation_unsupported fb_runtime_gate fb_flashback_keyed fb_flashback_bag fb_flashback_storage_boundary fb_flashback_hot_update_fpw fb_flashback_main_truncate fb_flashback_standby_lock fb_flashback_toast_storage_boundary fb_guc_defaults fb_guc_startup fb_target_snapshot pg_flashback fb_user_surface fb_extension_upgrade fb_recordref fb_replay fb_replay_prune_future_state fb_wal_sidecar fb_wal_parallel_payload fb_payload_scan_mode fb_summary_payload_locator_merge fb_apply_parallel fb_wal_source_policy fb_recovered_wal_policy fb_wal_prefix_suffix fb_wal_error_surface fb_memory_limit fb_spill fb_preflight fb_toast_flashback fb_progress fb_value_per_call fb_custom_scan fb_flashback_full_output fb_summary_prefilter fb_summary_service fb_summary_daemon_state fb_summary_identity fb_runtime_cleanup fb_summary_v3 fb_summary_overlap_toast
+DATA = sql/pg_flashback--0.1.0.sql sql/pg_flashback--0.1.1.sql sql/pg_flashback--0.2.0.sql sql/pg_flashback--0.2.1.sql sql/pg_flashback--0.2.2.sql sql/pg_flashback--0.2.3.sql sql/pg_flashback--0.2.4.sql sql/pg_flashback--0.1.0--0.1.1.sql sql/pg_flashback--0.1.1--0.2.0.sql sql/pg_flashback--0.2.0--0.2.1.sql sql/pg_flashback--0.2.1--0.2.2.sql sql/pg_flashback--0.2.2--0.2.3.sql sql/pg_flashback--0.2.3--0.2.4.sql
+REGRESS = fb_smoke fb_relation_gate fb_relation_unsupported fb_runtime_gate fb_flashback_keyed fb_flashback_bag fb_flashback_storage_boundary fb_flashback_hot_update_fpw fb_flashback_main_truncate fb_flashback_standby_lock fb_flashback_toast_storage_boundary fb_guc_defaults fb_guc_startup pg_flashback fb_user_surface fb_dml_profile fb_extension_upgrade fb_unresolved_xid_debug fb_memory_limit fb_spill fb_preflight fb_toast_flashback fb_flashback_full_output fb_replay_final_progress fb_summary_daemon_state
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 BINDIR := $(shell $(PG_CONFIG) --bindir)
 SHAREDIR := $(shell $(PG_CONFIG) --sharedir)
 INCLUDEDIR := $(shell $(PG_CONFIG) --includedir)
+SERVER_INCLUDEDIR := $(shell $(PG_CONFIG) --includedir-server)
 LIBDIR := $(shell $(PG_CONFIG) --libdir)
+PG_MAJOR := $(shell $(PG_CONFIG) --version | sed -E 's/.* ([0-9]+)(\..*)?/\1/')
 VERSION := $(shell cat VERSION)
 SUMMARYD = pg_flashback-summaryd
 SUMMARYD_BIN = summaryd/$(SUMMARYD)
+SUMMARYD_XLOGREADER_SRC = summaryd/vendor/xlogreader.c
+SUMMARYD_XACTDESC_SRC = summaryd/vendor/xactdesc.c
+SUMMARYD_DYNAHASH_SRC = summaryd/vendor/dynahash.c
+ifeq ($(PG_MAJOR),14)
+SUMMARYD_XLOGREADER_SRC = summaryd/vendor/xlogreader_pg14.c
+SUMMARYD_XACTDESC_SRC = summaryd/vendor/xactdesc_pg14.c
+SUMMARYD_DYNAHASH_SRC = summaryd/vendor/dynahash_pg14.c
+endif
 SUMMARYD_SRCS = \
 	summaryd/pg_flashback_summaryd.c \
 	summaryd/fb_summaryd_core.c \
@@ -61,30 +71,35 @@ endif
 all: $(SUMMARYD_BIN)
 
 summaryd/pg_flashback_summaryd.o: summaryd/pg_flashback_summaryd.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -Wall -Wextra -std=c11 -I$(INCLUDEDIR) -I$(shell $(PG_CONFIG) --includedir-server) -I$(CURDIR) -DPG_FLASHBACK_VERSION=\"$(VERSION)\" -c -o $@ $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Wall -Wextra -std=c11 -I$(INCLUDEDIR) -I$(SERVER_INCLUDEDIR) -I$(CURDIR) -DPG_FLASHBACK_VERSION=\"$(VERSION)\" -c -o $@ $<
 
 summaryd/fb_summaryd_core.o: summaryd/fb_summaryd_core.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -Wall -Wextra -std=c11 -I$(INCLUDEDIR) -I$(shell $(PG_CONFIG) --includedir-server) -I$(CURDIR) -c -o $@ $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Wall -Wextra -std=c11 -I$(INCLUDEDIR) -I$(SERVER_INCLUDEDIR) -I$(CURDIR) -c -o $@ $<
 
 summaryd/fb_summaryd_standalone_shim.o: summaryd/fb_summaryd_standalone_shim.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -Wall -Wextra -std=c11 -I$(INCLUDEDIR) -I$(CURDIR) -I$(shell $(PG_CONFIG) --includedir-server) -c -o $@ $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Wall -Wextra -std=c11 -I$(INCLUDEDIR) -I$(CURDIR) -I$(SERVER_INCLUDEDIR) -c -o $@ $<
 
 summaryd/fb_summary_standalone.o: src/fb_summary.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DPOSIX_FADV_SEQUENTIAL=2 -ffunction-sections -fdata-sections -Wall -Wextra -std=c11 -I$(INCLUDEDIR) -I$(shell $(PG_CONFIG) --includedir-server) -I$(CURDIR)/include -c -o $@ $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFB_SUMMARY_STANDALONE=1 -DPOSIX_FADV_SEQUENTIAL=2 -ffunction-sections -fdata-sections -Wall -Wextra -std=c11 -I$(INCLUDEDIR) -I$(SERVER_INCLUDEDIR) -I$(CURDIR)/include -c -o $@ $<
 
-summaryd/vendor/xlogreader.o: summaryd/vendor/xlogreader.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -ffunction-sections -fdata-sections -Wall -Wextra -std=c11 -I$(INCLUDEDIR) -I$(shell $(PG_CONFIG) --includedir-server) -c -o $@ $<
+summaryd/vendor/xlogreader.o: $(SUMMARYD_XLOGREADER_SRC)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -ffunction-sections -fdata-sections -Wall -Wextra -std=c11 -I$(INCLUDEDIR) -I$(SERVER_INCLUDEDIR) -c -o $@ $<
 
-summaryd/vendor/xactdesc.o: summaryd/vendor/xactdesc.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -Wall -Wextra -std=c11 -I$(INCLUDEDIR) -I$(shell $(PG_CONFIG) --includedir-server) -c -o $@ $<
+summaryd/vendor/xactdesc.o: $(SUMMARYD_XACTDESC_SRC)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -Wall -Wextra -std=c11 -I$(INCLUDEDIR) -I$(SERVER_INCLUDEDIR) -c -o $@ $<
 
-summaryd/vendor/dynahash.o: summaryd/vendor/dynahash.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -Wall -Wextra -std=c11 -I$(INCLUDEDIR) -I$(shell $(PG_CONFIG) --includedir-server) -c -o $@ $<
+summaryd/vendor/dynahash.o: $(SUMMARYD_DYNAHASH_SRC)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -Wall -Wextra -std=c11 -I$(INCLUDEDIR) -I$(SERVER_INCLUDEDIR) -c -o $@ $<
 
 $(SUMMARYD_BIN): $(SUMMARYD_OBJS)
 	$(CC) $(CFLAGS) -Wall -Wextra -std=c11 -o $@ $(SUMMARYD_OBJS) $(LIBDIR)/libpgcommon.a $(LIBDIR)/libpgport.a -L$(LIBDIR) -Wl,-rpath,$(LIBDIR) -Wl,--gc-sections -lz
 
-.PHONY: daemon install-daemon install-service check-summaryd
+.PHONY: daemon install-daemon install-service check-summaryd clean-summaryd
+
+clean-summaryd:
+	rm -f $(SUMMARYD_BIN) $(SUMMARYD_OBJS)
+
+clean: clean-summaryd
 
 daemon: $(SUMMARYD_BIN)
 
@@ -101,12 +116,14 @@ install-service:
 check-summaryd: $(SUMMARYD_BIN)
 	bash tests/summaryd/help_smoke.sh
 	bash tests/summaryd/config_smoke.sh
+	bash tests/summaryd/missing_segment_race_smoke.sh
 	bash tests/summaryd/no_conninfo_smoke.sh
 	bash tests/summaryd/summary_runner_smoke.sh
 	bash tests/summaryd/readme_surface_smoke.sh
 	bash tests/summaryd/bootstrap_nonroot_smoke.sh
 	bash tests/summaryd/bootstrap_help_smoke.sh
 	bash tests/summaryd/bootstrap_manual_runner_smoke.sh
+	bash tests/summaryd/bootstrap_cron_smoke.sh
 	bash tests/summaryd/bootstrap_archive_autodiscovery_smoke.sh
 	bash tests/summaryd/bootstrap_remove_legacy_service_smoke.sh
 	bash tests/summaryd/bootstrap_prompt_defaults_smoke.sh

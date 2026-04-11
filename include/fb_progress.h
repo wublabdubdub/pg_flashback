@@ -72,5 +72,7 @@ uint32 fb_progress_map_subrange(uint32 base_percent, uint32 span_percent,
  */
 void fb_progress_debug_set_clock_script(const int64 *script, int count);
 void fb_progress_debug_clear_clock(void);
+FbProgressStage fb_progress_debug_current_stage(void);
+int fb_progress_debug_last_percent(void);
 
 #endif

@@ -13,6 +13,7 @@ SNAPSHOT_SH="$REPO_ROOT/tests/release_gate/bin/capture_truth_snapshots.sh"
 MATRIX_SH="$REPO_ROOT/tests/release_gate/bin/run_flashback_matrix.sh"
 EVAL_SH="$REPO_ROOT/tests/release_gate/bin/evaluate_gate.sh"
 REPORT_SH="$REPO_ROOT/tests/release_gate/bin/render_report.sh"
+BOOTSTRAP_SH="$REPO_ROOT/scripts/b_pg_flashback.sh"
 CONFIG_DIR="$REPO_ROOT/tests/release_gate/config"
 TEMPLATE_DIR="$REPO_ROOT/tests/release_gate/templates"
 SQL_DIR="$REPO_ROOT/tests/release_gate/sql"
@@ -51,6 +52,7 @@ assert_file_matches() {
 [[ -f "$MATRIX_SH" ]] || fail "missing flashback matrix runner: $MATRIX_SH"
 [[ -f "$EVAL_SH" ]] || fail "missing gate evaluator: $EVAL_SH"
 [[ -f "$REPORT_SH" ]] || fail "missing report renderer: $REPORT_SH"
+[[ -f "$BOOTSTRAP_SH" ]] || fail "missing bootstrap script: $BOOTSTRAP_SH"
 [[ -x "$RUN_SH" ]] || fail "runner is not executable: $RUN_SH"
 [[ -x "$PREPARE_SH" ]] || fail "prepare script is not executable: $PREPARE_SH"
 [[ -x "$SIM_SH" ]] || fail "simulator wrapper is not executable: $SIM_SH"
@@ -61,9 +63,50 @@ assert_file_matches() {
 [[ -x "$MATRIX_SH" ]] || fail "flashback matrix runner is not executable: $MATRIX_SH"
 [[ -x "$EVAL_SH" ]] || fail "gate evaluator is not executable: $EVAL_SH"
 [[ -x "$REPORT_SH" ]] || fail "report renderer is not executable: $REPORT_SH"
+[[ -x "$BOOTSTRAP_SH" ]] || fail "bootstrap script is not executable: $BOOTSTRAP_SH"
 
 bash -n "$COMMON_SH" "$RUN_SH" "$PREPARE_SH" "$SIM_SH" "$LOAD_SH" "$PRESSURE_SH" "$GROW_SH" \
-	"$SNAPSHOT_SH" "$MATRIX_SH" "$EVAL_SH" "$REPORT_SH"
+	"$SNAPSHOT_SH" "$MATRIX_SH" "$EVAL_SH" "$REPORT_SH" "$BOOTSTRAP_SH"
+
+clean_line="$(grep -n 'make -C "${REPO_ROOT}" "PG_CONFIG=${PG_CONFIG_BIN}" clean' "$BOOTSTRAP_SH" | cut -d: -f1)"
+build_line="$(grep -n 'make -C "${REPO_ROOT}" "PG_CONFIG=${PG_CONFIG_BIN}"$' "$BOOTSTRAP_SH" | cut -d: -f1)"
+install_line="$(grep -n 'make -C "${REPO_ROOT}" "PG_CONFIG=${PG_CONFIG_BIN}" install' "$BOOTSTRAP_SH" | cut -d: -f1)"
+preload_line="$(grep -n 'remove_preloaded_pg_flashback_if_present "${psql_bin}" "${pg_ctl_bin}"' "$BOOTSTRAP_SH" | cut -d: -f1)"
+restart_line="$(grep -n 'run_cmd "${pg_ctl_bin}" -D "${PGDATA}" restart -m fast -w' "$BOOTSTRAP_SH" | cut -d: -f1)"
+standalone_pg18_branch_line="$(grep -n '#if PG_VERSION_NUM >= 180000' "$REPO_ROOT/summaryd/fb_summaryd_standalone_shim.c" | cut -d: -f1)"
+standalone_compat_beginread_line="$(grep -n 'XLogBeginRead(state, pageptr + startoff);' "$REPO_ROOT/summaryd/fb_summaryd_standalone_shim.c" | cut -d: -f1)"
+summaryd_clean_output="$(make -n PG_CONFIG=/home/14pg/local/bin/pg_config clean)"
+summaryd_pg14_xlogreader_cmd="$(make -B -n PG_CONFIG=/home/14pg/local/bin/pg_config summaryd/vendor/xlogreader.o 2>/dev/null | tail -n 1)"
+summaryd_pg14_xactdesc_cmd="$(make -B -n PG_CONFIG=/home/14pg/local/bin/pg_config summaryd/vendor/xactdesc.o 2>/dev/null | tail -n 1)"
+summaryd_pg14_dynahash_cmd="$(make -B -n PG_CONFIG=/home/14pg/local/bin/pg_config summaryd/vendor/dynahash.o 2>/dev/null | tail -n 1)"
+summaryd_pg18_xlogreader_cmd="$(make -B -n PG_CONFIG=/home/18pg/local/bin/pg_config summaryd/vendor/xlogreader.o 2>/dev/null | tail -n 1)"
+[[ -n "$clean_line" ]] || fail "bootstrap script must force make clean before build/install"
+[[ -n "$build_line" ]] || fail "bootstrap script must run make before install"
+[[ -n "$install_line" ]] || fail "bootstrap script must run make install"
+[[ -n "$preload_line" ]] || fail "bootstrap script must handle legacy shared_preload_libraries=pg_flashback"
+[[ -n "$restart_line" ]] || fail "bootstrap script must restart PostgreSQL after removing legacy pg_flashback preload"
+[[ -n "$standalone_pg18_branch_line" ]] || fail "standalone shim must keep an explicit PG18+ native XLogFindNextRecord branch"
+[[ -n "$standalone_compat_beginread_line" ]] || fail "standalone shim must keep PG14-17 compatible WAL first-record scan"
+(( clean_line < build_line && build_line < install_line )) || \
+	fail "bootstrap script build order must be make clean -> make -> make install"
+(( install_line < preload_line )) || \
+	fail "bootstrap script must handle legacy pg_flashback preload after install"
+printf '%s\n' "$summaryd_clean_output" | grep -Fq 'summaryd/pg_flashback-summaryd' || \
+	fail "make clean must remove the standalone summaryd binary"
+printf '%s\n' "$summaryd_clean_output" | grep -Fq 'summaryd/vendor/xlogreader.o' || \
+	fail "make clean must remove standalone xlogreader objects"
+printf '%s\n' "$summaryd_clean_output" | grep -Fq 'summaryd/vendor/xactdesc.o' || \
+	fail "make clean must remove standalone xactdesc objects"
+printf '%s\n' "$summaryd_clean_output" | grep -Fq 'summaryd/vendor/dynahash.o' || \
+	fail "make clean must remove standalone dynahash objects"
+[[ "$summaryd_pg14_xlogreader_cmd" == *'summaryd/vendor/xlogreader_pg14.c'* ]] || \
+	fail "PG14 standalone build must compile the PG14 xlogreader vendor source"
+[[ "$summaryd_pg14_xactdesc_cmd" == *'summaryd/vendor/xactdesc_pg14.c'* ]] || \
+	fail "PG14 standalone build must compile the PG14 xactdesc vendor source"
+[[ "$summaryd_pg14_dynahash_cmd" == *'summaryd/vendor/dynahash_pg14.c'* ]] || \
+	fail "PG14 standalone build must compile the PG14 dynahash vendor source"
+[[ "$summaryd_pg18_xlogreader_cmd" == *'summaryd/vendor/xlogreader.c'* ]] || \
+	fail "PG18 standalone build must keep the current xlogreader vendor source"
 
 # shellcheck disable=SC1090
 source "$COMMON_SH"

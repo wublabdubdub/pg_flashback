@@ -1,0 +1,76 @@
+DO $$
+BEGIN
+	IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_flashback') THEN
+		EXECUTE 'DROP EXTENSION pg_flashback CASCADE';
+	END IF;
+END;
+$$;
+DROP TABLE
+DROP TABLE
+CREATE EXTENSION pg_flashback;
+SET pg_flashback.show_progress = off;
+DO $$
+BEGIN
+	EXECUTE format('SET pg_flashback.archive_dir = %L', current_setting('data_directory') || '/pg_wal');
+END;
+$$;
+CREATE TABLE fb_dml_profile_target (
+	id integer PRIMARY KEY,
+	note text
+);
+INSERT INTO fb_dml_profile_target VALUES
+	(1, 'seed-1'),
+	(2, 'seed-2'),
+	(3, 'seed-3');
+CREATE TABLE fb_dml_profile_mark (
+	target_ts timestamptz NOT NULL
+);
+INSERT INTO fb_dml_profile_mark VALUES (clock_timestamp());
+INSERT INTO fb_dml_profile_target VALUES (4, 'after-insert');
+UPDATE fb_dml_profile_target
+SET note = 'after-update'
+WHERE id = 1;
+DELETE FROM fb_dml_profile_target
+WHERE id = 2;
+WITH summary AS (
+	SELECT *
+	FROM pg_flashback_dml_profile(
+		NULL::public.fb_dml_profile_target,
+		(SELECT target_ts::text FROM fb_dml_profile_mark)
+	)
+),
+detail AS (
+	SELECT *
+	FROM pg_flashback_dml_profile_detail(
+		NULL::public.fb_dml_profile_target,
+		(SELECT target_ts::text FROM fb_dml_profile_mark)
+	)
+)
+SELECT summary.window_supported OR summary.unsafe_reason = 'storage_change' AS supported_or_storage_change,
+	   CASE
+		   WHEN summary.window_supported THEN summary.total_ops >= 3
+		   ELSE summary.total_ops = 0
+	   END AS total_ops_ok,
+	   CASE
+		   WHEN summary.window_supported THEN summary.insert_ops = 1
+		   ELSE summary.insert_ops = 0
+	   END AS insert_ops_ok,
+	   CASE
+		   WHEN summary.window_supported THEN summary.update_ops = 1
+		   ELSE summary.update_ops = 0
+	   END AS update_ops_ok,
+	   CASE
+		   WHEN summary.window_supported THEN summary.delete_ops = 1
+		   ELSE summary.delete_ops = 0
+	   END AS delete_ops_ok,
+	   summary.vacuum_ops = COALESCE((SELECT sum(op_count) FROM detail WHERE op_group = 'vacuum'), 0) AS detail_matches_vacuum,
+	   summary.total_ops = COALESCE((SELECT sum(op_count) FROM detail), 0) AS detail_matches_total,
+	   summary.insert_ops = COALESCE((SELECT sum(op_count) FROM detail WHERE op_group = 'insert'), 0) AS detail_matches_insert,
+	   summary.update_ops = COALESCE((SELECT sum(op_count) FROM detail WHERE op_group = 'update'), 0) AS detail_matches_update,
+	   summary.delete_ops = COALESCE((SELECT sum(op_count) FROM detail WHERE op_group = 'delete'), 0) AS detail_matches_delete,
+	   summary.other_ops = COALESCE((SELECT sum(op_count) FROM detail WHERE op_group = 'other'), 0) AS detail_matches_other
+FROM summary;
+ supported_or_storage_change | total_ops_ok | insert_ops_ok | update_ops_ok | delete_ops_ok | detail_matches_vacuum | detail_matches_total | detail_matches_insert | detail_matches_update | detail_matches_delete | detail_matches_other 
+-----------------------------+--------------+---------------+---------------+---------------+-----------------------+----------------------+-----------------------+-----------------------+-----------------------+----------------------
+ t                           | t            | t             | t             | t             | t                     | t                    | t                     | t                     | t                     | t
+(1 row)

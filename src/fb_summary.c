@@ -36,21 +36,12 @@
 #include "fb_summary.h"
 #include "fb_wal.h"
 
-PG_FUNCTION_INFO_V1(fb_summary_build_available_debug);
-PG_FUNCTION_INFO_V1(fb_summary_block_anchor_debug);
-PG_FUNCTION_INFO_V1(fb_summary_meta_stats_debug);
-PG_FUNCTION_INFO_V1(fb_summary_path_debug);
-PG_FUNCTION_INFO_V1(fb_summary_v6_rejected_debug);
-PG_FUNCTION_INFO_V1(fb_summary_candidate_debug);
-PG_FUNCTION_INFO_V1(fb_summary_build_candidate_debug);
-PG_FUNCTION_INFO_V1(fb_summary_payload_locator_merge_debug);
-
 #define FB_SUMMARY_MAGIC ((uint32) 0x4642534d)
 /*
- * v10 invalidates stale v9 summary files generated before the current
- * RM_XACT xid-outcome parse fix, forcing a rebuild from WAL.
+ * v12 invalidates summary sidecars generated before PG14 HEAP2_VACUUM records
+ * were retained in summary-backed payload replay.
  */
-#define FB_SUMMARY_VERSION 11
+#define FB_SUMMARY_VERSION 12
 #define FB_SUMMARY_LOCATOR_BLOOM_BYTES 64
 #define FB_SUMMARY_RELTAG_BLOOM_BYTES 64
 #define FB_SUMMARY_SECTION_COUNT 8
@@ -318,7 +309,8 @@ typedef struct FbSummaryReaderPrivate
 	XLogRecPtr endptr;
 	bool endptr_reached;
 	TimeLineID timeline_id;
-#if PG_VERSION_NUM < 130000
+	int wal_seg_size;
+#if PG_VERSION_NUM < 130000 || defined(FB_SUMMARY_STANDALONE)
 	int current_file;
 	bool current_file_open;
 	XLogSegNo current_file_segno;
@@ -476,7 +468,8 @@ static bool fb_summary_record_payload_kind(XLogReaderState *reader,
 										   uint8 *kind_out,
 										   uint8 *flags_out);
 static int fb_summary_open_file_at_path(const char *path);
-static int fb_summary_read_wal_segment_size_from_path(const char *path);
+static bool fb_summary_read_wal_segment_size_from_path(const char *path,
+													   int *wal_seg_size_out);
 static bool fb_summary_read_segment_sysid_path(const char *path,
 											   uint64 *sysid);
 static bool fb_summary_parse_timeline_id(const char *name, TimeLineID *timeline_id);
@@ -878,7 +871,17 @@ fb_summary_collect_selected_segments(FbSummarySegmentEntry **selected_out,
 		if (candidates[i].timeline_id != highest_tli)
 			candidates[i].ignored = true;
 		if (wal_seg_size == 0 && !candidates[i].ignored)
-			wal_seg_size = fb_summary_read_wal_segment_size_from_path(candidates[i].path);
+		{
+			int parsed_wal_seg_size = 0;
+
+			if (!fb_summary_read_wal_segment_size_from_path(candidates[i].path,
+														 &parsed_wal_seg_size))
+			{
+				candidates[i].ignored = true;
+				continue;
+			}
+			wal_seg_size = parsed_wal_seg_size;
+		}
 		if (!candidates[i].ignored)
 			XLogFromFileName(candidates[i].name, &parsed_tli, &candidates[i].segno,
 							 wal_seg_size);
@@ -2033,6 +2036,7 @@ fb_summary_record_payload_kind(XLogReaderState *reader,
 			case XLOG_HEAP2_PRUNE_VACUUM_CLEANUP:
 #elif PG_VERSION_NUM >= 140000
 			case XLOG_HEAP2_PRUNE:
+			case XLOG_HEAP2_VACUUM:
 #else
 			case XLOG_HEAP2_CLEAN:
 #endif
@@ -2107,7 +2111,6 @@ fb_summary_note_record(XLogReaderState *reader, FbSummaryBuildState *state)
 			continue;
 		if (forknum != MAIN_FORKNUM)
 			continue;
-
 		fb_summary_add_locator(state, &locator);
 		entry = fb_summary_get_or_add_locator_relation(state, &locator);
 		fb_summary_relation_append_span(entry, record_start, record_end, 0);
@@ -2317,8 +2320,8 @@ fb_summary_note_record(XLogReaderState *reader, FbSummaryBuildState *state)
 	}
 }
 
-static int
-fb_summary_read_wal_segment_size_from_path(const char *path)
+static bool
+fb_summary_read_wal_segment_size_from_path(const char *path, int *wal_seg_size_out)
 {
 	PGAlignedXLogBlock buf;
 	FILE *fp;
@@ -2326,11 +2329,18 @@ fb_summary_read_wal_segment_size_from_path(const char *path)
 	XLogLongPageHeader longhdr;
 	int wal_seg_size;
 
+	if (wal_seg_size_out != NULL)
+		*wal_seg_size_out = 0;
+
 	fp = AllocateFile(path, PG_BINARY_R);
 	if (fp == NULL)
+	{
+		if (errno == ENOENT)
+			return false;
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m", path)));
+	}
 
 	bytes_read = fread(buf.data, 1, XLOG_BLCKSZ, fp);
 	FreeFile(fp);
@@ -2347,7 +2357,9 @@ fb_summary_read_wal_segment_size_from_path(const char *path)
 				 errmsg("invalid WAL segment size in \"%s\": %d",
 						path, wal_seg_size)));
 
-	return wal_seg_size;
+	if (wal_seg_size_out != NULL)
+		*wal_seg_size_out = wal_seg_size;
+	return true;
 }
 
 static bool
@@ -2542,6 +2554,85 @@ fb_summary_validate_segment_identity(FbSummarySegmentEntry *entry, int wal_seg_s
 	return true;
 }
 
+static bool
+fb_summary_resolve_fallback_segment_path(TimeLineID timeline_id,
+										 XLogSegNo segno,
+										 int wal_seg_size,
+										 char *path_out,
+										 Size path_out_size,
+										 int *source_kind_out)
+{
+	char segname[MAXPGPATH];
+	char candidate_path[MAXPGPATH];
+	char *archive_dir = NULL;
+	char *recovered_dir = NULL;
+	const char *directories[3];
+	int source_kinds[3];
+	FbArchiveDirSource archive_source;
+	const char *archive_setting_name = NULL;
+	int i;
+
+	if (path_out != NULL && path_out_size > 0)
+		path_out[0] = '\0';
+	if (source_kind_out != NULL)
+		*source_kind_out = 0;
+
+	XLogFileName(segname, timeline_id, segno, wal_seg_size);
+	archive_dir = fb_try_resolve_archive_dir(&archive_source, &archive_setting_name);
+	recovered_dir = fb_runtime_recovered_wal_dir();
+
+	directories[0] = archive_dir;
+	source_kinds[0] = archive_source == FB_ARCHIVE_DIR_SOURCE_LEGACY_DIR ?
+		FB_SUMMARY_SOURCE_ARCHIVE_DIR_LEGACY :
+		FB_SUMMARY_SOURCE_ARCHIVE_DEST;
+	directories[1] = recovered_dir;
+	source_kinds[1] = FB_SUMMARY_SOURCE_CKWAL;
+	directories[2] = fb_get_pg_wal_dir();
+	source_kinds[2] = FB_SUMMARY_SOURCE_PG_WAL;
+
+	for (i = 0; i < lengthof(directories); i++)
+	{
+		struct stat st;
+		TimeLineID actual_tli;
+		XLogSegNo actual_segno;
+
+		if (directories[i] == NULL || directories[i][0] == '\0')
+			continue;
+
+		snprintf(candidate_path, sizeof(candidate_path), "%s/%s",
+				 directories[i], segname);
+		if (stat(candidate_path, &st) != 0)
+			continue;
+		if (!fb_summary_read_segment_identity_path(candidate_path,
+												   &actual_tli,
+												   &actual_segno,
+												   wal_seg_size))
+			continue;
+		if (actual_tli != timeline_id || actual_segno != segno)
+			continue;
+
+		if (path_out != NULL && path_out_size > 0)
+			strlcpy(path_out, candidate_path, path_out_size);
+		if (source_kind_out != NULL)
+			*source_kind_out = source_kinds[i];
+		if (archive_dir != NULL)
+			pfree(archive_dir);
+		if (recovered_dir != NULL)
+			pfree(recovered_dir);
+		if (directories[2] != NULL)
+			pfree((char *) directories[2]);
+		return true;
+	}
+
+	if (archive_dir != NULL)
+		pfree(archive_dir);
+	if (recovered_dir != NULL)
+		pfree(recovered_dir);
+	if (directories[2] != NULL)
+		pfree((char *) directories[2]);
+	return false;
+}
+
 #if PG_VERSION_NUM >= 130000
 static void
 fb_summary_open_segment(XLogReaderState *state, XLogSegNo next_segno,
@@ -2549,6 +2640,8 @@ fb_summary_open_segment(XLogReaderState *state, XLogSegNo next_segno,
 {
 	FbSummaryReaderPrivate *private = (FbSummaryReaderPrivate *) state->private_data;
 	const FbSummarySegmentEntry *entry = NULL;
+	char fallback_path[MAXPGPATH];
+	int fallback_source_kind = 0;
 
 	if (private->segment != NULL && private->segment->segno == next_segno)
 		entry = private->segment;
@@ -2564,6 +2657,14 @@ fb_summary_open_segment(XLogReaderState *state, XLogSegNo next_segno,
 
 	*timeline_id = entry->timeline_id;
 	state->seg.ws_file = fb_summary_open_file_at_path(entry->path);
+	if (state->seg.ws_file < 0 &&
+		fb_summary_resolve_fallback_segment_path(entry->timeline_id,
+													 next_segno,
+													 private->wal_seg_size,
+													 fallback_path,
+													 sizeof(fallback_path),
+													 &fallback_source_kind))
+		state->seg.ws_file = fb_summary_open_file_at_path(fallback_path);
 	if (state->seg.ws_file < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -2604,15 +2705,17 @@ fb_summary_read_page(XLogReaderState *state, XLogRecPtr target_page_ptr,
 		}
 	}
 
-#if PG_VERSION_NUM < 130000
+#if PG_VERSION_NUM < 130000 || defined(FB_SUMMARY_STANDALONE)
 	{
 		XLogSegNo target_segno;
 		uint32 segment_offset;
 		const FbSummarySegmentEntry *entry = NULL;
+		char fallback_path[MAXPGPATH];
+		int fallback_source_kind = 0;
 		int nread;
 
-		XLByteToSeg(target_page_ptr, target_segno, state->wal_segment_size);
-		segment_offset = target_page_ptr % state->wal_segment_size;
+		XLByteToSeg(target_page_ptr, target_segno, private->wal_seg_size);
+		segment_offset = target_page_ptr % private->wal_seg_size;
 
 		if (private->segment != NULL && private->segment->segno == target_segno)
 			entry = private->segment;
@@ -2626,8 +2729,10 @@ fb_summary_read_page(XLogReaderState *state, XLogRecPtr target_page_ptr,
 					 errmsg("summary builder missing decode-tail segment for segno %llu",
 							(unsigned long long) target_segno)));
 
+#if PG_VERSION_NUM < 130000
 		if (page_tli != NULL)
 			*page_tli = entry->timeline_id;
+#endif
 
 		if (!private->current_file_open ||
 			!private->current_file_segno_valid ||
@@ -2636,6 +2741,14 @@ fb_summary_read_page(XLogReaderState *state, XLogRecPtr target_page_ptr,
 			if (private->current_file_open)
 				CloseTransientFile(private->current_file);
 			private->current_file = fb_summary_open_file_at_path(entry->path);
+			if (private->current_file < 0 &&
+				fb_summary_resolve_fallback_segment_path(entry->timeline_id,
+														 target_segno,
+														 private->wal_seg_size,
+														 fallback_path,
+														 sizeof(fallback_path),
+														 &fallback_source_kind))
+				private->current_file = fb_summary_open_file_at_path(fallback_path);
 			if (private->current_file < 0)
 				ereport(ERROR,
 						(errcode_for_file_access(),
@@ -2644,6 +2757,13 @@ fb_summary_read_page(XLogReaderState *state, XLogRecPtr target_page_ptr,
 			private->current_file_segno = target_segno;
 			private->current_file_segno_valid = true;
 		}
+
+#if PG_VERSION_NUM < 130000
+		*page_tli = entry->timeline_id;
+#else
+		state->seg.ws_tli = entry->timeline_id;
+		state->seg.ws_segno = target_segno;
+#endif
 
 		nread = FileRead(private->current_file, read_buf, count, segment_offset, 0);
 		if (nread < 0)
@@ -2654,8 +2774,8 @@ fb_summary_read_page(XLogReaderState *state, XLogRecPtr target_page_ptr,
 		if (nread != count)
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not read WAL segment \"%s\", offset %u: read %d of %d",
-							entry->name, segment_offset, nread, count)));
+						 errmsg("could not read WAL segment \"%s\", offset %u: read %d of %d",
+								entry->name, segment_offset, nread, count)));
 	}
 #else
 	{
@@ -2666,7 +2786,7 @@ fb_summary_read_page(XLogReaderState *state, XLogRecPtr target_page_ptr,
 			WALOpenSegment *seg = &errinfo.wre_seg;
 			char segment_name[MAXPGPATH];
 
-			XLogFileName(segment_name, seg->ws_tli, seg->ws_segno, state->segcxt.ws_segsize);
+			XLogFileName(segment_name, seg->ws_tli, seg->ws_segno, private->wal_seg_size);
 			if (errinfo.wre_errno != 0)
 			{
 				errno = errinfo.wre_errno;
@@ -2799,8 +2919,12 @@ fb_summary_build_file_for_segment(const FbSummarySegmentEntry *entry,
 	private.segment = entry;
 	private.next_segment = next_entry;
 	private.timeline_id = entry->timeline_id;
-#if PG_VERSION_NUM < 130000
+	private.wal_seg_size = wal_seg_size;
+#if PG_VERSION_NUM < 130000 || defined(FB_SUMMARY_STANDALONE)
 	private.current_file = -1;
+	private.current_file_open = false;
+	private.current_file_segno = 0;
+	private.current_file_segno_valid = false;
 #endif
 	XLogSegNoOffsetToRecPtr(entry->segno, 0, wal_seg_size, start_lsn);
 	end_lsn = start_lsn + (XLogRecPtr) Min((off_t) wal_seg_size, entry->bytes);
@@ -2853,10 +2977,10 @@ fb_summary_build_file_for_segment(const FbSummarySegmentEntry *entry,
 	}
 
 	XLogReaderFree(reader);
-	#if PG_VERSION_NUM < 130000
+#if PG_VERSION_NUM < 130000 || defined(FB_SUMMARY_STANDALONE)
 	if (private.current_file_open)
 		CloseTransientFile(private.current_file);
-	#endif
+#endif
 
 	state.file.relation_entry_count = state.relation_count;
 	for (i = 0; i < state.relation_count; i++)
@@ -4784,13 +4908,13 @@ fb_summary_meta_stats_cstring(void)
 					counts.prefilter_files);
 }
 
-Datum
+static Datum
 fb_summary_build_available_debug(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT32(fb_summary_build_available_debug_impl());
 }
 
-Datum
+static Datum
 fb_summary_block_anchor_debug(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);
@@ -4845,13 +4969,13 @@ fb_summary_block_anchor_debug(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32((int32) total_anchors);
 }
 
-Datum
+static Datum
 fb_summary_meta_stats_debug(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_TEXT_P(cstring_to_text(fb_summary_meta_stats_cstring()));
 }
 
-Datum
+static Datum
 fb_summary_path_debug(PG_FUNCTION_ARGS)
 {
 	char *wal_path = text_to_cstring(PG_GETARG_TEXT_PP(0));
@@ -4872,7 +4996,7 @@ fb_summary_path_debug(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(summary_path));
 }
 
-Datum
+static Datum
 fb_summary_v6_rejected_debug(PG_FUNCTION_ARGS)
 {
 	FbSummaryBuildCandidate *candidates = NULL;
@@ -4985,7 +5109,7 @@ fb_summary_v6_rejected_debug(PG_FUNCTION_ARGS)
 											 rejected ? "true" : "false")));
 }
 
-Datum
+static Datum
 fb_summary_candidate_debug(PG_FUNCTION_ARGS)
 {
 	char *wal_path = text_to_cstring(PG_GETARG_TEXT_PP(0));
@@ -5047,7 +5171,7 @@ fb_summary_candidate_debug(PG_FUNCTION_ARGS)
 		summary_path)));
 }
 
-Datum
+static Datum
 fb_summary_build_candidate_debug(PG_FUNCTION_ARGS)
 {
 	char *wal_path = text_to_cstring(PG_GETARG_TEXT_PP(0));
@@ -5117,7 +5241,7 @@ fb_summary_build_candidate_debug(PG_FUNCTION_ARGS)
 		summary_path)));
 }
 
-Datum
+static Datum
 fb_summary_payload_locator_merge_debug(PG_FUNCTION_ARGS)
 {
 	ArrayType  *counts_array = PG_GETARG_ARRAYTYPE_P(0);

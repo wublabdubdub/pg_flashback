@@ -20,9 +20,6 @@
 #include "fb_compat.h"
 #include "fb_runtime.h"
 
-PG_FUNCTION_INFO_V1(fb_runtime_create_test_artifacts_debug);
-PG_FUNCTION_INFO_V1(fb_runtime_remove_test_artifacts_debug);
-
 /*
  * fb_runtime_join_path
  *    Runtime helper.
@@ -364,7 +361,7 @@ fb_runtime_cleanup_current_backend(void)
 	fb_runtime_cleanup_matching_owner(false, MyProcPid);
 }
 
-PGDLLEXPORT Datum
+static Datum
 fb_runtime_create_test_artifacts_debug(PG_FUNCTION_ARGS)
 {
 	int32 owner_pid = PG_GETARG_INT32(0);
@@ -415,7 +412,7 @@ fb_runtime_create_test_artifacts_debug(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(true);
 }
 
-PGDLLEXPORT Datum
+static Datum
 fb_runtime_remove_test_artifacts_debug(PG_FUNCTION_ARGS)
 {
 	int32 owner_pid = PG_GETARG_INT32(0);

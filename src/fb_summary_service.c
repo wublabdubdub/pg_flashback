@@ -45,22 +45,8 @@
 #define FB_SUMMARY_SERVICE_RATE_MIN_SAMPLE_MS 5000
 
 PG_FUNCTION_INFO_V1(fb_summary_progress_internal);
-PG_FUNCTION_INFO_V1(fb_summary_service_debug_internal);
-PG_FUNCTION_INFO_V1(fb_summary_cleanup_plan_debug);
-PG_FUNCTION_INFO_V1(fb_summary_service_plan_debug);
-PG_FUNCTION_INFO_V1(fb_summary_service_schedule_debug);
-PG_FUNCTION_INFO_V1(fb_summary_service_worker_error_isolation_debug);
-PG_FUNCTION_INFO_V1(fb_summary_service_cleanup_debug);
-PG_FUNCTION_INFO_V1(fb_summary_service_memory_reset_debug);
 
 PGDLLEXPORT Datum fb_summary_progress_internal(PG_FUNCTION_ARGS);
-PGDLLEXPORT Datum fb_summary_service_debug_internal(PG_FUNCTION_ARGS);
-PGDLLEXPORT Datum fb_summary_cleanup_plan_debug(PG_FUNCTION_ARGS);
-PGDLLEXPORT Datum fb_summary_service_plan_debug(PG_FUNCTION_ARGS);
-PGDLLEXPORT Datum fb_summary_service_schedule_debug(PG_FUNCTION_ARGS);
-PGDLLEXPORT Datum fb_summary_service_worker_error_isolation_debug(PG_FUNCTION_ARGS);
-PGDLLEXPORT Datum fb_summary_service_cleanup_debug(PG_FUNCTION_ARGS);
-PGDLLEXPORT Datum fb_summary_service_memory_reset_debug(PG_FUNCTION_ARGS);
 
 typedef enum FbSummaryServiceTaskState
 {
@@ -2017,80 +2003,7 @@ fb_summary_progress_internal(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
 }
 
-Datum
-fb_summary_service_debug_internal(PG_FUNCTION_ARGS)
-{
-	FbSummaryServiceProgressStats stats;
-	TupleDesc tupdesc;
-	HeapTuple tuple;
-	Datum values[31];
-	bool nulls[31];
-
-	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fb_summary_service_debug_internal must return a composite type")));
-
-	tupdesc = BlessTupleDesc(tupdesc);
-	MemSet(nulls, 0, sizeof(nulls));
-
-	fb_summary_service_collect_progress(&stats, true);
-
-	values[0] = BoolGetDatum(stats.service_enabled);
-	if (stats.launcher_pid == 0)
-		nulls[1] = true;
-	else
-		values[1] = Int32GetDatum((int32) stats.launcher_pid);
-	values[2] = Int32GetDatum(stats.registered_workers);
-	values[3] = Int32GetDatum(stats.active_workers);
-	values[4] = Int32GetDatum(stats.queue_capacity);
-	values[5] = Int32GetDatum(stats.hot_window);
-	values[6] = Int32GetDatum(stats.pending_hot);
-	values[7] = Int32GetDatum(stats.pending_cold);
-	values[8] = Int32GetDatum(stats.running_hot);
-	values[9] = Int32GetDatum(stats.running_cold);
-	if (stats.snapshot_timeline_id == 0)
-		nulls[10] = true;
-	else
-		values[10] = Int32GetDatum((int32) stats.snapshot_timeline_id);
-	if (stats.snapshot_oldest_segno == 0)
-		nulls[11] = true;
-	else
-		values[11] = Int64GetDatum((int64) stats.snapshot_oldest_segno);
-	if (stats.snapshot_newest_segno == 0)
-		nulls[12] = true;
-	else
-		values[12] = Int64GetDatum((int64) stats.snapshot_newest_segno);
-	values[13] = Int32GetDatum(stats.snapshot_hot_candidates);
-	values[14] = Int32GetDatum(stats.snapshot_cold_candidates);
-	values[15] = Int64GetDatum((int64) stats.stable_candidates);
-	values[16] = Int64GetDatum((int64) stats.completed_summaries);
-	values[17] = Int64GetDatum((int64) stats.missing_summaries);
-	values[18] = Int64GetDatum((int64) stats.hot_missing_summaries);
-	values[19] = Int64GetDatum((int64) stats.cold_missing_summaries);
-	values[20] = Int64GetDatum((int64) stats.summary_files);
-	values[21] = Int64GetDatum((int64) stats.summary_bytes);
-	values[22] = Int64GetDatum((int64) stats.scan_count);
-	values[23] = Int64GetDatum((int64) stats.enqueue_count);
-	values[24] = Int64GetDatum((int64) stats.build_count);
-	values[25] = Int64GetDatum((int64) stats.cleanup_count);
-	if (stats.last_scan_at == 0)
-		nulls[26] = true;
-	else
-		values[26] = TimestampTzGetDatum(stats.last_scan_at);
-	values[27] = CStringGetTextDatum(fb_summary_state_source_name(stats.state_source));
-	values[28] = BoolGetDatum(stats.daemon_state_present);
-	values[29] = BoolGetDatum(stats.daemon_state_stale);
-	if (stats.daemon_state_published_at == 0)
-		nulls[30] = true;
-	else
-		values[30] = TimestampTzGetDatum(stats.daemon_state_published_at);
-
-	tuple = heap_form_tuple(tupdesc, values, nulls);
-	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
-}
-
-Datum
+static Datum
 fb_summary_service_plan_debug(PG_FUNCTION_ARGS)
 {
 	FuncCallContext *funcctx;
@@ -2197,7 +2110,7 @@ fb_summary_service_plan_debug(PG_FUNCTION_ARGS)
 	SRF_RETURN_DONE(funcctx);
 }
 
-Datum
+static Datum
 fb_summary_service_worker_error_isolation_debug(PG_FUNCTION_ARGS)
 {
 	FbSummaryBuildCandidate *candidates = NULL;
@@ -2240,7 +2153,7 @@ fb_summary_service_worker_error_isolation_debug(PG_FUNCTION_ARGS)
 											  isolated ? "true" : "false")));
 }
 
-Datum
+static Datum
 fb_summary_service_memory_reset_debug(PG_FUNCTION_ARGS)
 {
 	FbSummaryBuildCandidate *candidates = NULL;
@@ -2280,7 +2193,7 @@ fb_summary_service_memory_reset_debug(PG_FUNCTION_ARGS)
 											  after_bytes)));
 }
 
-Datum
+static Datum
 fb_summary_service_cleanup_debug(PG_FUNCTION_ARGS)
 {
 	fb_runtime_ensure_initialized();
@@ -2288,7 +2201,7 @@ fb_summary_service_cleanup_debug(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text("summary_cleanup_ran=true"));
 }
 
-Datum
+static Datum
 fb_summary_service_schedule_debug(PG_FUNCTION_ARGS)
 {
 	FuncCallContext *funcctx;
@@ -2387,7 +2300,7 @@ fb_summary_service_schedule_debug(PG_FUNCTION_ARGS)
 	SRF_RETURN_DONE(funcctx);
 }
 
-Datum
+static Datum
 fb_summary_cleanup_plan_debug(PG_FUNCTION_ARGS)
 {
 	FuncCallContext *funcctx;

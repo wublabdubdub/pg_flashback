@@ -21,6 +21,7 @@
 #include "access/xlogreader.h"
 #include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
 #include "storage/dsm.h"
@@ -42,14 +43,7 @@
 #include "fb_summary_service.h"
 #include "fb_wal.h"
 
-PG_FUNCTION_INFO_V1(fb_wal_payload_window_contract_debug);
-PG_FUNCTION_INFO_V1(fb_wal_nonapply_image_spool_contract_debug);
-PG_FUNCTION_INFO_V1(fb_wal_hint_fpi_payload_contract_debug);
-PG_FUNCTION_INFO_V1(fb_wal_heap2_visible_payload_contract_debug);
-PG_FUNCTION_INFO_V1(fb_summary_xid_resolution_debug);
-PG_FUNCTION_INFO_V1(fb_summary_xid_probe_debug);
-PG_FUNCTION_INFO_V1(fb_target_snapshot_clog_status_debug);
-PG_FUNCTION_INFO_V1(fb_summary_payload_locator_plan_debug);
+PG_FUNCTION_INFO_V1(pg_flashback_debug_unresolv_xid);
 
 static bool fb_wal_payload_kind_enabled(uint8 kind);
 
@@ -209,6 +203,67 @@ typedef struct FbWalSerialXactVisitorState
 	uint32 remaining_xids;
 } FbWalSerialXactVisitorState;
 
+typedef struct FbWalXidDebugCandidate
+{
+	TransactionId xid;
+	bool is_touched;
+	bool is_unsafe;
+	bool unresolved_after_summary;
+	bool unresolved_after_exact_windows;
+	bool unresolved_after_exact_all;
+} FbWalXidDebugCandidate;
+
+typedef struct FbWalXidDebugProbe
+{
+	TransactionId xid;
+	bool touched_in_metadata;
+	bool unresolved_after_summary;
+	bool unresolved_after_exact_windows;
+	bool unresolved_after_exact_all;
+	TransactionId span_top_xid;
+	TransactionId all_top_xid;
+	TransactionId probe_top_xid;
+	FbSummaryXidOutcome outcome;
+	FbSummaryXidOutcome top_outcome;
+	TimestampTz probe_commit_ts;
+	bool probe_commit_ts_found;
+	bool span_outcome_found;
+	bool all_outcome_found;
+	bool span_assignment_found;
+	bool all_assignment_found;
+	bool span_assignment_top_found;
+	bool all_assignment_top_found;
+	bool top_outcome_found;
+	uint32 summary_missing_segments;
+	uint32 fallback_windows;
+	uint32 missing_span_outcome_segments;
+	uint32 missing_span_assignment_segments;
+	uint32 missing_all_outcome_segments;
+	uint32 missing_all_assignment_segments;
+	StringInfoData missing_all_outcome_paths;
+} FbWalXidDebugProbe;
+
+typedef struct FbWalXidDebugRow
+{
+	TransactionId xid;
+	const char *xid_role;
+	const char *resolved_by;
+	const char *fallback_reason;
+	TransactionId top_xid;
+	bool top_xid_isnull;
+	TimestampTz commit_ts;
+	bool commit_ts_isnull;
+	int32 summary_missing_segments;
+	int32 fallback_windows;
+	char *diag;
+} FbWalXidDebugRow;
+
+typedef struct FbWalXidDebugResult
+{
+	FbWalXidDebugRow *rows;
+	uint32 row_count;
+} FbWalXidDebugResult;
+
 typedef struct FbCountOnlyXidEntry
 {
 	TransactionId xid;
@@ -238,8 +293,11 @@ typedef struct FbWalIndexBuildState
 	bool tail_capture_allowed;
 	bool defer_payload_body;
 	bool locator_only_payload_capture;
+	bool payload_stats_only_capture;
 	FbSpoolLog **payload_log;
 	const char *payload_label;
+	FbSpoolLog **payload_stats_log;
+	const char *payload_stats_label;
 	XLogRecPtr payload_emit_start_lsn;
 	XLogRecPtr payload_emit_end_lsn;
 	const FbSummaryPayloadLocator *payload_locators;
@@ -290,6 +348,17 @@ typedef struct FbSerializedRecordHeader
 	uint32 main_data_len;
 	FbSerializedRecordBlockRef blocks[FB_WAL_MAX_BLOCK_REFS];
 } FbSerializedRecordHeader;
+
+typedef struct FbWalPayloadStatsEntry
+{
+	XLogRecPtr lsn;
+	TransactionId xid;
+	FbWalRecordKind kind;
+	uint8 flags;
+} FbWalPayloadStatsEntry;
+
+#define FB_WAL_PAYLOAD_STATS_FLAG_SPECULATIVE_INSERT 0x01
+#define FB_WAL_PAYLOAD_STATS_FLAG_SUPER_DELETE 0x02
 
 typedef struct FbWalXactSummaryHeader
 {
@@ -511,15 +580,25 @@ typedef struct FbWalPayloadTask
 	FbRelationInfo info;
 	TimestampTz target_ts;
 	XLogRecPtr anchor_redo_lsn;
+	bool capture_stats_only;
 	int window_start;
 	int window_end;
 	uint32 locator_start;
 	uint32 locator_count;
 	uint32 record_count;
+	uint32 stats_count;
+	uint32 missing_block_count;
 	uint64 scanned_record_count;
 	uint64 reader_reset_count;
 	uint64 reader_reuse_count;
+	uint64 kept_record_count;
+	uint64 target_record_count;
+	uint64 target_insert_count;
+	uint64 target_delete_count;
+	uint64 target_update_count;
 	char spool_path[MAXPGPATH];
+	char stats_path[MAXPGPATH];
+	char missing_blocks_path[MAXPGPATH];
 	char archive_dest[MAXPGPATH];
 	char archive_dir[MAXPGPATH];
 	char debug_pg_wal_dir[MAXPGPATH];
@@ -668,6 +747,9 @@ static void fb_capture_unsafe_context(FbWalScanContext *ctx,
 									  TimestampTz commit_ts);
 static void fb_mark_xid_touched(HTAB *touched_xids, TransactionId xid,
 								FbWalScanContext *ctx);
+static HTAB *fb_create_touched_xid_hash(void);
+static HTAB *fb_create_unsafe_xid_hash(void);
+static HTAB *fb_create_xid_status_hash(void);
 static HTAB *fb_create_assigned_xid_hash(void);
 static void fb_note_assigned_xid(HTAB *assigned_xids,
 								 TransactionId subxid,
@@ -725,12 +807,15 @@ bool fb_wal_record_block_materializes_page(const FbRecordRef *record,
 										   int block_index);
 static bool fb_wal_record_block_requires_initialized_page(const FbRecordRef *record,
 														  int block_index);
+static bool fb_index_record_visitor(XLogReaderState *reader, void *arg);
 static void fb_wal_note_precomputed_missing_blocks(FbWalRecordIndex *index,
 												   HTAB *block_states,
 												   const FbRecordRef *record,
 												   uint32 record_index);
 static uint32 fb_wal_count_window_segments(const FbWalVisitWindow *windows,
 										   uint32 window_count);
+static uint32 fb_build_prefilter_visit_windows(FbWalScanContext *ctx,
+											   FbWalVisitWindow **windows_out);
 static uint32 fb_build_missing_summary_visit_windows(FbWalScanContext *ctx,
 													 FbWalVisitWindow **windows_out);
 static void fb_maybe_activate_tail_payload_capture(XLogReaderState *reader,
@@ -909,19 +994,37 @@ static void fb_wal_payload_fill_task(FbWalPayloadTask *task,
 									 const FbRelationInfo *info,
 									 TimestampTz target_ts,
 									 XLogRecPtr anchor_redo_lsn,
+									 bool capture_stats_only,
 									 int window_start,
 									 int window_end,
 									 uint32 locator_start,
 									 uint32 locator_count,
-									 const char *spool_path);
+									 const char *spool_path,
+									 const char *stats_path,
+									 const char *missing_blocks_path);
 static bool fb_wal_payload_launch_worker(dsm_handle handle,
 										 int task_index,
 										 BackgroundWorkerHandle **handle_out);
 static void fb_wal_payload_wait_worker(BackgroundWorkerHandle *handle,
 									   const FbWalPayloadTask *task);
-static void fb_wal_payload_merge_log(FbWalRecordIndex *index,
+static bool fb_wal_payload_merge_log(FbWalRecordIndex *index,
 									 const char *path,
-									 uint32 item_count);
+									 uint32 item_count,
+									 HTAB *block_states);
+static void fb_wal_dump_payload_stats_log(FbSpoolLog **log_ptr,
+										  const char *label,
+										  const FbRecordRef *record,
+										  uint8 flags);
+static void fb_wal_merge_payload_stats_log(FbWalRecordIndex *index,
+										   const char *path,
+										   uint32 item_count);
+static void fb_wal_dump_missing_blocks(HTAB *missing_blocks,
+									   const char *path,
+									   uint32 *count_out);
+static void fb_wal_merge_missing_blocks(FbWalRecordIndex *index,
+										const char *path,
+										uint32 item_count,
+										uint32 record_index_base);
 static void fb_wal_metadata_collect_capture_gucs(FbWalMetadataCollectTask *task);
 static void fb_wal_metadata_collect_apply_gucs(const FbWalMetadataCollectTask *task);
 static void fb_wal_metadata_collect_fill_task(FbWalMetadataCollectTask *task,
@@ -997,14 +1100,21 @@ static bool fb_wal_materialize_payload_parallel(const FbRelationInfo *info,
 									FbWalScanContext *ctx,
 									FbWalRecordIndex *index,
 									const FbWalVisitWindow *windows,
-									uint32 window_count);
+									uint32 window_count,
+									HTAB **block_states_ptr);
 static bool fb_wal_materialize_payload_locators_parallel(const FbRelationInfo *info,
 														 FbWalScanContext *ctx,
 														 FbWalRecordIndex *index,
 														 const FbWalVisitWindow *windows,
 														 uint32 window_count,
 														 const FbSummaryPayloadLocator *locators,
-														 uint32 locator_count);
+														 uint32 locator_count,
+														 HTAB **block_states_ptr);
+static bool fb_wal_capture_locator_stub_stats_parallel(const FbRelationInfo *info,
+													   FbWalScanContext *ctx,
+													   FbWalRecordIndex *index,
+													   const FbSummaryPayloadLocator *locators,
+													   uint32 locator_count);
 static bool fb_wal_serial_xact_fill_visitor(XLogReaderState *reader, void *arg);
 static void fb_wal_fill_xact_statuses_serial(const FbRelationInfo *info,
 											 FbWalScanContext *ctx,
@@ -1015,6 +1125,31 @@ static void fb_wal_fill_xact_statuses_serial(const FbRelationInfo *info,
 											 HTAB *unsafe_xids);
 static int fb_transactionid_cmp(const void *lhs, const void *rhs);
 static int fb_unsafe_xid_entry_cmp(const void *lhs, const void *rhs);
+static uint32 fb_wal_build_xid_debug_candidates(HTAB *touched_xids,
+												HTAB *unsafe_xids,
+												FbWalXidDebugCandidate **candidates_out);
+static void fb_wal_capture_xid_unresolved_stage(FbWalRecordIndex *index,
+												FbWalXidDebugCandidate *candidates,
+												uint32 candidate_count,
+												int stage);
+static void fb_wal_probe_xid_summary_context(FbWalScanContext *ctx,
+											 const FbWalVisitWindow *source_windows,
+											 uint32 source_window_count,
+											 TransactionId probe_xid,
+											 bool touched_in_metadata,
+											 bool unresolved_after_summary,
+											 bool unresolved_after_exact_windows,
+											 bool unresolved_after_exact_all,
+											 FbWalXidDebugProbe *probe);
+static const char *fb_wal_xid_debug_role_name(bool is_touched, bool is_unsafe);
+static const char *fb_wal_xid_debug_resolved_by(const FbWalXidDebugCandidate *candidate);
+static const char *fb_wal_xid_debug_fallback_reason(const FbWalXidDebugCandidate *candidate,
+													const FbWalXidDebugProbe *probe);
+static void fb_wal_append_xid_debug_diag(StringInfo buf,
+										 const FbWalXidDebugCandidate *candidate,
+										 const FbWalXidDebugProbe *probe);
+static FbWalXidDebugResult *fb_wal_build_unresolved_xid_debug_result(Oid relid,
+																	 TimestampTz target_ts);
 /*
  * fb_prefilter_hash_bytes
  *    WAL helper.
@@ -1138,6 +1273,10 @@ static void fb_wal_prepare_payload_read_window(FbWalScanContext *ctx,
 												 const FbWalSegmentEntry *all_segments,
 												 uint32 all_segment_count,
 												 FbWalVisitWindow *read_window);
+static uint32 fb_wal_visit_payload_locators_exact(FbWalScanContext *ctx,
+												  const FbSummaryPayloadLocator *locators,
+												  uint32 locator_count,
+												  FbWalIndexBuildState *state);
 static uint32 fb_wal_visit_payload_locators(FbWalScanContext *ctx,
 											const FbSummaryPayloadLocator *locators,
 											uint32 locator_count,
@@ -1147,6 +1286,12 @@ static bool fb_wal_visit_windows_share_segment_slice(const FbWalVisitWindow *lhs
 static uint32 fb_split_parallel_materialize_windows(FbWalScanContext *ctx,
 													   FbWalVisitWindow **windows_io,
 													   uint32 window_count);
+static int fb_build_payload_locator_task_ranges(FbWalScanContext *ctx,
+												const FbSummaryPayloadLocator *locators,
+												uint32 locator_count,
+												int desired_workers,
+												uint32 *start_offsets,
+												uint32 *counts);
 static int fb_find_segment_index_for_lsn(FbWalSegmentEntry *segments,
 										 int segment_count,
 										 XLogRecPtr lsn,
@@ -1523,6 +1668,621 @@ fb_unsafe_xid_entry_cmp(const void *lhs, const void *rhs)
 	return fb_transactionid_cmp(&left->xid, &right->xid);
 }
 
+static uint32
+fb_wal_build_xid_debug_candidates(HTAB *touched_xids,
+								  HTAB *unsafe_xids,
+								  FbWalXidDebugCandidate **candidates_out)
+{
+	long touched_count = (touched_xids != NULL) ? hash_get_num_entries(touched_xids) : 0;
+	long unsafe_count = (unsafe_xids != NULL) ? hash_get_num_entries(unsafe_xids) : 0;
+	TransactionId *touched = NULL;
+	FbUnsafeXidEntry *unsafe = NULL;
+	HASH_SEQ_STATUS status;
+	FbTouchedXidEntry *touched_entry;
+	FbUnsafeXidEntry *unsafe_entry;
+	FbWalXidDebugCandidate *candidates = NULL;
+	uint32 count = 0;
+	long touched_index = 0;
+	long unsafe_index = 0;
+
+	if (candidates_out != NULL)
+		*candidates_out = NULL;
+	if (touched_count <= 0 && unsafe_count <= 0)
+		return 0;
+
+	if (touched_count > 0)
+	{
+		touched = palloc(sizeof(TransactionId) * touched_count);
+		hash_seq_init(&status, touched_xids);
+		while ((touched_entry = (FbTouchedXidEntry *) hash_seq_search(&status)) != NULL)
+			touched[touched_index++] = touched_entry->xid;
+		qsort(touched, touched_count, sizeof(TransactionId), fb_transactionid_cmp);
+	}
+
+	if (unsafe_count > 0)
+	{
+		unsafe = palloc(sizeof(FbUnsafeXidEntry) * unsafe_count);
+		hash_seq_init(&status, unsafe_xids);
+		while ((unsafe_entry = (FbUnsafeXidEntry *) hash_seq_search(&status)) != NULL)
+			unsafe[unsafe_index++] = *unsafe_entry;
+		qsort(unsafe, unsafe_count, sizeof(FbUnsafeXidEntry), fb_unsafe_xid_entry_cmp);
+	}
+
+	candidates = palloc0(sizeof(*candidates) * Max(touched_count + unsafe_count, 1L));
+	touched_index = 0;
+	unsafe_index = 0;
+	while (touched_index < touched_count || unsafe_index < unsafe_count)
+	{
+		TransactionId touched_xid = InvalidTransactionId;
+		TransactionId unsafe_xid = InvalidTransactionId;
+
+		if (touched_index < touched_count)
+			touched_xid = touched[touched_index];
+		if (unsafe_index < unsafe_count)
+			unsafe_xid = unsafe[unsafe_index].xid;
+
+		if (unsafe_index >= unsafe_count ||
+			(touched_index < touched_count && touched_xid < unsafe_xid))
+		{
+			candidates[count].xid = touched_xid;
+			candidates[count].is_touched = true;
+			touched_index++;
+		}
+		else if (touched_index >= touched_count || unsafe_xid < touched_xid)
+		{
+			candidates[count].xid = unsafe_xid;
+			candidates[count].is_unsafe = true;
+			unsafe_index++;
+		}
+		else
+		{
+			candidates[count].xid = touched_xid;
+			candidates[count].is_touched = true;
+			candidates[count].is_unsafe = true;
+			touched_index++;
+			unsafe_index++;
+		}
+
+		count++;
+	}
+
+	if (touched != NULL)
+		pfree(touched);
+	if (unsafe != NULL)
+		pfree(unsafe);
+	if (candidates_out != NULL)
+		*candidates_out = candidates;
+	else
+		pfree(candidates);
+
+	return count;
+}
+
+static void
+fb_wal_capture_xid_unresolved_stage(FbWalRecordIndex *index,
+									FbWalXidDebugCandidate *candidates,
+									uint32 candidate_count,
+									int stage)
+{
+	uint32 i;
+
+	if (index == NULL || candidates == NULL)
+		return;
+
+	for (i = 0; i < candidate_count; i++)
+	{
+		FbXidStatusEntry *status_entry;
+		bool unresolved;
+
+		status_entry = (FbXidStatusEntry *) hash_search(index->xid_statuses,
+														&candidates[i].xid,
+														HASH_FIND,
+														NULL);
+		unresolved = (status_entry == NULL || status_entry->status == FB_WAL_XID_UNKNOWN);
+
+		if (stage == 0)
+			candidates[i].unresolved_after_summary = unresolved;
+		else if (stage == 1)
+			candidates[i].unresolved_after_exact_windows = unresolved;
+		else
+			candidates[i].unresolved_after_exact_all = unresolved;
+	}
+}
+
+static void
+fb_wal_probe_xid_summary_context(FbWalScanContext *ctx,
+								 const FbWalVisitWindow *source_windows,
+								 uint32 source_window_count,
+								 TransactionId probe_xid,
+								 bool touched_in_metadata,
+								 bool unresolved_after_summary,
+								 bool unresolved_after_exact_windows,
+								 bool unresolved_after_exact_all,
+								 FbWalXidDebugProbe *probe)
+{
+	RepOriginId probe_origin_id = 0;
+	bool *source_segment_seen;
+	uint32 i;
+
+	MemSet(probe, 0, sizeof(*probe));
+	probe->xid = probe_xid;
+	probe->touched_in_metadata = touched_in_metadata;
+	probe->unresolved_after_summary = unresolved_after_summary;
+	probe->unresolved_after_exact_windows = unresolved_after_exact_windows;
+	probe->unresolved_after_exact_all = unresolved_after_exact_all;
+	probe->summary_missing_segments = ctx->summary_xid_missing_segments;
+	probe->fallback_windows = ctx->xact_fallback_windows;
+	probe->span_top_xid = InvalidTransactionId;
+	probe->all_top_xid = InvalidTransactionId;
+	probe->probe_top_xid = InvalidTransactionId;
+	if (track_commit_timestamp)
+		probe->probe_commit_ts_found =
+			TransactionIdGetCommitTsData(probe_xid,
+										 &probe->probe_commit_ts,
+										 &probe_origin_id);
+
+	source_segment_seen = palloc0(sizeof(bool) * ctx->resolved_segment_count);
+	for (i = 0; i < source_window_count; i++)
+	{
+		const FbWalVisitWindow *window = &source_windows[i];
+		uint32 j;
+
+		for (j = 0; j < window->segment_count; j++)
+		{
+			FbWalSegmentEntry *segment = &window->segments[j];
+			FbWalSegmentEntry *base_segments = (FbWalSegmentEntry *) ctx->resolved_segments;
+			uint32 segment_index =
+				(uint32) ((window->segments - base_segments) + j);
+			const FbSummaryXidAssignment *assignments = NULL;
+			uint32 assignment_count = 0;
+			uint32 assignment_index;
+			bool found = false;
+
+			if (segment_index >= ctx->resolved_segment_count || source_segment_seen[segment_index])
+				continue;
+			source_segment_seen[segment_index] = true;
+
+			if (!fb_summary_segment_lookup_xid_outcome_for_xid_cached(segment->path,
+																	 segment->bytes,
+																	 segment->timeline_id,
+																	 segment->segno,
+																	 ctx->wal_seg_size,
+																	 segment->source_kind,
+																	 probe_xid,
+																	 ctx->summary_cache,
+																	 &probe->outcome,
+																	 &found))
+				probe->missing_span_outcome_segments++;
+			else if (found && !probe->span_outcome_found)
+				probe->span_outcome_found = true;
+
+			if (!fb_summary_segment_lookup_xid_assignment_slice_cached(segment->path,
+																	  segment->bytes,
+																	  segment->timeline_id,
+																	  segment->segno,
+																	  ctx->wal_seg_size,
+																	  segment->source_kind,
+																	  ctx->summary_cache,
+																	  &assignments,
+																	  &assignment_count))
+				probe->missing_span_assignment_segments++;
+			else
+			{
+				for (assignment_index = 0; assignment_index < assignment_count; assignment_index++)
+				{
+					if (assignments[assignment_index].top_xid == probe_xid)
+						probe->span_assignment_top_found = true;
+					if (assignments[assignment_index].subxid != probe_xid)
+						continue;
+					probe->span_assignment_found = true;
+					probe->span_top_xid = assignments[assignment_index].top_xid;
+					break;
+				}
+			}
+		}
+	}
+	pfree(source_segment_seen);
+
+	initStringInfo(&probe->missing_all_outcome_paths);
+	for (i = 0; i < ctx->resolved_segment_count; i++)
+	{
+		FbWalSegmentEntry *segment = &((FbWalSegmentEntry *) ctx->resolved_segments)[i];
+		const FbSummaryXidAssignment *assignments = NULL;
+		uint32 assignment_count = 0;
+		uint32 assignment_index;
+		bool found = false;
+
+		if (!fb_summary_segment_lookup_xid_outcome_for_xid_cached(segment->path,
+																  segment->bytes,
+																  segment->timeline_id,
+																  segment->segno,
+																  ctx->wal_seg_size,
+																  segment->source_kind,
+																  probe_xid,
+																  ctx->summary_cache,
+																  &probe->outcome,
+																  &found))
+		{
+			probe->missing_all_outcome_segments++;
+			if (probe->missing_all_outcome_segments <= 5)
+			{
+				const char *base = strrchr(segment->path, '/');
+
+				if (probe->missing_all_outcome_paths.len > 0)
+					appendStringInfoString(&probe->missing_all_outcome_paths, ",");
+				appendStringInfoString(&probe->missing_all_outcome_paths,
+									   (base != NULL) ? base + 1 : segment->path);
+			}
+		}
+		else if (found && !probe->all_outcome_found)
+			probe->all_outcome_found = true;
+
+		if (!fb_summary_segment_lookup_xid_assignment_slice_cached(segment->path,
+																  segment->bytes,
+																  segment->timeline_id,
+																  segment->segno,
+																  ctx->wal_seg_size,
+																  segment->source_kind,
+																  ctx->summary_cache,
+																  &assignments,
+																  &assignment_count))
+			probe->missing_all_assignment_segments++;
+		else
+		{
+			for (assignment_index = 0; assignment_index < assignment_count; assignment_index++)
+			{
+				if (assignments[assignment_index].top_xid == probe_xid)
+					probe->all_assignment_top_found = true;
+				if (assignments[assignment_index].subxid != probe_xid)
+					continue;
+				probe->all_assignment_found = true;
+				probe->all_top_xid = assignments[assignment_index].top_xid;
+				break;
+			}
+		}
+	}
+
+	probe->probe_top_xid = TransactionIdIsValid(probe->all_top_xid) ?
+		probe->all_top_xid : probe->span_top_xid;
+	if (TransactionIdIsValid(probe->probe_top_xid))
+	{
+		for (i = 0; i < ctx->resolved_segment_count; i++)
+		{
+			FbWalSegmentEntry *segment = &((FbWalSegmentEntry *) ctx->resolved_segments)[i];
+			bool found = false;
+
+			if (!fb_summary_segment_lookup_xid_outcome_for_xid_cached(segment->path,
+																	  segment->bytes,
+																	  segment->timeline_id,
+																	  segment->segno,
+																	  ctx->wal_seg_size,
+																	  segment->source_kind,
+																	  probe->probe_top_xid,
+																	  ctx->summary_cache,
+																	  &probe->top_outcome,
+																	  &found))
+				continue;
+			if (!found)
+				continue;
+			probe->top_outcome_found = true;
+			break;
+		}
+	}
+}
+
+static const char *
+fb_wal_xid_debug_role_name(bool is_touched, bool is_unsafe)
+{
+	if (is_unsafe)
+		return "unsafe";
+	if (is_touched)
+		return "touched";
+	return "unknown";
+}
+
+static const char *
+fb_wal_xid_debug_resolved_by(const FbWalXidDebugCandidate *candidate)
+{
+	if (candidate == NULL)
+		return "unresolved";
+	if (!candidate->unresolved_after_summary)
+		return "summary";
+	if (!candidate->unresolved_after_exact_windows)
+		return "exact_window";
+	if (!candidate->unresolved_after_exact_all)
+		return "exact_all";
+	return "unresolved";
+}
+
+static const char *
+fb_wal_xid_debug_fallback_reason(const FbWalXidDebugCandidate *candidate,
+								 const FbWalXidDebugProbe *probe)
+{
+	if (candidate != NULL && candidate->is_unsafe)
+		return "unsafe_xid";
+	if (probe == NULL)
+		return "raw_xact_fallback";
+	if (probe->summary_missing_segments > 0 ||
+		probe->missing_all_outcome_segments > 0 ||
+		probe->missing_all_assignment_segments > 0)
+		return "summary_missing_segment";
+	if (!probe->span_outcome_found && probe->all_outcome_found)
+		return "summary_outcome_outside_span";
+	if (!probe->span_assignment_found && probe->all_assignment_found)
+		return "summary_assignment_outside_span";
+	if (TransactionIdIsValid(probe->probe_top_xid) &&
+		!probe->top_outcome_found)
+		return "summary_missing_top_outcome";
+	if (!probe->all_assignment_found)
+		return "summary_missing_assignment";
+	if (!probe->all_outcome_found)
+		return "summary_missing_outcome";
+	return "raw_xact_fallback";
+}
+
+static void
+fb_wal_append_xid_debug_diag(StringInfo buf,
+							 const FbWalXidDebugCandidate *candidate,
+							 const FbWalXidDebugProbe *probe)
+{
+	appendStringInfo(buf,
+					 "xid=%u xid_role=%s unresolved_after_summary=%s unresolved_after_exact_windows=%s unresolved_after_exact_all=%s fallback_reason=%s fallback_windows=%u summary_missing_segments=%u touched_in_metadata=%s span_outcome_found=%s all_outcome_found=%s span_assignment_found=%s all_assignment_found=%s top_outcome_found=%s top_xid=%u missing_span_outcome_segments=%u missing_span_assignment_segments=%u missing_all_outcome_segments=%u missing_all_assignment_segments=%u missing_all_outcome_path_samples=[%s] commit_ts_known=%s commit_ts=%s",
+					 probe->xid,
+					 fb_wal_xid_debug_role_name(candidate->is_touched, candidate->is_unsafe),
+					 candidate->unresolved_after_summary ? "true" : "false",
+					 candidate->unresolved_after_exact_windows ? "true" : "false",
+					 candidate->unresolved_after_exact_all ? "true" : "false",
+					 fb_wal_xid_debug_fallback_reason(candidate, probe),
+					 probe->fallback_windows,
+					 probe->summary_missing_segments,
+					 probe->touched_in_metadata ? "true" : "false",
+					 probe->span_outcome_found ? "true" : "false",
+					 probe->all_outcome_found ? "true" : "false",
+					 probe->span_assignment_found ? "true" : "false",
+					 probe->all_assignment_found ? "true" : "false",
+					 probe->top_outcome_found ? "true" : "false",
+					 probe->probe_top_xid,
+					 probe->missing_span_outcome_segments,
+					 probe->missing_span_assignment_segments,
+					 probe->missing_all_outcome_segments,
+					 probe->missing_all_assignment_segments,
+					 probe->missing_all_outcome_paths.data,
+					 probe->probe_commit_ts_found ? "true" : "false",
+					 probe->probe_commit_ts_found ?
+					 timestamptz_to_str(probe->probe_commit_ts) : "null");
+}
+
+static FbWalXidDebugResult *
+fb_wal_build_unresolved_xid_debug_result(Oid relid,
+										 TimestampTz target_ts)
+{
+	FbRelationInfo info;
+	FbWalScanContext ctx;
+	FbWalRecordIndex index;
+	FbWalIndexBuildState state;
+	FbWalVisitWindow *windows = NULL;
+	FbWalVisitWindow *span_windows = NULL;
+	FbWalVisitWindow *metadata_windows = NULL;
+	FbWalVisitWindow *fallback_windows = NULL;
+	const FbWalVisitWindow *source_windows;
+	uint32 source_window_count;
+	HTAB *fallback_touched = NULL;
+	HTAB *fallback_unsafe = NULL;
+	FbWalXidDebugCandidate *candidates = NULL;
+	FbWalXidDebugResult *result;
+	uint32 candidate_count = 0;
+	uint32 row_count = 0;
+	uint32 window_count = 0;
+	uint32 span_window_count = 0;
+	uint32 metadata_window_count = 0;
+	uint32 fallback_window_count = 0;
+	uint32 i;
+
+	fb_catalog_load_relation_info(relid, &info);
+	fb_wal_prepare_scan_context(target_ts, NULL, &ctx);
+
+	MemSet(&index, 0, sizeof(index));
+	index.target_ts = ctx.target_ts;
+	index.query_now_ts = ctx.query_now_ts;
+	index.xid_statuses = fb_create_xid_status_hash();
+	if (ctx.summary_cache == NULL)
+		ctx.summary_cache = fb_summary_query_cache_create(CurrentMemoryContext);
+	index.summary_cache = ctx.summary_cache;
+
+	MemSet(&state, 0, sizeof(state));
+	state.info = &info;
+	state.ctx = &ctx;
+	state.index = &index;
+	state.touched_xids = fb_create_touched_xid_hash();
+	state.unsafe_xids = fb_create_unsafe_xid_hash();
+	state.collect_metadata = true;
+	state.collect_xact_statuses = false;
+	state.capture_payload = false;
+	state.count_only_capture = false;
+	state.tail_capture_allowed = false;
+	state.defer_payload_body = true;
+	state.xact_summary_log = NULL;
+	state.xact_summary_label = NULL;
+
+	fb_prepare_segment_prefilter(&info, &ctx);
+	window_count = fb_build_prefilter_visit_windows(&ctx, &windows);
+	span_window_count =
+		fb_build_summary_span_visit_windows(&info, &ctx, windows, window_count, &span_windows);
+	if (span_window_count > 0)
+		span_window_count = fb_merge_visit_windows(&ctx, &span_windows, span_window_count);
+	source_windows = (span_window_count > 0) ? span_windows : windows;
+	source_window_count = (span_window_count > 0) ? span_window_count : window_count;
+
+	metadata_window_count =
+		fb_summary_seed_metadata_from_summary(&info,
+											  &ctx,
+											  source_windows,
+											  source_window_count,
+											  state.touched_xids,
+											  state.unsafe_xids,
+											  &metadata_windows);
+	if (metadata_window_count > 0)
+	{
+		for (i = 0; i < metadata_window_count; i++)
+			fb_wal_visit_window(&ctx, &metadata_windows[i], fb_index_record_visitor, &state);
+	}
+
+	candidate_count =
+		fb_wal_build_xid_debug_candidates(state.touched_xids,
+										  state.unsafe_xids,
+										  &candidates);
+	result = palloc0(sizeof(*result));
+	if (candidate_count == 0)
+		goto cleanup;
+
+	(void) fb_summary_fill_xact_statuses(&info,
+										 &ctx,
+										 &index,
+										 source_windows,
+										 source_window_count,
+										 state.touched_xids,
+										 state.unsafe_xids);
+	fb_wal_capture_xid_unresolved_stage(&index, candidates, candidate_count, 0);
+
+	fb_build_unresolved_xid_fallback_sets(&index,
+										  state.touched_xids,
+										  state.unsafe_xids,
+										  &fallback_touched,
+										  &fallback_unsafe);
+	if ((fallback_touched != NULL && hash_get_num_entries(fallback_touched) > 0) ||
+		(fallback_unsafe != NULL && hash_get_num_entries(fallback_unsafe) > 0))
+	{
+		fallback_window_count =
+			fb_build_xact_fallback_visit_windows(&ctx,
+												 source_windows,
+												 source_window_count,
+												 &fallback_windows);
+		ctx.xact_fallback_windows = fallback_window_count;
+		ctx.xact_fallback_covered_segments =
+			fb_wal_count_window_segments(fallback_windows, fallback_window_count);
+		(void) fb_summary_fill_exact_xact_statuses(&ctx,
+												   &index,
+												   fallback_windows,
+												   fallback_window_count,
+												   fallback_touched,
+												   fallback_unsafe);
+	}
+	fb_wal_capture_xid_unresolved_stage(&index, candidates, candidate_count, 1);
+
+	if (fallback_touched != NULL)
+	{
+		hash_destroy(fallback_touched);
+		fallback_touched = NULL;
+	}
+	if (fallback_unsafe != NULL)
+	{
+		hash_destroy(fallback_unsafe);
+		fallback_unsafe = NULL;
+	}
+
+	fb_build_unresolved_xid_fallback_sets(&index,
+										  state.touched_xids,
+										  state.unsafe_xids,
+										  &fallback_touched,
+										  &fallback_unsafe);
+	if ((fallback_touched != NULL && hash_get_num_entries(fallback_touched) > 0) ||
+		(fallback_unsafe != NULL && hash_get_num_entries(fallback_unsafe) > 0))
+	{
+		(void) fb_summary_fill_exact_xact_statuses(&ctx,
+												   &index,
+												   NULL,
+												   0,
+												   fallback_touched,
+												   fallback_unsafe);
+	}
+	fb_wal_capture_xid_unresolved_stage(&index, candidates, candidate_count, 2);
+
+	result->rows = palloc0(sizeof(*result->rows) * candidate_count);
+	for (i = 0; i < candidate_count; i++)
+	{
+		FbWalXidDebugProbe probe;
+		StringInfoData diag;
+
+		if (!candidates[i].unresolved_after_summary)
+			continue;
+
+		fb_wal_probe_xid_summary_context(&ctx,
+										 source_windows,
+										 source_window_count,
+										 candidates[i].xid,
+										 candidates[i].is_touched,
+										 candidates[i].unresolved_after_summary,
+										 candidates[i].unresolved_after_exact_windows,
+										 candidates[i].unresolved_after_exact_all,
+										 &probe);
+
+		result->rows[row_count].xid = candidates[i].xid;
+		result->rows[row_count].xid_role =
+			fb_wal_xid_debug_role_name(candidates[i].is_touched, candidates[i].is_unsafe);
+		result->rows[row_count].resolved_by =
+			fb_wal_xid_debug_resolved_by(&candidates[i]);
+		result->rows[row_count].fallback_reason =
+			fb_wal_xid_debug_fallback_reason(&candidates[i], &probe);
+		result->rows[row_count].top_xid = probe.probe_top_xid;
+		result->rows[row_count].top_xid_isnull =
+			!TransactionIdIsValid(probe.probe_top_xid);
+		if (probe.probe_commit_ts_found)
+		{
+			result->rows[row_count].commit_ts = probe.probe_commit_ts;
+			result->rows[row_count].commit_ts_isnull = false;
+		}
+		else if (probe.all_outcome_found &&
+				 probe.outcome.status == FB_WAL_XID_COMMITTED)
+		{
+			result->rows[row_count].commit_ts = probe.outcome.commit_ts;
+			result->rows[row_count].commit_ts_isnull = false;
+		}
+		else if (probe.top_outcome_found &&
+				 probe.top_outcome.status == FB_WAL_XID_COMMITTED)
+		{
+			result->rows[row_count].commit_ts = probe.top_outcome.commit_ts;
+			result->rows[row_count].commit_ts_isnull = false;
+		}
+		else
+			result->rows[row_count].commit_ts_isnull = true;
+		result->rows[row_count].summary_missing_segments =
+			(int32) probe.summary_missing_segments;
+		result->rows[row_count].fallback_windows = (int32) probe.fallback_windows;
+
+		initStringInfo(&diag);
+		fb_wal_append_xid_debug_diag(&diag, &candidates[i], &probe);
+		result->rows[row_count].diag = diag.data;
+		row_count++;
+
+		pfree(probe.missing_all_outcome_paths.data);
+	}
+	result->row_count = row_count;
+
+cleanup:
+	if (candidates != NULL)
+		pfree(candidates);
+	if (fallback_windows != NULL)
+		pfree(fallback_windows);
+	if (metadata_windows != NULL)
+		pfree(metadata_windows);
+	if (span_windows != NULL)
+		pfree(span_windows);
+	if (windows != NULL)
+		pfree(windows);
+	if (fallback_touched != NULL)
+		hash_destroy(fallback_touched);
+	if (fallback_unsafe != NULL)
+		hash_destroy(fallback_unsafe);
+	if (state.touched_xids != NULL)
+		hash_destroy(state.touched_xids);
+	if (state.unsafe_xids != NULL)
+		hash_destroy(state.unsafe_xids);
+	if (index.xid_statuses != NULL)
+		hash_destroy(index.xid_statuses);
+
+	return result;
+}
+
 static FbWalPayloadTask *
 fb_wal_payload_tasks(FbWalPayloadShared *shared)
 {
@@ -1672,13 +2432,19 @@ fb_wal_payload_fill_task(FbWalPayloadTask *task,
 						 const FbRelationInfo *info,
 						 TimestampTz target_ts,
 						 XLogRecPtr anchor_redo_lsn,
+						 bool capture_stats_only,
 						 int window_start,
 						 int window_end,
 						 uint32 locator_start,
 						 uint32 locator_count,
-						 const char *spool_path)
+						 const char *spool_path,
+						 const char *stats_path,
+						 const char *missing_blocks_path)
 {
-	if (task == NULL || info == NULL || spool_path == NULL)
+	if (task == NULL || info == NULL ||
+		(!capture_stats_only && spool_path == NULL) ||
+		(capture_stats_only &&
+		 (stats_path == NULL || missing_blocks_path == NULL)))
 		return;
 
 	MemSet(task, 0, sizeof(*task));
@@ -1690,11 +2456,19 @@ fb_wal_payload_fill_task(FbWalPayloadTask *task,
 	task->info.mode_name = NULL;
 	task->target_ts = target_ts;
 	task->anchor_redo_lsn = anchor_redo_lsn;
+	task->capture_stats_only = capture_stats_only;
 	task->window_start = window_start;
 	task->window_end = window_end;
 	task->locator_start = locator_start;
 	task->locator_count = locator_count;
-	strlcpy(task->spool_path, spool_path, sizeof(task->spool_path));
+	if (spool_path != NULL)
+		strlcpy(task->spool_path, spool_path, sizeof(task->spool_path));
+	if (stats_path != NULL)
+		strlcpy(task->stats_path, stats_path, sizeof(task->stats_path));
+	if (missing_blocks_path != NULL)
+		strlcpy(task->missing_blocks_path,
+				missing_blocks_path,
+				sizeof(task->missing_blocks_path));
 	fb_wal_payload_capture_gucs(task);
 }
 
@@ -3560,6 +4334,53 @@ fb_wal_visit_windows_share_segment_slice(const FbWalVisitWindow *lhs,
 
 	return lhs->segments == rhs->segments &&
 		lhs->segment_count == rhs->segment_count;
+}
+
+static int
+fb_build_payload_locator_task_ranges(FbWalScanContext *ctx,
+									 const FbSummaryPayloadLocator *locators,
+									 uint32 locator_count,
+									 int desired_workers,
+									 uint32 *start_offsets,
+									 uint32 *counts)
+{
+	uint32 start = 0;
+	uint32 remaining = locator_count;
+	int remaining_workers = desired_workers;
+	int task_count = 0;
+
+	if (ctx == NULL || locators == NULL || locator_count == 0 ||
+		desired_workers <= 0 || start_offsets == NULL || counts == NULL)
+		return 0;
+
+	while (start < locator_count && remaining_workers > 0)
+	{
+		uint32 target = Max((uint32) 1,
+							(remaining + (uint32) remaining_workers - 1) /
+							(uint32) remaining_workers);
+		uint32 end = start + 1;
+
+		while (end < locator_count)
+		{
+			XLogSegNo prev_segno;
+			XLogSegNo next_segno;
+
+			XLByteToSeg(locators[end - 1].record_start_lsn, prev_segno, ctx->wal_seg_size);
+			XLByteToSeg(locators[end].record_start_lsn, next_segno, ctx->wal_seg_size);
+			if ((end - start) >= target && next_segno != prev_segno)
+				break;
+			end++;
+		}
+
+		start_offsets[task_count] = start;
+		counts[task_count] = end - start;
+		task_count++;
+		remaining -= (end - start);
+		remaining_workers--;
+		start = end;
+	}
+
+	return task_count;
 }
 
 static void
@@ -6126,7 +6947,8 @@ fb_wal_load_record_by_lsn(const FbWalRecordIndex *index,
 												 record_out,
 												 include_payload);
 #elif PG_VERSION_NUM >= 140000
-		if (info_code == XLOG_HEAP2_PRUNE)
+		if (info_code == XLOG_HEAP2_PRUNE ||
+			info_code == XLOG_HEAP2_VACUUM)
 			built = fb_wal_build_heap_record_ref(reader, &active_materializer->info,
 												 FB_WAL_RECORD_HEAP2_PRUNE,
 												 record_out,
@@ -6251,7 +7073,8 @@ fb_wal_decode_record_ref(XLogReaderState *reader,
 			 info_code == XLOG_HEAP2_PRUNE_VACUUM_SCAN ||
 			 info_code == XLOG_HEAP2_PRUNE_VACUUM_CLEANUP) &&
 #elif PG_VERSION_NUM >= 140000
-			info_code == XLOG_HEAP2_PRUNE &&
+			(info_code == XLOG_HEAP2_PRUNE ||
+			 info_code == XLOG_HEAP2_VACUUM) &&
 #else
 			info_code == XLOG_HEAP2_CLEAN &&
 #endif
@@ -7318,12 +8141,60 @@ fb_index_append_record(FbWalRecordIndex *index,
 }
 
 static void
+fb_wal_dump_payload_stats_log(FbSpoolLog **log_ptr,
+							  const char *label,
+							  const FbRecordRef *record,
+							  uint8 flags)
+{
+	FbWalPayloadStatsEntry entry;
+	FbSpoolLog *log;
+
+	if (log_ptr == NULL || label == NULL || record == NULL)
+		return;
+	(void) label;
+
+	log = *log_ptr;
+	if (log == NULL)
+		return;
+
+	MemSet(&entry, 0, sizeof(entry));
+	entry.lsn = record->lsn;
+	entry.xid = record->xid;
+	entry.kind = record->kind;
+	entry.flags = flags;
+	fb_spool_log_append(log, &entry, sizeof(entry));
+}
+
+static void
 fb_index_note_record_metadata(FbWalRecordIndex *index)
 {
 	if (index == NULL)
 		return;
 
 	index->total_record_count++;
+}
+
+static void
+fb_index_note_target_kind(FbWalRecordIndex *index,
+						  FbWalRecordKind kind)
+{
+	if (index == NULL)
+		return;
+	if (kind <= 0 || kind >= FB_WAL_RECORD_KIND_COUNT)
+		return;
+
+	index->target_kind_counts[kind]++;
+}
+
+static bool
+fb_index_record_visible_for_profile(const FbRecordRef *record)
+{
+	if (record == NULL)
+		return false;
+	if (!TransactionIdIsValid(record->xid))
+		return true;
+
+	return record->committed_after_target;
 }
 
 static void
@@ -7338,7 +8209,7 @@ fb_index_note_materialized_record(FbWalRecordIndex *index,
 		return;
 
 	index->kept_record_count++;
-	if (!record->committed_after_target)
+	if (!fb_index_record_visible_for_profile(record))
 		return;
 
 	switch (record->kind)
@@ -7346,6 +8217,7 @@ fb_index_note_materialized_record(FbWalRecordIndex *index,
 		case FB_WAL_RECORD_HEAP_INSERT:
 			if (!fb_record_is_speculative_insert(record))
 			{
+				fb_index_note_target_kind(index, record->kind);
 				index->target_record_count++;
 				index->target_insert_count++;
 			}
@@ -7353,14 +8225,23 @@ fb_index_note_materialized_record(FbWalRecordIndex *index,
 		case FB_WAL_RECORD_HEAP_DELETE:
 			if (!fb_record_is_super_delete(record))
 			{
+				fb_index_note_target_kind(index, record->kind);
 				index->target_record_count++;
 				index->target_delete_count++;
 			}
 			break;
 		case FB_WAL_RECORD_HEAP_UPDATE:
 		case FB_WAL_RECORD_HEAP_HOT_UPDATE:
+			fb_index_note_target_kind(index, record->kind);
 			index->target_record_count++;
 			index->target_update_count++;
+			break;
+		case FB_WAL_RECORD_HEAP2_MULTI_INSERT:
+		case FB_WAL_RECORD_HEAP_INPLACE:
+		case FB_WAL_RECORD_HEAP2_PRUNE:
+		case FB_WAL_RECORD_XLOG_FPI:
+		case FB_WAL_RECORD_XLOG_FPI_FOR_HINT:
+			fb_index_note_target_kind(index, record->kind);
 			break;
 		default:
 			break;
@@ -7784,6 +8665,173 @@ fb_wal_xact_merge_statuses(FbWalRecordIndex *index,
 	unlink(path);
 }
 
+static void
+fb_index_note_payload_stats_entry(FbWalRecordIndex *index,
+								  const FbWalPayloadStatsEntry *entry)
+{
+	FbRecordRef record;
+
+	if (index == NULL || entry == NULL)
+		return;
+
+	MemSet(&record, 0, sizeof(record));
+	record.kind = entry->kind;
+	record.lsn = entry->lsn;
+	record.xid = entry->xid;
+	fb_wal_set_record_status(index, &record);
+	if (record.lsn < index->anchor_redo_lsn)
+		return;
+
+	index->kept_record_count++;
+	if (!fb_index_record_visible_for_profile(&record))
+		return;
+
+	switch (entry->kind)
+	{
+		case FB_WAL_RECORD_HEAP_INSERT:
+			if ((entry->flags & FB_WAL_PAYLOAD_STATS_FLAG_SPECULATIVE_INSERT) == 0)
+			{
+				fb_index_note_target_kind(index, entry->kind);
+				index->target_record_count++;
+				index->target_insert_count++;
+			}
+			break;
+		case FB_WAL_RECORD_HEAP_DELETE:
+			if ((entry->flags & FB_WAL_PAYLOAD_STATS_FLAG_SUPER_DELETE) == 0)
+			{
+				fb_index_note_target_kind(index, entry->kind);
+				index->target_record_count++;
+				index->target_delete_count++;
+			}
+			break;
+		case FB_WAL_RECORD_HEAP_UPDATE:
+		case FB_WAL_RECORD_HEAP_HOT_UPDATE:
+			fb_index_note_target_kind(index, entry->kind);
+			index->target_record_count++;
+			index->target_update_count++;
+			break;
+		case FB_WAL_RECORD_HEAP2_MULTI_INSERT:
+		case FB_WAL_RECORD_HEAP_INPLACE:
+		case FB_WAL_RECORD_HEAP2_PRUNE:
+		case FB_WAL_RECORD_XLOG_FPI:
+		case FB_WAL_RECORD_XLOG_FPI_FOR_HINT:
+			fb_index_note_target_kind(index, entry->kind);
+			break;
+		default:
+			break;
+	}
+}
+
+static void
+fb_wal_merge_payload_stats_log(FbWalRecordIndex *index,
+							   const char *path,
+							   uint32 item_count)
+{
+	FbSpoolLog *source;
+	FbSpoolCursor *cursor;
+	StringInfoData buf;
+	uint32 item_index;
+
+	if (index == NULL || path == NULL || item_count == 0)
+		return;
+
+	source = fb_spool_log_open_readonly(path, item_count);
+	cursor = fb_spool_cursor_open(source, FB_SPOOL_FORWARD);
+	initStringInfo(&buf);
+	while (fb_spool_cursor_read(cursor, &buf, &item_index))
+	{
+		FbWalPayloadStatsEntry entry;
+
+		if (buf.len != sizeof(entry))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("fb WAL payload stats spool entry has invalid length")));
+		memcpy(&entry, buf.data, sizeof(entry));
+		fb_index_note_payload_stats_entry(index, &entry);
+	}
+	pfree(buf.data);
+	fb_spool_cursor_close(cursor);
+	fb_spool_log_close(source);
+	unlink(path);
+}
+
+static void
+fb_wal_dump_missing_blocks(HTAB *missing_blocks,
+						   const char *path,
+						   uint32 *count_out)
+{
+	FbSpoolLog *log;
+	HASH_SEQ_STATUS status;
+	FbWalPrecomputedMissingBlock *entry;
+	uint32 count = 0;
+
+	if (count_out != NULL)
+		*count_out = 0;
+	if (missing_blocks == NULL || path == NULL)
+		return;
+
+	log = fb_spool_log_create_path(path);
+	hash_seq_init(&status, missing_blocks);
+	while ((entry = (FbWalPrecomputedMissingBlock *) hash_seq_search(&status)) != NULL)
+	{
+		fb_spool_log_append(log, entry, sizeof(*entry));
+		count++;
+	}
+	fb_spool_log_close(log);
+	if (count_out != NULL)
+		*count_out = count;
+}
+
+static void
+fb_wal_merge_missing_blocks(FbWalRecordIndex *index,
+							const char *path,
+							uint32 item_count,
+							uint32 record_index_base)
+{
+	FbSpoolLog *source;
+	FbSpoolCursor *cursor;
+	StringInfoData buf;
+	uint32 item_index;
+
+	if (index == NULL || path == NULL || item_count == 0)
+		return;
+
+	if (index->precomputed_missing_blocks == NULL)
+		index->precomputed_missing_blocks =
+			fb_wal_create_precomputed_missing_block_hash();
+
+	source = fb_spool_log_open_readonly(path, item_count);
+	cursor = fb_spool_cursor_open(source, FB_SPOOL_FORWARD);
+	initStringInfo(&buf);
+	while (fb_spool_cursor_read(cursor, &buf, &item_index))
+	{
+		FbWalPrecomputedMissingBlock incoming;
+		FbWalPrecomputedMissingBlock *entry;
+		bool found = false;
+
+		if (buf.len != sizeof(incoming))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("fb WAL missing-block spool entry has invalid length")));
+		memcpy(&incoming, buf.data, sizeof(incoming));
+		incoming.first_record_index += record_index_base;
+		entry = (FbWalPrecomputedMissingBlock *)
+			hash_search(index->precomputed_missing_blocks,
+						&incoming.key,
+						HASH_ENTER,
+						&found);
+		if (!found ||
+			incoming.first_record_index < entry->first_record_index ||
+			(incoming.first_record_index == entry->first_record_index &&
+			 incoming.first_record_lsn < entry->first_record_lsn))
+			*entry = incoming;
+	}
+	pfree(buf.data);
+	fb_spool_cursor_close(cursor);
+	fb_spool_log_close(source);
+	unlink(path);
+}
+
 /*
  * fb_copy_heap_record_ref
  *    WAL helper.
@@ -7795,6 +8843,9 @@ fb_copy_heap_record_ref(XLogReaderState *reader, const FbRelationInfo *info,
 {
 	FbRecordRef record;
 	FbWalRecordIndex *index = state->index;
+	bool stats_only = state->payload_stats_only_capture;
+	bool copy_payload = !stats_only;
+	uint8 payload_stats_flags = 0;
 	int block_count = 0;
 	int block_id;
 
@@ -7805,9 +8856,25 @@ fb_copy_heap_record_ref(XLogReaderState *reader, const FbRelationInfo *info,
 	record.xid = fb_record_xid(reader);
 	record.info = XLogRecGetInfo(reader);
 	record.init_page = ((XLogRecGetInfo(reader) & XLOG_HEAP_INIT_PAGE) != 0);
-	record.main_data = fb_copy_bytes(XLogRecGetData(reader),
-									 XLogRecGetDataLen(reader));
-	record.main_data_len = XLogRecGetDataLen(reader);
+	if (!stats_only)
+	{
+		record.main_data = fb_copy_bytes(XLogRecGetData(reader),
+										 XLogRecGetDataLen(reader));
+		record.main_data_len = XLogRecGetDataLen(reader);
+	}
+	else
+	{
+		if (kind == FB_WAL_RECORD_HEAP_INSERT &&
+			XLogRecGetDataLen(reader) >= SizeOfHeapInsert &&
+			(((const xl_heap_insert *) XLogRecGetData(reader))->flags &
+			 XLH_INSERT_IS_SPECULATIVE) != 0)
+			payload_stats_flags |= FB_WAL_PAYLOAD_STATS_FLAG_SPECULATIVE_INSERT;
+		else if (kind == FB_WAL_RECORD_HEAP_DELETE &&
+				 XLogRecGetDataLen(reader) >= SizeOfHeapDelete &&
+				 (((const xl_heap_delete *) XLogRecGetData(reader))->flags &
+				  XLH_DELETE_IS_SUPER) != 0)
+			payload_stats_flags |= FB_WAL_PAYLOAD_STATS_FLAG_SUPER_DELETE;
+	}
 
 	for (block_id = 0;
 		 block_id <= FB_XLOGREC_MAX_BLOCK_ID(reader) && block_count < FB_WAL_MAX_BLOCK_REFS;
@@ -7825,19 +8892,29 @@ fb_copy_heap_record_ref(XLogReaderState *reader, const FbRelationInfo *info,
 		if (!fb_locator_matches_relation(&locator, info))
 			continue;
 
-		fb_fill_record_block_ref(&record.blocks[block_count], reader, block_id, info, true);
+		fb_fill_record_block_ref(&record.blocks[block_count], reader, block_id, info, copy_payload);
 		block_count++;
 	}
 
 	record.block_count = block_count;
-	fb_index_append_record(index,
-						   state->payload_log,
-						   state->payload_label,
-						   &record,
-						   state->defer_payload_body);
+	if (!stats_only)
+		fb_index_append_record(index,
+							   state->payload_log,
+							   state->payload_label,
+							   &record,
+							   state->defer_payload_body);
+	else
+	{
+		fb_wal_dump_payload_stats_log(state->payload_stats_log,
+									  state->payload_stats_label,
+									  &record,
+									  payload_stats_flags);
+		index->record_count++;
+	}
 	if (state->payload_block_states != NULL && index->record_count > 0)
 	{
-		fb_index_note_materialized_record(index, &record);
+		if (!stats_only)
+			fb_index_note_materialized_record(index, &record);
 		fb_wal_note_precomputed_missing_blocks(index,
 											  state->payload_block_states,
 											  &record,
@@ -7857,6 +8934,8 @@ fb_copy_xlog_fpi_record_ref(XLogReaderState *reader, const FbRelationInfo *info,
 {
 	FbRecordRef record;
 	FbWalRecordIndex *index = state->index;
+	bool stats_only = state->payload_stats_only_capture;
+	bool copy_payload = !stats_only;
 	int block_count = 0;
 	int block_id;
 
@@ -7884,19 +8963,29 @@ fb_copy_xlog_fpi_record_ref(XLogReaderState *reader, const FbRelationInfo *info,
 		if (!fb_locator_matches_relation(&locator, info))
 			continue;
 
-		fb_fill_record_block_ref(&record.blocks[block_count], reader, block_id, info, true);
+		fb_fill_record_block_ref(&record.blocks[block_count], reader, block_id, info, copy_payload);
 		block_count++;
 	}
 
 	record.block_count = block_count;
-	fb_index_append_record(index,
-						   state->payload_log,
-						   state->payload_label,
-						   &record,
-						   state->defer_payload_body);
+	if (!stats_only)
+		fb_index_append_record(index,
+							   state->payload_log,
+							   state->payload_label,
+							   &record,
+							   state->defer_payload_body);
+	else
+	{
+		fb_wal_dump_payload_stats_log(state->payload_stats_log,
+									  state->payload_stats_label,
+									  &record,
+									  0);
+		index->record_count++;
+	}
 	if (state->payload_block_states != NULL && index->record_count > 0)
 	{
-		fb_index_note_materialized_record(index, &record);
+		if (!stats_only)
+			fb_index_note_materialized_record(index, &record);
 		fb_wal_note_precomputed_missing_blocks(index,
 											  state->payload_block_states,
 											  &record,
@@ -10404,7 +11493,8 @@ fb_index_record_visitor(XLogReaderState *reader, void *arg)
 				  info_code == XLOG_HEAP2_PRUNE_VACUUM_SCAN ||
 				  info_code == XLOG_HEAP2_PRUNE_VACUUM_CLEANUP) &&
 #elif PG_VERSION_NUM >= 140000
-				 info_code == XLOG_HEAP2_PRUNE &&
+				 (info_code == XLOG_HEAP2_PRUNE ||
+				  info_code == XLOG_HEAP2_VACUUM) &&
 #else
 				 info_code == XLOG_HEAP2_CLEAN &&
 #endif
@@ -10706,18 +11796,18 @@ done:
 }
 
 static uint32
-fb_wal_visit_payload_locators(FbWalScanContext *ctx,
-							  const FbSummaryPayloadLocator *locators,
-							  uint32 locator_count,
-							  FbWalIndexBuildState *state)
+fb_wal_visit_payload_locators_exact(FbWalScanContext *ctx,
+									  const FbSummaryPayloadLocator *locators,
+									  uint32 locator_count,
+									  FbWalIndexBuildState *state)
 {
 	FbWalReaderPrivate private;
 	XLogReaderState *reader;
-	FbWalVisitWindow *visit_windows = NULL;
 	bool *saved_hit_map;
 	bool saved_prefilter_used;
 	bool saved_current_segment_may_hit;
-	uint32 visit_window_count = 0;
+	bool reader_initialized = false;
+	uint32 visited = 0;
 	uint32 i;
 
 	if (ctx == NULL)
@@ -10727,48 +11817,6 @@ fb_wal_visit_payload_locators(FbWalScanContext *ctx,
 	if (locators == NULL || locator_count == 0)
 		return 0;
 
-	visit_window_count =
-		fb_build_payload_locator_visit_windows(ctx, locators, locator_count, &visit_windows);
-	if (visit_window_count > 0 && visit_window_count < locator_count)
-	{
-		if (state->index != NULL &&
-			fb_wal_materialize_payload_locators_parallel(state->info,
-														 ctx,
-														 state->index,
-														 visit_windows,
-														 visit_window_count,
-														 locators,
-														 locator_count))
-		{
-			if (visit_windows != NULL)
-				pfree(visit_windows);
-			return visit_window_count;
-		}
-		fb_wal_enable_incremental_payload_stats(state->index, state);
-		state->payload_emit_start_lsn = InvalidXLogRecPtr;
-		state->payload_emit_end_lsn = InvalidXLogRecPtr;
-		state->payload_locators = locators;
-		state->payload_locator_count = locator_count;
-		state->payload_locator_index = 0;
-		fb_wal_visit_window_batch(ctx, visit_windows, visit_window_count, state);
-		if (state->payload_locator_index != locator_count)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("summary payload locator visit ended early"),
-					 errdetail("Consumed %u of %u payload locators during batched visit.",
-							   state->payload_locator_index,
-							   locator_count)));
-		state->payload_locators = NULL;
-		state->payload_locator_count = 0;
-		state->payload_locator_index = 0;
-		if (visit_windows != NULL)
-			pfree(visit_windows);
-		return visit_window_count;
-	}
-	if (visit_windows != NULL)
-		pfree(visit_windows);
-
-	fb_wal_enable_incremental_payload_stats(state->index, state);
 	saved_hit_map = ctx->segment_hit_map;
 	saved_prefilter_used = ctx->segment_prefilter_used;
 	saved_current_segment_may_hit = ctx->current_segment_may_hit;
@@ -10779,7 +11827,7 @@ fb_wal_visit_payload_locators(FbWalScanContext *ctx,
 
 	MemSet(&private, 0, sizeof(private));
 	private.timeline_id = ctx->timeline_id;
-	private.endptr = ctx->end_lsn;
+	private.endptr = InvalidXLogRecPtr;
 	private.current_file = -1;
 	private.open_pattern = FB_WAL_OPEN_SPARSE;
 	private.ctx = ctx;
@@ -10810,6 +11858,14 @@ fb_wal_visit_payload_locators(FbWalScanContext *ctx,
 		XLogRecord *record;
 		char *errormsg = NULL;
 
+		if (!reader_initialized)
+		{
+			ctx->payload_sparse_reader_resets++;
+			reader_initialized = true;
+		}
+		else
+			ctx->payload_sparse_reader_reuses++;
+
 		state->payload_emit_start_lsn = locators[i].record_start_lsn;
 		state->payload_emit_end_lsn = locators[i].record_start_lsn + 1;
 
@@ -10839,6 +11895,7 @@ fb_wal_visit_payload_locators(FbWalScanContext *ctx,
 		ctx->last_record_lsn = reader->EndRecPtr;
 		if (XLogRecPtrIsInvalid(ctx->first_record_lsn))
 			ctx->first_record_lsn = reader->ReadRecPtr;
+		visited++;
 		if (!fb_index_record_visitor(reader, state))
 			break;
 	}
@@ -10848,7 +11905,60 @@ fb_wal_visit_payload_locators(FbWalScanContext *ctx,
 	ctx->segment_hit_map = saved_hit_map;
 	ctx->segment_prefilter_used = saved_prefilter_used;
 	ctx->current_segment_may_hit = saved_current_segment_may_hit;
-	return locator_count;
+	return visited;
+}
+
+static uint32
+fb_wal_visit_payload_locators(FbWalScanContext *ctx,
+							  const FbSummaryPayloadLocator *locators,
+							  uint32 locator_count,
+							  FbWalIndexBuildState *state)
+{
+	FbWalVisitWindow *visit_windows = NULL;
+	uint32 visit_window_count = 0;
+
+	if (ctx == NULL)
+		elog(ERROR, "FbWalScanContext must not be NULL");
+	if (state == NULL)
+		elog(ERROR, "FbWalIndexBuildState must not be NULL");
+	if (locators == NULL || locator_count == 0)
+		return 0;
+
+	visit_window_count =
+		fb_build_payload_locator_visit_windows(ctx, locators, locator_count, &visit_windows);
+	if (visit_window_count > 0 && visit_window_count < locator_count)
+	{
+		fb_wal_enable_incremental_payload_stats(state->index, state);
+		if (state->index != NULL &&
+			fb_wal_materialize_payload_locators_parallel(state->info,
+														 ctx,
+														 state->index,
+														 visit_windows,
+														 visit_window_count,
+														 locators,
+														 locator_count,
+														 &state->payload_block_states))
+			{
+				if (visit_windows != NULL)
+					pfree(visit_windows);
+				return visit_window_count;
+		}
+		if (visit_windows != NULL)
+			pfree(visit_windows);
+		fb_wal_enable_incremental_payload_stats(state->index, state);
+		return fb_wal_visit_payload_locators_exact(ctx,
+												   locators,
+												   locator_count,
+												   state);
+	}
+	if (visit_windows != NULL)
+		pfree(visit_windows);
+
+	fb_wal_enable_incremental_payload_stats(state->index, state);
+	return fb_wal_visit_payload_locators_exact(ctx,
+											   locators,
+											   locator_count,
+											   state);
 }
 
 static void
@@ -11020,6 +12130,7 @@ fb_wal_payload_worker_main(Datum main_arg)
 	FbWalRecordIndex index;
 	FbWalIndexBuildState state;
 	FbSpoolLog *log = NULL;
+	FbSpoolLog *stats_log = NULL;
 	FbWalVisitWindow *task_windows = NULL;
 	uint32 task_window_count = 0;
 	int task_index;
@@ -11055,8 +12166,13 @@ fb_wal_payload_worker_main(Datum main_arg)
 		ctx.current_segment_may_hit = true;
 
 		MemSet(&index, 0, sizeof(index));
+		index.target_ts = task->target_ts;
+		index.query_now_ts = task->target_ts;
 		index.anchor_redo_lsn = task->anchor_redo_lsn;
-		log = fb_spool_log_create_path(task->spool_path);
+		if (task->capture_stats_only)
+			stats_log = fb_spool_log_create_path(task->stats_path);
+		else
+			log = fb_spool_log_create_path(task->spool_path);
 
 		MemSet(&state, 0, sizeof(state));
 		state.info = &info;
@@ -11067,6 +12183,11 @@ fb_wal_payload_worker_main(Datum main_arg)
 		state.tail_capture_allowed = false;
 		state.payload_log = &log;
 		state.payload_label = "wal-records-worker";
+		state.payload_stats_only_capture = task->capture_stats_only;
+		state.payload_stats_log = &stats_log;
+		state.payload_stats_label = "wal-payload-stats-worker";
+		if (task->capture_stats_only)
+			state.payload_block_states = fb_wal_create_block_init_state_hash();
 		if (task->locator_count > 0)
 		{
 			state.payload_emit_start_lsn = InvalidXLogRecPtr;
@@ -11076,27 +12197,35 @@ fb_wal_payload_worker_main(Datum main_arg)
 			state.payload_locator_index = 0;
 		}
 
-		task_window_count = (uint32) (task->window_end - task->window_start);
-		task_windows = palloc0(sizeof(*task_windows) * task_window_count);
-		for (i = task->window_start; i < task->window_end; i++)
+		if (task->locator_count > 0)
+			fb_wal_visit_payload_locators_exact(&ctx,
+												locators + task->locator_start,
+												task->locator_count,
+												&state);
+		else
 		{
-			FbWalParallelWindow *shared_window = &windows[i];
-			FbWalVisitWindow *window = &task_windows[i - task->window_start];
+			task_window_count = (uint32) (task->window_end - task->window_start);
+			task_windows = palloc0(sizeof(*task_windows) * task_window_count);
+			for (i = task->window_start; i < task->window_end; i++)
+			{
+				FbWalParallelWindow *shared_window = &windows[i];
+				FbWalVisitWindow *window = &task_windows[i - task->window_start];
 
-			if (shared_window->segment_start_index + shared_window->segment_count >
-				ctx.resolved_segment_count)
-				elog(ERROR, "payload worker window segment range is out of bounds");
+				if (shared_window->segment_start_index + shared_window->segment_count >
+					ctx.resolved_segment_count)
+					elog(ERROR, "payload worker window segment range is out of bounds");
 
-			window->segments = &segments[shared_window->segment_start_index];
-			window->segment_count = shared_window->segment_count;
-			window->start_lsn = shared_window->start_lsn;
-			window->end_lsn = shared_window->end_lsn;
-			window->read_end_lsn = shared_window->read_end_lsn;
+				window->segments = &segments[shared_window->segment_start_index];
+				window->segment_count = shared_window->segment_count;
+				window->start_lsn = shared_window->start_lsn;
+				window->end_lsn = shared_window->end_lsn;
+				window->read_end_lsn = shared_window->read_end_lsn;
+			}
+			fb_wal_visit_window_batch(&ctx,
+									  task_windows,
+									  task_window_count,
+									  &state);
 		}
-		fb_wal_visit_window_batch(&ctx,
-								  task_windows,
-								  task_window_count,
-								  &state);
 		if (task->locator_count > 0 &&
 			state.payload_locator_index != task->locator_count)
 			ereport(ERROR,
@@ -11108,11 +12237,38 @@ fb_wal_payload_worker_main(Datum main_arg)
 							   task_index + 1)));
 
 		task->record_count = index.record_count;
+		task->stats_count = index.record_count;
+		task->kept_record_count = index.kept_record_count;
+		task->target_record_count = index.target_record_count;
+		task->target_insert_count = index.target_insert_count;
+		task->target_delete_count = index.target_delete_count;
+		task->target_update_count = index.target_update_count;
 		task->scanned_record_count = index.payload_scanned_record_count;
 		task->reader_reset_count = ctx.payload_sparse_reader_resets;
 		task->reader_reuse_count = ctx.payload_sparse_reader_reuses;
-		fb_spool_log_close(log);
-		log = NULL;
+		if (task->capture_stats_only)
+		{
+			fb_wal_dump_missing_blocks(index.precomputed_missing_blocks,
+									   task->missing_blocks_path,
+									   &task->missing_block_count);
+			if (state.payload_block_states != NULL)
+			{
+				hash_destroy(state.payload_block_states);
+				state.payload_block_states = NULL;
+			}
+			if (index.precomputed_missing_blocks != NULL)
+			{
+				hash_destroy(index.precomputed_missing_blocks);
+				index.precomputed_missing_blocks = NULL;
+			}
+			fb_spool_log_close(stats_log);
+			stats_log = NULL;
+		}
+		else
+		{
+			fb_spool_log_close(log);
+			log = NULL;
+		}
 		if (task_windows != NULL)
 		{
 			pfree(task_windows);
@@ -11128,6 +12284,12 @@ fb_wal_payload_worker_main(Datum main_arg)
 		FlushErrorState();
 		if (log != NULL)
 			fb_spool_log_close(log);
+		if (stats_log != NULL)
+			fb_spool_log_close(stats_log);
+		if (state.payload_block_states != NULL)
+			hash_destroy(state.payload_block_states);
+		if (index.precomputed_missing_blocks != NULL)
+			hash_destroy(index.precomputed_missing_blocks);
 		if (task_windows != NULL)
 			pfree(task_windows);
 		strlcpy(task->errmsg,
@@ -11649,20 +12811,71 @@ fb_wal_xact_fill_wait_worker(BackgroundWorkerHandle *handle,
 									task->errmsg[0] != '\0' ? task->errmsg : "worker exited without success")));
 }
 
-static void
+static bool
 fb_wal_payload_merge_log(FbWalRecordIndex *index,
 						 const char *path,
-						 uint32 item_count)
+						 uint32 item_count,
+						 HTAB *block_states)
 {
 	FbSpoolLog *dest;
+	FbSpoolLog *source = NULL;
+	FbSpoolCursor *cursor = NULL;
+	StringInfoData buf;
+	uint32 item_index = 0;
+	bool incremental_ok = true;
 
 	if (index == NULL || path == NULL || item_count == 0)
-		return;
+		return true;
 
 	dest = fb_index_ensure_record_log(index, &index->record_log, "wal-records");
-	fb_spool_log_append_file(dest, path, item_count);
-	index->record_count += item_count;
+
+	if (block_states == NULL)
+	{
+		fb_spool_log_append_file(dest, path, item_count);
+		index->record_count += item_count;
+		unlink(path);
+		return true;
+	}
+
+	source = fb_spool_log_open_readonly(path, item_count);
+	cursor = fb_spool_cursor_open(source, FB_SPOOL_FORWARD);
+	initStringInfo(&buf);
+
+	while (fb_spool_cursor_read(cursor, &buf, &item_index))
+	{
+		fb_spool_log_append(dest, buf.data, buf.len);
+		index->record_count++;
+
+		if (incremental_ok)
+		{
+			FbSerializedRecordHeader hdr;
+			FbRecordRef record;
+
+			if (buf.len < sizeof(hdr))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("fb WAL payload worker spool entry is truncated")));
+
+			memcpy(&hdr, buf.data, sizeof(hdr));
+			if (hdr.locator_only)
+				incremental_ok = false;
+			else
+			{
+				fb_wal_deserialize_record(index, buf.data, buf.len, &record);
+				fb_index_note_materialized_record(index, &record);
+				fb_wal_note_precomputed_missing_blocks(index,
+													  block_states,
+													  &record,
+													  index->record_count - 1);
+			}
+		}
+	}
+
+	pfree(buf.data);
+	fb_spool_cursor_close(cursor);
+	fb_spool_log_close(source);
 	unlink(path);
+	return incremental_ok;
 }
 
 static bool
@@ -12059,10 +13272,11 @@ fb_wal_fill_xact_statuses_parallel(const FbRelationInfo *info,
 
 static bool
 fb_wal_materialize_payload_parallel(const FbRelationInfo *info,
-									FbWalScanContext *ctx,
-									FbWalRecordIndex *index,
-									const FbWalVisitWindow *windows,
-									uint32 window_count)
+								 FbWalScanContext *ctx,
+								 FbWalRecordIndex *index,
+								 const FbWalVisitWindow *windows,
+								 uint32 window_count,
+								 HTAB **block_states_ptr)
 {
 	const char *session_dir;
 	Size tasks_size;
@@ -12077,6 +13291,7 @@ fb_wal_materialize_payload_parallel(const FbRelationInfo *info,
 	BackgroundWorkerHandle *worker_handles[FB_WAL_PARALLEL_MAX_WORKERS];
 	int desired_workers;
 	int chunk_size;
+	bool incremental_merge_ok;
 	int i;
 
 	if (info == NULL || ctx == NULL || index == NULL || windows == NULL ||
@@ -12145,11 +13360,14 @@ fb_wal_materialize_payload_parallel(const FbRelationInfo *info,
 									 info,
 									 ctx->target_ts,
 									 index->anchor_redo_lsn,
+									 false,
 									 window_start,
 									 window_end,
 									 0,
 									 0,
-									 spool_path);
+									 spool_path,
+									 NULL,
+									 NULL);
 			if (!fb_wal_payload_launch_worker(handle, i, &worker_handles[i]))
 				break;
 			launched++;
@@ -12174,14 +13392,26 @@ fb_wal_materialize_payload_parallel(const FbRelationInfo *info,
 			continue;
 		}
 
+		incremental_merge_ok = true;
 		for (i = 0; i < desired_workers; i++)
 			fb_wal_payload_wait_worker(worker_handles[i], &tasks[i]);
 		for (i = 0; i < desired_workers; i++)
 		{
-			fb_wal_payload_merge_log(index, tasks[i].spool_path, tasks[i].record_count);
+			if (!fb_wal_payload_merge_log(index,
+										 tasks[i].spool_path,
+										 tasks[i].record_count,
+										 block_states_ptr != NULL ? *block_states_ptr : NULL))
+				incremental_merge_ok = false;
 			index->payload_scanned_record_count += tasks[i].scanned_record_count;
 			index->payload_sparse_reader_resets += tasks[i].reader_reset_count;
 			index->payload_sparse_reader_reuses += tasks[i].reader_reuse_count;
+		}
+		if (!incremental_merge_ok &&
+			block_states_ptr != NULL &&
+			*block_states_ptr != NULL)
+		{
+			hash_destroy(*block_states_ptr);
+			*block_states_ptr = NULL;
 		}
 		index->payload_window_count = window_count;
 		index->payload_parallel_workers = desired_workers;
@@ -12199,7 +13429,8 @@ fb_wal_materialize_payload_locators_parallel(const FbRelationInfo *info,
 											 const FbWalVisitWindow *windows,
 											 uint32 window_count,
 											 const FbSummaryPayloadLocator *locators,
-											 uint32 locator_count)
+											 uint32 locator_count,
+											 HTAB **block_states_ptr)
 {
 	const char *session_dir;
 	uint32 *window_locator_offsets = NULL;
@@ -12217,6 +13448,7 @@ fb_wal_materialize_payload_locators_parallel(const FbRelationInfo *info,
 	int desired_workers;
 	int chunk_size;
 	uint32 locator_index = 0;
+	bool incremental_merge_ok;
 	int i;
 
 	if (info == NULL || ctx == NULL || index == NULL || windows == NULL ||
@@ -12308,11 +13540,14 @@ fb_wal_materialize_payload_locators_parallel(const FbRelationInfo *info,
 									 info,
 									 ctx->target_ts,
 									 index->anchor_redo_lsn,
+									 false,
 									 window_start,
 									 window_end,
 									 task_locator_start,
 									 task_locator_count,
-									 spool_path);
+									 spool_path,
+									 NULL,
+									 NULL);
 			if (!fb_wal_payload_launch_worker(handle, i, &worker_handles[i]))
 				break;
 			launched++;
@@ -12337,14 +13572,26 @@ fb_wal_materialize_payload_locators_parallel(const FbRelationInfo *info,
 			continue;
 		}
 
+		incremental_merge_ok = true;
 		for (i = 0; i < desired_workers; i++)
 			fb_wal_payload_wait_worker(worker_handles[i], &tasks[i]);
 		for (i = 0; i < desired_workers; i++)
 		{
-			fb_wal_payload_merge_log(index, tasks[i].spool_path, tasks[i].record_count);
+			if (!fb_wal_payload_merge_log(index,
+										 tasks[i].spool_path,
+										 tasks[i].record_count,
+										 block_states_ptr != NULL ? *block_states_ptr : NULL))
+				incremental_merge_ok = false;
 			index->payload_scanned_record_count += tasks[i].scanned_record_count;
 			index->payload_sparse_reader_resets += tasks[i].reader_reset_count;
 			index->payload_sparse_reader_reuses += tasks[i].reader_reuse_count;
+		}
+		if (!incremental_merge_ok &&
+			block_states_ptr != NULL &&
+			*block_states_ptr != NULL)
+		{
+			hash_destroy(*block_states_ptr);
+			*block_states_ptr = NULL;
 		}
 		index->payload_window_count = window_count;
 		index->payload_parallel_workers = desired_workers;
@@ -12354,6 +13601,162 @@ fb_wal_materialize_payload_locators_parallel(const FbRelationInfo *info,
 	}
 
 	pfree(window_locator_offsets);
+	return false;
+}
+
+static bool
+fb_wal_capture_locator_stub_stats_parallel(const FbRelationInfo *info,
+										   FbWalScanContext *ctx,
+										   FbWalRecordIndex *index,
+										   const FbSummaryPayloadLocator *locators,
+										   uint32 locator_count)
+{
+	const char *session_dir;
+	Size tasks_size;
+	Size windows_size;
+	Size segments_size;
+	Size locators_size;
+	Size shared_size;
+	dsm_segment *seg;
+	dsm_handle handle;
+	FbWalPayloadShared *shared;
+	FbWalPayloadTask *tasks;
+	BackgroundWorkerHandle *worker_handles[FB_WAL_PARALLEL_MAX_WORKERS];
+	uint32 task_locator_offsets[FB_WAL_PARALLEL_MAX_WORKERS];
+	uint32 task_locator_counts[FB_WAL_PARALLEL_MAX_WORKERS];
+	int desired_workers;
+	int task_count;
+	int i;
+
+	if (info == NULL || ctx == NULL || index == NULL || locators == NULL ||
+		locator_count == 0 || ctx->parallel_workers <= 1 || index->spool_session == NULL)
+		return false;
+
+	desired_workers = fb_parallel_worker_count((int) Min(locator_count,
+														 fb_count_payload_locator_segments(ctx,
+																						   locators,
+																						   locator_count)));
+	if (desired_workers <= 1)
+		return false;
+
+	session_dir = fb_spool_session_dir(index->spool_session);
+	if (session_dir == NULL)
+		return false;
+
+	for (; desired_workers > 1; desired_workers--)
+	{
+		int launched = 0;
+
+		task_count = fb_build_payload_locator_task_ranges(ctx,
+														  locators,
+														  locator_count,
+														  desired_workers,
+														  task_locator_offsets,
+														  task_locator_counts);
+		if (task_count <= 1)
+			continue;
+
+		tasks_size = MAXALIGN(sizeof(FbWalPayloadTask) * task_count);
+		windows_size = 0;
+		segments_size = MAXALIGN(sizeof(FbWalSegmentEntry) * ctx->resolved_segment_count);
+		locators_size = MAXALIGN(sizeof(FbSummaryPayloadLocator) * locator_count);
+		shared_size = MAXALIGN(sizeof(FbWalPayloadShared)) +
+			tasks_size + windows_size + segments_size + locators_size;
+		seg = dsm_create(shared_size, 0);
+		handle = dsm_segment_handle(seg);
+		shared = (FbWalPayloadShared *) dsm_segment_address(seg);
+		MemSet(shared, 0, shared_size);
+		shared->task_count = task_count;
+		shared->window_count = 0;
+		shared->locator_count = locator_count;
+		shared->timeline_id = ctx->timeline_id;
+		shared->wal_seg_size = ctx->wal_seg_size;
+		shared->resolved_segment_count = ctx->resolved_segment_count;
+		shared->tasks_offset = MAXALIGN(sizeof(FbWalPayloadShared));
+		shared->windows_offset = shared->tasks_offset + tasks_size;
+		shared->segments_offset = shared->windows_offset + windows_size;
+		shared->locators_offset = shared->segments_offset + segments_size;
+		tasks = fb_wal_payload_tasks(shared);
+		memcpy(fb_wal_payload_segments(shared),
+			   ctx->resolved_segments,
+			   sizeof(FbWalSegmentEntry) * ctx->resolved_segment_count);
+		memcpy(fb_wal_payload_locators_shared(shared),
+			   locators,
+			   sizeof(FbSummaryPayloadLocator) * locator_count);
+
+		for (i = 0; i < task_count; i++)
+		{
+			char stats_path[MAXPGPATH];
+			char missing_path[MAXPGPATH];
+			snprintf(stats_path, sizeof(stats_path),
+					 "%s/wal-payload-stats-worker-%d.bin",
+					 session_dir, i + 1);
+			snprintf(missing_path, sizeof(missing_path),
+					 "%s/wal-payload-missing-worker-%d.bin",
+					 session_dir, i + 1);
+			fb_wal_payload_fill_task(&tasks[i],
+									 info,
+									 ctx->target_ts,
+									 index->anchor_redo_lsn,
+									 true,
+									 0,
+									 0,
+									 task_locator_offsets[i],
+									 task_locator_counts[i],
+									 NULL,
+									 stats_path,
+									 missing_path);
+			if (!fb_wal_payload_launch_worker(handle, i, &worker_handles[i]))
+				break;
+			launched++;
+		}
+
+		if (launched != task_count)
+		{
+			for (i = 0; i < launched; i++)
+				TerminateBackgroundWorker(worker_handles[i]);
+			for (i = 0; i < launched; i++)
+			{
+				BgwHandleStatus status = WaitForBackgroundWorkerShutdown(worker_handles[i]);
+
+				if (status == BGWH_POSTMASTER_DIED)
+					ereport(ERROR,
+							(errcode(ERRCODE_INTERNAL_ERROR),
+							 errmsg("postmaster died while stopping pg_flashback WAL payload stats workers")));
+				if (tasks[i].stats_path[0] != '\0')
+					unlink(tasks[i].stats_path);
+				if (tasks[i].missing_blocks_path[0] != '\0')
+					unlink(tasks[i].missing_blocks_path);
+			}
+			dsm_detach(seg);
+			continue;
+		}
+
+		fb_wal_reset_record_stats(index);
+		for (i = 0; i < task_count; i++)
+			fb_wal_payload_wait_worker(worker_handles[i], &tasks[i]);
+		for (i = 0; i < task_count; i++)
+		{
+			fb_wal_merge_payload_stats_log(index,
+										   tasks[i].stats_path,
+										   tasks[i].stats_count);
+			fb_wal_merge_missing_blocks(index,
+										tasks[i].missing_blocks_path,
+										tasks[i].missing_block_count,
+										tasks[i].locator_start);
+			index->payload_scanned_record_count += tasks[i].scanned_record_count;
+			index->payload_sparse_reader_resets += tasks[i].reader_reset_count;
+			index->payload_sparse_reader_reuses += tasks[i].reader_reuse_count;
+		}
+		if (index->precomputed_missing_blocks != NULL)
+			index->precomputed_missing_block_count =
+				hash_get_num_entries(index->precomputed_missing_blocks);
+		index->payload_window_count = locator_count;
+		index->payload_parallel_workers = task_count;
+		dsm_detach(seg);
+		return true;
+	}
+
 	return false;
 }
 
@@ -12489,6 +13892,7 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 	bool		metadata_parallel_done = false;
 	bool		payload_use_sparse_scan = false;
 	bool		payload_parallel_done = false;
+	bool		locator_stub_stats_done = false;
 	bool		count_only_mode = (build_mode == FB_WAL_BUILD_COUNT_ONLY);
 	uint32 i;
 
@@ -12532,9 +13936,10 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 	state.count_only_capture = false;
 	state.tail_capture_allowed = false;
 	state.defer_payload_body = !count_only_mode;
-	state.locator_only_payload_capture = false;
 	state.payload_log = NULL;
 	state.payload_label = NULL;
+	state.payload_stats_log = NULL;
+	state.payload_stats_label = NULL;
 	state.xact_summary_log = &index->xact_summary_log;
 	state.xact_summary_label = "wal-xact-summary";
 	ctx->summary_span_windows = 0;
@@ -12660,30 +14065,27 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 		const FbWalVisitWindow *payload_source_windows;
 		uint32		payload_source_window_count;
 
-		fb_progress_update_percent(FB_PROGRESS_STAGE_BUILD_INDEX,
-								   fb_progress_map_subrange(55, 15, 1, 1),
-								   "payload");
 		payload_source_windows =
 			(payload_base_window_count > 0) ? payload_base_windows :
 			(span_window_count > 0) ? span_windows : windows;
 		payload_source_window_count =
 			(payload_base_window_count > 0) ? payload_base_window_count :
 			(span_window_count > 0) ? span_window_count : window_count;
-			payload_locator_count =
-				fb_build_summary_payload_locator_plan(info,
-													  ctx,
-													  payload_source_windows,
-													  payload_source_window_count,
+		payload_locator_count =
+			fb_build_summary_payload_locator_plan(info,
+												  ctx,
+												  payload_source_windows,
+												  payload_source_window_count,
 												  ctx->anchor_redo_lsn,
 												  index->tail_inline_payload ?
 												  index->tail_cutover_lsn :
 												  ctx->end_lsn,
-													  &payload_locators,
-													  &payload_locator_fallback_base_windows,
-													  &payload_locator_fallback_base_count,
-													  &index->summary_payload_locator_fallback_segments,
-													  &index->summary_payload_locator_segments_read,
-													  NULL);
+												  &payload_locators,
+												  &payload_locator_fallback_base_windows,
+												  &payload_locator_fallback_base_count,
+												  &index->summary_payload_locator_fallback_segments,
+												  &index->summary_payload_locator_segments_read,
+												  NULL);
 		payload_locator_segment_count =
 			fb_count_payload_locator_segments(ctx,
 											  payload_locators,
@@ -12760,6 +14162,13 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 			index->payload_scanned_record_count += payload_locator_count;
 			index->payload_window_count = payload_locator_count;
 			state.locator_only_payload_capture = true;
+			if (payload_locator_fallback_base_count == 0)
+				locator_stub_stats_done =
+					fb_wal_capture_locator_stub_stats_parallel(info,
+															   ctx,
+															   index,
+															   payload_locators,
+															   payload_locator_count);
 		}
 		else if (payload_locator_count > 0)
 			index->payload_window_count =
@@ -12816,27 +14225,31 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 				}
 				state.payload_emit_start_lsn = InvalidXLogRecPtr;
 				state.payload_emit_end_lsn = InvalidXLogRecPtr;
+				fb_wal_enable_incremental_payload_stats(index, &state);
 				payload_parallel_done =
 					fb_wal_materialize_payload_parallel(info, ctx, index,
 														payload_sparse_windows,
-														payload_sparse_count);
+														payload_sparse_count,
+														&state.payload_block_states);
 				if (!payload_parallel_done)
 				{
-						fb_wal_enable_incremental_payload_stats(index, &state);
-						fb_wal_visit_sparse_windows(ctx,
-													payload_sparse_windows,
-													payload_sparse_count,
-													&state);
+					fb_wal_enable_incremental_payload_stats(index, &state);
+					fb_wal_visit_sparse_windows(ctx,
+												payload_sparse_windows,
+												payload_sparse_count,
+												&state);
 				}
 			}
 			else
 			{
 				if (payload_parallel_count > 0)
 				{
+					fb_wal_enable_incremental_payload_stats(index, &state);
 					payload_parallel_done =
 						fb_wal_materialize_payload_parallel(info, ctx, index,
 															payload_parallel_windows,
-															payload_parallel_count);
+															payload_parallel_count,
+															&state.payload_block_states);
 				}
 
 				if (payload_parallel_done)
@@ -12901,28 +14314,39 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 			payload_base_windows = NULL;
 		}
 
-			payload_scanned_record_count = index->payload_scanned_record_count;
-			payload_kept_record_count = index->record_count;
-			if (!count_only_mode && state.locator_only_payload_capture)
-			{
-				if (state.payload_block_states != NULL)
-				{
-					hash_destroy(state.payload_block_states);
-					state.payload_block_states = NULL;
-				}
-				fb_wal_finalize_record_stats(index);
-			}
-			else if (!count_only_mode && state.payload_block_states != NULL)
+		payload_scanned_record_count = index->payload_scanned_record_count;
+		payload_kept_record_count = index->record_count;
+		if (!count_only_mode && state.locator_only_payload_capture && locator_stub_stats_done)
+		{
+			if (state.payload_block_states != NULL)
 			{
 				hash_destroy(state.payload_block_states);
 				state.payload_block_states = NULL;
-				if (index->precomputed_missing_blocks != NULL)
-					index->precomputed_missing_block_count =
-						hash_get_num_entries(index->precomputed_missing_blocks);
 			}
-			else if (!count_only_mode)
-				fb_wal_finalize_record_stats(index);
-			index->payload_covered_segment_count = payload_covered_segment_count;
+			if (index->precomputed_missing_blocks != NULL)
+				index->precomputed_missing_block_count =
+					hash_get_num_entries(index->precomputed_missing_blocks);
+		}
+		else if (!count_only_mode && state.locator_only_payload_capture)
+		{
+			if (state.payload_block_states != NULL)
+			{
+				hash_destroy(state.payload_block_states);
+				state.payload_block_states = NULL;
+			}
+			fb_wal_finalize_record_stats(index);
+		}
+		else if (!count_only_mode && state.payload_block_states != NULL)
+		{
+			hash_destroy(state.payload_block_states);
+			state.payload_block_states = NULL;
+			if (index->precomputed_missing_blocks != NULL)
+				index->precomputed_missing_block_count =
+					hash_get_num_entries(index->precomputed_missing_blocks);
+		}
+		else if (!count_only_mode)
+			fb_wal_finalize_record_stats(index);
+		index->payload_covered_segment_count = payload_covered_segment_count;
 		index->payload_scanned_record_count = payload_scanned_record_count;
 		index->payload_kept_record_count = payload_kept_record_count;
 		index->payload_sparse_reader_resets += ctx->payload_sparse_reader_resets;
@@ -12958,7 +14382,7 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 		hash_destroy(state.count_only_xids);
 }
 
-Datum
+static Datum
 fb_wal_payload_window_contract_debug(PG_FUNCTION_ARGS)
 {
 	FbWalScanContext ctx;
@@ -12999,7 +14423,7 @@ fb_wal_payload_window_contract_debug(PG_FUNCTION_ARGS)
 		read_window.segment_count)));
 }
 
-Datum
+static Datum
 fb_wal_nonapply_image_spool_contract_debug(PG_FUNCTION_ARGS)
 {
 	FbWalRecordIndex index;
@@ -13063,7 +14487,7 @@ fb_wal_nonapply_image_spool_contract_debug(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(result));
 }
 
-Datum
+static Datum
 fb_wal_hint_fpi_payload_contract_debug(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
@@ -13072,7 +14496,7 @@ fb_wal_hint_fpi_payload_contract_debug(PG_FUNCTION_ARGS)
 		"true" : "false")));
 }
 
-Datum
+static Datum
 fb_wal_heap2_visible_payload_contract_debug(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
@@ -13082,6 +14506,74 @@ fb_wal_heap2_visible_payload_contract_debug(PG_FUNCTION_ARGS)
 }
 
 Datum
+pg_flashback_debug_unresolv_xid(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		Oid relid = PG_GETARG_OID(0);
+		TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+		MemoryContext oldcontext;
+		FbWalXidDebugResult *result;
+		TupleDesc tupdesc;
+
+		if (target_ts > GetCurrentTimestamp())
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("target timestamp must not be in the future")));
+
+		fb_require_archive_has_wal_segments();
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+		result = fb_wal_build_unresolved_xid_debug_result(relid, target_ts);
+		funcctx->user_fctx = result;
+
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("pg_flashback_debug_unresolv_xid must return a composite type")));
+		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	if (funcctx->call_cntr < ((FbWalXidDebugResult *) funcctx->user_fctx)->row_count)
+	{
+		FbWalXidDebugResult *result = (FbWalXidDebugResult *) funcctx->user_fctx;
+		FbWalXidDebugRow *row = &result->rows[funcctx->call_cntr];
+		Datum values[9];
+		bool nulls[9];
+		HeapTuple tuple;
+
+		MemSet(values, 0, sizeof(values));
+		MemSet(nulls, 0, sizeof(nulls));
+
+		values[0] = Int64GetDatum((int64) row->xid);
+		values[1] = CStringGetTextDatum(row->xid_role);
+		values[2] = CStringGetTextDatum(row->resolved_by);
+		values[3] = CStringGetTextDatum(row->fallback_reason);
+		if (row->top_xid_isnull)
+			nulls[4] = true;
+		else
+			values[4] = Int64GetDatum((int64) row->top_xid);
+		if (row->commit_ts_isnull)
+			nulls[5] = true;
+		else
+			values[5] = TimestampTzGetDatum(row->commit_ts);
+		values[6] = Int32GetDatum(row->summary_missing_segments);
+		values[7] = Int32GetDatum(row->fallback_windows);
+		values[8] = CStringGetTextDatum(row->diag);
+
+		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+	}
+
+	SRF_RETURN_DONE(funcctx);
+}
+
+static Datum
 fb_summary_xid_resolution_debug(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);
@@ -13133,7 +14625,6 @@ fb_summary_xid_resolution_debug(PG_FUNCTION_ARGS)
 	state.count_only_capture = false;
 	state.tail_capture_allowed = false;
 	state.defer_payload_body = true;
-	state.locator_only_payload_capture = false;
 	state.xact_summary_log = NULL;
 	state.xact_summary_label = NULL;
 
@@ -13253,7 +14744,7 @@ fb_summary_xid_resolution_debug(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }
 
-Datum
+static Datum
 fb_summary_xid_probe_debug(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);
@@ -13343,7 +14834,6 @@ fb_summary_xid_probe_debug(PG_FUNCTION_ARGS)
 	state.count_only_capture = false;
 	state.tail_capture_allowed = false;
 	state.defer_payload_body = true;
-	state.locator_only_payload_capture = false;
 	state.xact_summary_log = NULL;
 	state.xact_summary_label = NULL;
 
@@ -13370,8 +14860,9 @@ fb_summary_xid_probe_debug(PG_FUNCTION_ARGS)
 			fb_wal_visit_window(&ctx, &metadata_windows[i], fb_index_record_visitor, &state);
 	}
 	touched_in_metadata = fb_hash_has_xid(state.touched_xids, probe_xid);
-	probe_commit_ts_found =
-		TransactionIdGetCommitTsData(probe_xid, &probe_commit_ts, &probe_origin_id);
+	if (track_commit_timestamp)
+		probe_commit_ts_found =
+			TransactionIdGetCommitTsData(probe_xid, &probe_commit_ts, &probe_origin_id);
 
 	(void) fb_summary_fill_xact_statuses(&info,
 										 &ctx,
@@ -13658,7 +15149,7 @@ fb_summary_xid_probe_debug(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }
 
-Datum
+static Datum
 fb_target_snapshot_clog_status_debug(PG_FUNCTION_ARGS)
 {
 	int64 xid_input = PG_GETARG_INT64(0);
@@ -13725,7 +15216,7 @@ fb_target_snapshot_clog_status_debug(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }
 
-Datum
+static Datum
 fb_summary_payload_locator_plan_debug(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);
@@ -13784,7 +15275,6 @@ fb_summary_payload_locator_plan_debug(PG_FUNCTION_ARGS)
 	state.count_only_capture = false;
 	state.tail_capture_allowed = false;
 	state.defer_payload_body = true;
-	state.locator_only_payload_capture = false;
 	state.xact_summary_log = NULL;
 	state.xact_summary_label = NULL;
 

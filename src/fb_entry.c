@@ -64,28 +64,48 @@ typedef struct FbPreflightEstimate
 	uint64 total_bytes;
 } FbPreflightEstimate;
 
+typedef struct FbDmlProfileCounters
+{
+	TimestampTz target_ts;
+	TimestampTz query_now_ts;
+	bool window_supported;
+	const char *unsafe_reason;
+	uint64 total_ops;
+	uint64 insert_ops;
+	uint64 update_ops;
+	uint64 delete_ops;
+	uint64 vacuum_ops;
+	uint64 other_ops;
+} FbDmlProfileCounters;
+
+typedef struct FbDmlProfileDetailRow
+{
+	TimestampTz target_ts;
+	TimestampTz query_now_ts;
+	const char *op_kind;
+	const char *op_group;
+	uint64 op_count;
+	double op_pct;
+} FbDmlProfileDetailRow;
+
+typedef struct FbDmlProfileDetailResult
+{
+	uint32 row_count;
+	FbDmlProfileDetailRow *rows;
+} FbDmlProfileDetailResult;
+
+static char *fb_build_unsafe_detail(const FbRelationInfo *info,
+									const FbWalRecordIndex *index);
+static Oid fb_resolve_target_type_relid(FunctionCallInfo fcinfo);
+
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(fb_version);
 PG_FUNCTION_INFO_V1(fb_check_relation);
-PG_FUNCTION_INFO_V1(fb_archive_resolve_debug);
-PG_FUNCTION_INFO_V1(fb_apply_debug);
-PG_FUNCTION_INFO_V1(fb_keyed_key_debug);
-PG_FUNCTION_INFO_V1(fb_reverse_key_ops_debug);
-PG_FUNCTION_INFO_V1(fb_reverse_record_ops_debug);
-PG_FUNCTION_INFO_V1(fb_prepare_wal_scan_debug);
-PG_FUNCTION_INFO_V1(fb_replay_debug);
-PG_FUNCTION_INFO_V1(fb_recordref_debug);
-PG_FUNCTION_INFO_V1(fb_recordref_block_debug);
-PG_FUNCTION_INFO_V1(fb_recordref_lsn_debug);
-PG_FUNCTION_INFO_V1(fb_recordref_missing_spool_debug);
-PG_FUNCTION_INFO_V1(fb_progress_debug_set_clock);
-PG_FUNCTION_INFO_V1(fb_progress_debug_reset_clock);
-PG_FUNCTION_INFO_V1(fb_srf_mode_debug);
-PG_FUNCTION_INFO_V1(fb_wal_sidecar_debug);
 PG_FUNCTION_INFO_V1(fb_pg_flashback_support);
+PG_FUNCTION_INFO_V1(pg_flashback_dml_profile);
+PG_FUNCTION_INFO_V1(pg_flashback_dml_profile_detail);
 PG_FUNCTION_INFO_V1(pg_flashback);
-PG_FUNCTION_INFO_V1(fb_export_undo);
 
 /*
  * fb_require_target_ts_not_future
@@ -235,6 +255,203 @@ fb_record_kind_name(FbWalRecordKind kind)
 	}
 
 	return "unknown";
+}
+
+static const char *
+fb_record_kind_group_name(FbWalRecordKind kind)
+{
+	switch (kind)
+	{
+		case FB_WAL_RECORD_HEAP_INSERT:
+		case FB_WAL_RECORD_HEAP2_MULTI_INSERT:
+			return "insert";
+		case FB_WAL_RECORD_HEAP_UPDATE:
+		case FB_WAL_RECORD_HEAP_HOT_UPDATE:
+		case FB_WAL_RECORD_HEAP_INPLACE:
+			return "update";
+		case FB_WAL_RECORD_HEAP_DELETE:
+			return "delete";
+		case FB_WAL_RECORD_HEAP2_PRUNE:
+			return "vacuum";
+		default:
+			return "other";
+	}
+}
+
+static double
+fb_dml_profile_pct(uint64 count, uint64 total)
+{
+	if (total == 0)
+		return 0.0;
+
+	return ((double) count * 100.0) / (double) total;
+}
+
+static void
+fb_dml_profile_collect_counters(const FbWalRecordIndex *index,
+								FbDmlProfileCounters *counters_out)
+{
+	uint32 kind;
+
+	if (counters_out == NULL)
+		return;
+
+	MemSet(counters_out, 0, sizeof(*counters_out));
+	if (index == NULL)
+		return;
+
+	counters_out->target_ts = index->target_ts;
+	counters_out->query_now_ts = index->query_now_ts;
+	counters_out->window_supported = !index->unsafe;
+	counters_out->unsafe_reason = index->unsafe ?
+		fb_wal_unsafe_reason_name(index->unsafe_reason) : NULL;
+
+	for (kind = 1; kind < FB_WAL_RECORD_KIND_COUNT; kind++)
+	{
+		uint64 count = index->target_kind_counts[kind];
+
+		if (count == 0)
+			continue;
+
+		counters_out->total_ops += count;
+		switch ((FbWalRecordKind) kind)
+		{
+			case FB_WAL_RECORD_HEAP_INSERT:
+			case FB_WAL_RECORD_HEAP2_MULTI_INSERT:
+				counters_out->insert_ops += count;
+				break;
+			case FB_WAL_RECORD_HEAP_UPDATE:
+			case FB_WAL_RECORD_HEAP_HOT_UPDATE:
+			case FB_WAL_RECORD_HEAP_INPLACE:
+				counters_out->update_ops += count;
+				break;
+			case FB_WAL_RECORD_HEAP_DELETE:
+				counters_out->delete_ops += count;
+				break;
+			case FB_WAL_RECORD_HEAP2_PRUNE:
+				counters_out->vacuum_ops += count;
+				break;
+			default:
+				counters_out->other_ops += count;
+				break;
+		}
+	}
+}
+
+static FbDmlProfileDetailResult *
+fb_dml_profile_build_detail_result(const FbWalRecordIndex *index)
+{
+	FbDmlProfileCounters counters;
+	FbDmlProfileDetailResult *result;
+	uint32 kind;
+	uint32 row_count = 0;
+
+	result = palloc0(sizeof(*result));
+	if (index == NULL)
+		return result;
+
+	fb_dml_profile_collect_counters(index, &counters);
+	for (kind = 1; kind < FB_WAL_RECORD_KIND_COUNT; kind++)
+	{
+		if (index->target_kind_counts[kind] > 0)
+			row_count++;
+	}
+
+	result->row_count = row_count;
+	if (row_count == 0)
+		return result;
+
+	result->rows = palloc0(sizeof(*result->rows) * row_count);
+	row_count = 0;
+	for (kind = 1; kind < FB_WAL_RECORD_KIND_COUNT; kind++)
+	{
+		FbDmlProfileDetailRow *row;
+		uint64 count = index->target_kind_counts[kind];
+
+		if (count == 0)
+			continue;
+
+		row = &result->rows[row_count++];
+		row->target_ts = index->target_ts;
+		row->query_now_ts = index->query_now_ts;
+		row->op_kind = fb_record_kind_name((FbWalRecordKind) kind);
+		row->op_group = fb_record_kind_group_name((FbWalRecordKind) kind);
+		row->op_count = count;
+		row->op_pct = fb_dml_profile_pct(count, counters.total_ops);
+	}
+
+	return result;
+}
+
+static void
+fb_release_record_index(FbWalRecordIndex *index)
+{
+	if (index == NULL)
+		return;
+	if (index->target_snapshot_xids != NULL)
+	{
+		hash_destroy(index->target_snapshot_xids);
+		index->target_snapshot_xids = NULL;
+	}
+	if (index->xid_statuses != NULL)
+	{
+		hash_destroy(index->xid_statuses);
+		index->xid_statuses = NULL;
+	}
+	if (index->precomputed_missing_blocks != NULL)
+	{
+		hash_destroy(index->precomputed_missing_blocks);
+		index->precomputed_missing_blocks = NULL;
+	}
+}
+
+static void
+fb_build_dml_profile_index(FunctionCallInfo fcinfo,
+						   text *target_ts_text,
+						   FbWalRecordIndex *index_out)
+{
+	Oid relid;
+	TimestampTz target_ts;
+	FbRelationInfo info;
+	FbWalScanContext scan_ctx;
+	FbSpoolSession *spool = NULL;
+
+	if (index_out == NULL)
+		elog(ERROR, "FbWalRecordIndex must not be NULL");
+
+	relid = fb_resolve_target_type_relid(fcinfo);
+	target_ts = fb_parse_target_ts_text(target_ts_text);
+
+	MemSet(index_out, 0, sizeof(*index_out));
+	fb_progress_begin();
+
+	PG_TRY();
+	{
+		fb_progress_enter_stage(FB_PROGRESS_STAGE_VALIDATE, NULL);
+		fb_require_target_ts_not_future(target_ts);
+		fb_require_archive_dir();
+		fb_require_supported_target_relation(relid, &info);
+
+		spool = fb_spool_session_create();
+		fb_progress_enter_stage(FB_PROGRESS_STAGE_PREPARE_WAL, NULL);
+		fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
+		fb_wal_build_record_index(&info, &scan_ctx, index_out, FB_WAL_BUILD_FULL);
+
+		fb_spool_session_destroy(spool);
+		spool = NULL;
+		fb_progress_finish();
+		fb_runtime_cleanup_stale();
+	}
+	PG_CATCH();
+	{
+		if (spool != NULL)
+			fb_spool_session_destroy(spool);
+		fb_progress_abort();
+		fb_release_record_index(index_out);
+		fb_runtime_cleanup_stale();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 static const char *
@@ -678,10 +895,7 @@ fb_prepare_flashback_query(FbFlashbackQueryState *state,
 								  state->tupdesc,
 								  state->reverse,
 								  &state->fast_path);
-	fb_reverse_source_destroy(state->reverse);
-	state->reverse = NULL;
-	fb_spool_session_destroy(state->spool);
-	state->spool = NULL;
+	/* Parallel apply workers may still need reverse spill runs until query end. */
 }
 
 static void
@@ -849,12 +1063,119 @@ fb_check_relation(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }
 
+Datum
+pg_flashback_dml_profile(PG_FUNCTION_ARGS)
+{
+	FbWalRecordIndex index;
+	FbDmlProfileCounters counters;
+	TupleDesc tupdesc;
+	HeapTuple tuple;
+	Datum values[15];
+	bool nulls[15];
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_flashback_dml_profile must return a composite type")));
+
+	fb_build_dml_profile_index(fcinfo, PG_GETARG_TEXT_PP(1), &index);
+	fb_dml_profile_collect_counters(&index, &counters);
+
+	tupdesc = BlessTupleDesc(tupdesc);
+	MemSet(values, 0, sizeof(values));
+	MemSet(nulls, 0, sizeof(nulls));
+
+	values[0] = TimestampTzGetDatum(counters.target_ts);
+	values[1] = TimestampTzGetDatum(counters.query_now_ts);
+	values[2] = BoolGetDatum(counters.window_supported);
+	if (counters.unsafe_reason == NULL)
+		nulls[3] = true;
+	else
+		values[3] = CStringGetTextDatum(counters.unsafe_reason);
+	values[4] = Int64GetDatum((int64) counters.total_ops);
+	values[5] = Int64GetDatum((int64) counters.insert_ops);
+	values[6] = Float8GetDatum(fb_dml_profile_pct(counters.insert_ops,
+													 counters.total_ops));
+	values[7] = Int64GetDatum((int64) counters.update_ops);
+	values[8] = Float8GetDatum(fb_dml_profile_pct(counters.update_ops,
+													 counters.total_ops));
+	values[9] = Int64GetDatum((int64) counters.delete_ops);
+	values[10] = Float8GetDatum(fb_dml_profile_pct(counters.delete_ops,
+													 counters.total_ops));
+	values[11] = Int64GetDatum((int64) counters.vacuum_ops);
+	values[12] = Float8GetDatum(fb_dml_profile_pct(counters.vacuum_ops,
+													  counters.total_ops));
+	values[13] = Int64GetDatum((int64) counters.other_ops);
+	values[14] = Float8GetDatum(fb_dml_profile_pct(counters.other_ops,
+													  counters.total_ops));
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	fb_release_record_index(&index);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+Datum
+pg_flashback_dml_profile_detail(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext oldcontext;
+		FbWalRecordIndex index;
+		FbDmlProfileDetailResult *result;
+		TupleDesc tupdesc;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		fb_build_dml_profile_index(fcinfo, PG_GETARG_TEXT_PP(1), &index);
+		result = fb_dml_profile_build_detail_result(&index);
+		funcctx->user_fctx = result;
+
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("pg_flashback_dml_profile_detail must return a composite type")));
+		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+
+		fb_release_record_index(&index);
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	if (funcctx->call_cntr <
+		((FbDmlProfileDetailResult *) funcctx->user_fctx)->row_count)
+	{
+		FbDmlProfileDetailResult *result =
+			(FbDmlProfileDetailResult *) funcctx->user_fctx;
+		FbDmlProfileDetailRow *row = &result->rows[funcctx->call_cntr];
+		Datum values[6];
+		bool nulls[6];
+		HeapTuple tuple;
+
+		MemSet(values, 0, sizeof(values));
+		MemSet(nulls, 0, sizeof(nulls));
+		values[0] = TimestampTzGetDatum(row->target_ts);
+		values[1] = TimestampTzGetDatum(row->query_now_ts);
+		values[2] = CStringGetTextDatum(row->op_kind);
+		values[3] = CStringGetTextDatum(row->op_group);
+		values[4] = Int64GetDatum((int64) row->op_count);
+		values[5] = Float8GetDatum(row->op_pct);
+
+		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+	}
+
+	SRF_RETURN_DONE(funcctx);
+}
+
 /*
  * fb_archive_resolve_debug
  *    SQL entry point for regression-only archive source diagnostics.
  */
 
-Datum
+static Datum
 fb_archive_resolve_debug(PG_FUNCTION_ARGS)
 {
 	FbArchiveDirSource source;
@@ -875,7 +1196,7 @@ fb_archive_resolve_debug(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }
 
-Datum
+static Datum
 fb_prepare_wal_scan_debug(PG_FUNCTION_ARGS)
 {
 	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(0);
@@ -905,7 +1226,7 @@ fb_prepare_wal_scan_debug(PG_FUNCTION_ARGS)
  *    SQL entry point for regression-only index diagnostics.
  */
 
-Datum
+static Datum
 fb_recordref_debug(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);
@@ -989,7 +1310,7 @@ fb_recordref_debug(PG_FUNCTION_ARGS)
 	PG_END_TRY();
 }
 
-Datum
+static Datum
 fb_recordref_missing_spool_debug(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);
@@ -1007,7 +1328,7 @@ fb_recordref_missing_spool_debug(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text("unexpected success"));
 }
 
-Datum
+static Datum
 fb_recordref_block_debug(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);
@@ -1120,7 +1441,7 @@ fb_recordref_block_debug(PG_FUNCTION_ARGS)
 	PG_END_TRY();
 }
 
-Datum
+static Datum
 fb_recordref_lsn_debug(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);
@@ -1223,7 +1544,7 @@ fb_recordref_lsn_debug(PG_FUNCTION_ARGS)
 	PG_END_TRY();
 }
 
-Datum
+static Datum
 fb_replay_debug(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);
@@ -1286,7 +1607,7 @@ fb_replay_debug(PG_FUNCTION_ARGS)
  *    SQL entry point for regression-only apply diagnostics.
  */
 
-Datum
+static Datum
 fb_apply_debug(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);
@@ -1330,7 +1651,7 @@ fb_apply_debug(PG_FUNCTION_ARGS)
  *    SQL entry point for regression-only keyed state diagnostics.
  */
 
-Datum
+static Datum
 fb_keyed_key_debug(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);
@@ -1459,7 +1780,7 @@ fb_keyed_key_debug(PG_FUNCTION_ARGS)
 	PG_END_TRY();
 }
 
-Datum
+static Datum
 fb_reverse_key_ops_debug(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);
@@ -1554,7 +1875,7 @@ fb_reverse_key_ops_debug(PG_FUNCTION_ARGS)
 	PG_END_TRY();
 }
 
-Datum
+static Datum
 fb_reverse_record_ops_debug(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);
@@ -1663,7 +1984,7 @@ fb_reverse_record_ops_debug(PG_FUNCTION_ARGS)
  *    SQL entry point for regression-only sidecar diagnostics.
  */
 
-Datum
+static Datum
 fb_wal_sidecar_debug(PG_FUNCTION_ARGS)
 {
 	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
@@ -1689,7 +2010,7 @@ fb_wal_sidecar_debug(PG_FUNCTION_ARGS)
  *    SQL entry point for regression-only deterministic progress timing.
  */
 
-Datum
+static Datum
 fb_progress_debug_set_clock(PG_FUNCTION_ARGS)
 {
 	ArrayType  *values = PG_GETARG_ARRAYTYPE_P(0);
@@ -1744,14 +2065,14 @@ fb_progress_debug_set_clock(PG_FUNCTION_ARGS)
  *    SQL entry point for regression-only deterministic progress timing.
  */
 
-Datum
+static Datum
 fb_progress_debug_reset_clock(PG_FUNCTION_ARGS)
 {
 	fb_progress_debug_clear_clock();
 	PG_RETURN_VOID();
 }
 
-Datum
+static Datum
 fb_srf_mode_debug(PG_FUNCTION_ARGS)
 {
 	FuncCallContext *funcctx;
@@ -1893,7 +2214,7 @@ pg_flashback(PG_FUNCTION_ARGS)
  *    SQL entry point.
  */
 
-Datum
+static Datum
 fb_export_undo(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);

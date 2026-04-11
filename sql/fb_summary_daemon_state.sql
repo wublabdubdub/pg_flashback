@@ -90,19 +90,10 @@ SELECT service_enabled,
 	   daemon_state_published_at IS NOT NULL AS daemon_state_published_at_ok
 FROM pg_flashback_summary_progress;
 
-SELECT service_enabled,
-	   launcher_pid = 54321 AS daemon_pid_ok,
-	   registered_workers = 7 AS registered_workers_ok,
-	   active_workers = 6 AS active_workers_ok,
-	   scan_count = 99 AS scan_count_ok,
-	   build_count = 88 AS build_count_ok,
-	   cleanup_count = 77 AS cleanup_count_ok,
-	   last_scan_at IS NOT NULL AS last_scan_at_ok,
-	   state_source = 'external' AS debug_state_source_ok,
-	   daemon_state_present = true AS debug_daemon_state_present_ok,
-	   daemon_state_stale = false AS debug_daemon_state_stale_ok,
-	   daemon_state_published_at IS NOT NULL AS debug_daemon_state_published_at_ok
-FROM pg_flashback_summary_service_debug;
+SELECT to_regclass('pg_flashback_summary_service_debug') IS NULL
+	   AS no_public_service_debug_view,
+	   to_regprocedure('fb_summary_service_debug_internal()') IS NULL
+	   AS no_public_service_debug_internal;
 
 DO $$
 DECLARE

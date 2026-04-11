@@ -15,14 +15,24 @@ WHERE extname = 'pg_flashback';
 SELECT to_regprocedure('pg_flashback(text,text,text)') IS NOT NULL AS has_old_entry,
 	   to_regprocedure('pg_flashback(anyelement,text)') IS NULL AS no_new_entry;
 
-ALTER EXTENSION pg_flashback UPDATE TO '0.2.1';
+ALTER EXTENSION pg_flashback UPDATE TO '0.2.4';
 
-SELECT extversion = '0.2.1' AS at_new_version
+SELECT extversion = '0.2.4' AS at_new_version
 FROM pg_extension
 WHERE extname = 'pg_flashback';
 
 SELECT to_regprocedure('pg_flashback(text,text,text)') IS NULL AS no_old_entry,
-	   to_regprocedure('pg_flashback(anyelement,text)') IS NOT NULL AS has_new_entry;
+	   to_regprocedure('pg_flashback(anyelement,text)') IS NOT NULL AS has_new_entry,
+	   to_regprocedure('pg_flashback_dml_profile(anyelement,text)') IS NOT NULL
+	   AS has_dml_profile_entry,
+	   to_regprocedure('pg_flashback_dml_profile_detail(anyelement,text)') IS NOT NULL
+	   AS has_dml_profile_detail_entry,
+	   to_regprocedure('pg_flashback_debug_unresolv_xid(regclass,timestamptz)') IS NOT NULL
+	   AS has_unresolved_xid_debug_entry,
+	   to_regprocedure('fb_summary_service_debug_internal()') IS NULL
+	   AS no_summary_service_debug_internal,
+	   to_regclass('pg_flashback_summary_service_debug') IS NULL
+	   AS no_summary_service_debug_view;
 
 SET pg_flashback.show_progress = off;
 

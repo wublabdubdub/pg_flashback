@@ -9,8 +9,10 @@
   - `fb_version()`
   - `fb_check_relation(regclass)`
   - `pg_flashback(anyelement, text)`
+  - `pg_flashback_dml_profile(anyelement, text)`
+  - `pg_flashback_dml_profile_detail(anyelement, text)`
+  - `pg_flashback_debug_unresolv_xid(regclass, timestamptz)`
   - `pg_flashback_summary_progress` 视图
-  - `pg_flashback_summary_service_debug` 视图
 - 当前用户调用形态固定为：
   - `SELECT * FROM pg_flashback(NULL::schema.table, target_ts_text);`
 - 当前全表闪回落地策略固定为：
@@ -119,6 +121,18 @@
     - 若归档目录 / `pg_wal` / `recovered_wal` 中对应 segment 已不存在
     - 则对应 summary 索引文件也必须删除
     - 不能继续保留为“历史已构建但当前无源文件”的僵尸 summary
+- 当前新增公开 DML profile 入口已拍板：
+  - 入口同时提供：
+    - 单行汇总 `pg_flashback_dml_profile(anyelement, text)`
+    - 多行明细 `pg_flashback_dml_profile_detail(anyelement, text)`
+  - 统计口径固定为：
+    - 精确 WAL/index 统计
+    - 按当前 replay/WAL `kind` 计操作数
+    - `HEAP2_MULTI_INSERT` 按 1 次操作计，不按 tuple 数计
+  - 汇总层需要暴露：
+    - `total_ops`
+    - `insert/update/delete/vacuum/other` 计数与比例
+  - 明细层需要暴露当前支持的 `FbWalRecordKind` 分布
 - 开发期调试约定补充：
   - 手工导出 / 保留 core dump、gdb 临时 core 文件时，统一使用 `/isoTest/tmp`
   - 不再使用 `/tmp` 作为本项目的临时 core 落盘路径
@@ -136,6 +150,689 @@
     - 仍必须继续修到 `84/AE079278 / blk=216125 / failed to replay heap insert` 的真实根因为止
 
 ## 当前进行中
+
+- 2026-04-11 已启动公开 DML profile 用户入口：
+  - 目标：
+    - 新增 `pg_flashback_dml_profile(anyelement, text)`
+    - 新增 `pg_flashback_dml_profile_detail(anyelement, text)`
+  - 统计口径：
+    - 精确 WAL/index 统计
+    - 只建 record index，不进入 replay/apply
+    - 按当前 replay/WAL kind 计操作数
+  - 当前实现状态：
+    - 已补 `FbWalRecordKind` 级计数
+    - 已补 SQL 安装面与 `0.2.3 -> 0.2.4` 升级链
+    - 已补 `fb_user_surface` / `fb_extension_upgrade` / `fb_dml_profile` 回归资产
+    - `fb_dml_profile.sql` 已修成可重复执行，不再因残留测试表在 `CREATE TABLE` 处失败
+  - 14pg 当前验证状态：
+    - `PG_CONFIG=/home/14pg/local/bin/pg_config make clean && make && make install` 已完成
+    - 临时 14pg 集群已确认 `0.2.4` 对外安装面包含
+      `pg_flashback_dml_profile(anyelement, text)` 与
+      `pg_flashback_dml_profile_detail(anyelement, text)`
+    - 手工执行 `sql/fb_dml_profile.sql` 时，setup + DML 阶段可通过
+    - 但完整 profile 查询在 14pg 临时实例上仍会长时间停留在
+      `fb_wal_build_record_index() -> fb_build_summary_span_visit_windows()`
+      的 on-demand summary rebuild 路径，尚未拿到一次完整的 fresh pass 证据
+  - 下一步：
+    - 继续收口 14pg on-demand summary rebuild 热点
+    - 补一轮 fresh 14pg 完整 profile 通过证据
+    - 同步开源镜像
+
+- 2026-04-11 已修复 14pg `scenario_oa_50t_50000r.documents @ 2026-04-11 07:40:40.223683+00`
+  在 `5/9 replay warm` 后看似“卡死”的进度盲区：
+  - 现场 SQL：
+    - `select * from pg_flashback(NULL::"scenario_oa_50t_50000r"."documents", '2026-04-11 07:40:40.223683+00') order by id;`
+  - 当前复现与证据：
+    - 14pg 实机复现中，`5/9 100% replay warm` 仍可单段耗时约 `47s-64s`
+    - 但用户感知“卡死”窗口里的 backend 实际已进入：
+      - `fb_replay_final_build_reverse_source()`
+      - `fb_replay_build_prune_lookahead()`
+      - `fb_wal_record_cursor_read()`
+      - `fb_wal_record_materializer_load_record(... include_payload=true)`
+      - `XLogReadRecord()` / `WALRead()` / `pread64()`
+    - `pg_stat_activity` 同时显示 backend 仍为 `active`，
+      等待点落在 `WALRead` / `BufFileRead`
+    - 已确认 root cause 不是 warm 死循环或锁等待，而是：
+      - `fb_replay_final_build_reverse_source()` 先执行
+        `fb_replay_build_prune_lookahead()`
+      - 再调用 `fb_replay_progress_enter(&final_control)`
+      - 导致 `6/9 replay final and build forward ops` 的前置重活
+        完全落在 `5/9 100%` 之后、`6/9 0%` 之前的无进度空窗里
+      - 用户侧会误判为“SQL 卡死在 5/9”
+  - 当前实现已收口为：
+    - 新增 `fb_replay_prepare_final_control()`
+    - final 阶段当前改为：
+      - 先设置 `final_control.phase = FB_REPLAY_PHASE_FINAL`
+      - 立刻进入 `6/9`
+      - 再执行 `fb_replay_build_prune_lookahead()`
+    - 新增 regression-only 合约入口
+      `fb_replay_final_progress_contract_debug()`
+      锁住 “prune lookahead 启动时当前 progress stage 已经是 `6/9`”
+  - 当前验证状态：
+    - 14pg 重新
+      `make clean && make && make install`
+      `PG_CONFIG=/home/14pg/local/bin/pg_config`
+      通过
+    - 新增单测：
+      - `make PG_CONFIG=/home/14pg/local/bin/pg_config installcheck REGRESS=fb_replay_final_progress PGUSER=14pg`
+      - 结果：`All 1 tests passed.`
+  - 下一步：
+    - 同步开源镜像
+
+- 2026-04-11 已修复 14pg `scenario_oa_50t_50000r.users`
+  闪回失败主链：
+  - root cause 1：
+    - 旧 `meta/summary` sidecar 沿用旧版 summary 格式
+    - PG14 `XLOG_HEAP2_VACUUM` 没有被旧 sidecar 纳入 summary-backed payload replay
+    - 导致 toast 页 `1663/4629021/4629070 blk 0` 未回收 dead tuple storage
+    - 后续在 `B/0315E678` 重放 `heap insert off=36` 时空间不足报错
+  - root cause 2：
+    - query 初始化阶段在 `fb_apply_begin()` 后立刻销毁
+      `state->reverse/state->spool`
+    - parallel apply worker 随后再打开 reverse-run spill 文件时命中
+      `could not open fb spill file`
+  - 当前实现已收口为：
+    - `FB_SUMMARY_VERSION` 前滚到 `12`
+    - 强制淘汰未携带 PG14 `HEAP2_VACUUM` 的旧 summary sidecar
+    - `fb_prepare_flashback_query()` 不再提前释放 reverse/spool，
+      生命周期延后到 query release
+    - 清理本轮为该问题添加的 summary/vacuum 临时 WARNING 日志
+  - 当前验证状态：
+    - 14pg 重新 `make && make install` 已完成
+    - 已清空 `/isoTest/14pgdata/pg_flashback/meta/summary`
+      并用新版本 `summaryd` 重建 sidecar
+    - 新 summary 文件头已确认版本字节为 `0c 00`（v12）
+    - 原始现场 SQL：
+      `select * from pg_flashback(NULL::scenario_oa_50t_50000r.users, '2026-04-11 07:40:40.223683+00') order by id;`
+      在 14pg 上复跑退出码为 `0`
+      且结果文件 `/tmp/pg_flashback_users_verify.out`
+      已生成 `50011` 行输出
+  - 下一步：
+    - 同步开源镜像
+
+- 2026-04-11 已收口 `3/9 build record index` 的 payload notice 语义：
+  - 现场已确认：
+    - `NOTICE: [3/9 70%] ... payload`
+      只是 payload 子阶段起点
+    - `NOTICE: [3/9 100%] ... payload`
+      才是 payload 子阶段完成
+    - 两条当前共用同一个 `payload` 标签，用户侧会误读成同一事件重复打印
+  - 当前实现已改为：
+    - 删除对外 `70% payload` notice
+    - 保留 `100% payload` 作为 payload 子阶段完成信号
+    - `expected/fb_progress.out` 已同步锁住新的 notice 口径
+  - 当前验证状态：
+    - `make PG_CONFIG=/home/14pg/local/bin/pg_config src/fb_wal.o` 通过
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config src/fb_wal.o` 通过
+    - 运行时回归暂被当前工作树里的既有装载问题阻塞：
+      - `could not load library ".../pg_flashback.so": undefined symbol: shmem_request_hook`
+    - 该阻塞出现在本次为 PG14 执行 `make install` 后的现有工作树整体装载面，不是本次 notice 改动本身的语义风险
+  - 下一步：
+    - 待当前工作树装载问题收口后，补跑 `fb_progress` / 最小手工 notice 验证
+
+- 2026-04-11 已完成公开 summary service 调试视图收口：
+  - 已删除当前公开安装面：
+    - `pg_flashback_summary_service_debug`
+    - `fb_summary_service_debug_internal()`
+  - 用户侧 summary 观测当前只保留：
+    - `pg_flashback_summary_progress`
+  - 兼容性口径已收口为：
+    - 扩展版本前滚到 `0.2.3`
+    - 已补 `sql/pg_flashback--0.2.2--0.2.3.sql`
+    - 共享库内仍保留历史升级链所需 symbol，避免 `0.1.0 -> 0.2.3`
+      中途经过旧脚本时缺符号
+  - 当前验证状态：
+    - `make clean && make && make install`
+      `PG_CONFIG=/home/18pg/local/bin/pg_config` 通过
+    - 临时 PG18 实例下已确认：
+      - `CREATE EXTENSION pg_flashback` 后
+        `pg_flashback_summary_service_debug` / `fb_summary_service_debug_internal()`
+        均不存在
+      - `CREATE EXTENSION pg_flashback VERSION '0.1.0'`
+        后升级到 `0.2.3` 通过，且上述对象同样不存在
+  - 下一步：
+    - 同步开源镜像
+
+- 2026-04-11 已确认继续收口共享库内自用 debug helper：
+  - 本轮目标：
+    - 删除默认不安装、仅供研发手工 `CREATE FUNCTION` 挂载的 debug SQL helper 导出
+    - 删除它们对应的默认回归入口与文档引用
+  - 保留边界：
+    - 保留明确给用户使用的公开入口
+    - 保留 `fb_pg_flashback_support`
+    - 保留 `fb_summary_progress_internal()` 作为公开视图底座
+  - 当前实现已继续前推到：
+    - 历史版本安装/升级 SQL 也不再创建
+      `fb_summary_service_debug_internal()` /
+      `pg_flashback_summary_service_debug`
+    - `fb_summary_service_debug_internal()` 已可从共享库导出面物理删除
+  - 当前验证状态：
+    - `nm -D pg_flashback.so` 已确认剩余 fmgr 导出只剩：
+      - `fb_version`
+      - `fb_check_relation`
+      - `fb_pg_flashback_support`
+      - `fb_summary_progress_internal`
+      - `pg_flashback`
+      - `pg_flashback_debug_unresolv_xid`
+    - PG18 临时实例已确认：
+      - `CREATE EXTENSION pg_flashback` 成功
+      - `CREATE EXTENSION pg_flashback VERSION '0.1.0'`
+        后升级到 `0.2.3` 成功
+      - 两条路径下
+        `fb_summary_service_debug_internal()` /
+        `pg_flashback_summary_service_debug`
+        都不存在
+    - 验证过程中顺手修复了 PG18 装载阻塞：
+      - 扩展内文件 IO 已统一走 `FileReadV/FileWriteV` 兼容包装
+      - 重新按 PG18 全量重编扩展对象，避免旧版本残留 `.o`
+        把 `< PG15` 的 GUC 占位符符号重新带回 `.so`
+  - 下一步：
+    - 同步开源镜像
+
+- 2026-04-11 已修复 `3/9 build record index` 并行 payload 收尾重扫过慢：
+  - 现场 root cause 已收口为：
+    - `fb_wal_payload_merge_log()` 旧逻辑只做 worker spool 原样拼接
+    - 主进程缺少并行 payload 的增量统计与 `precomputed_missing_blocks`
+    - 最终必然落回 `fb_wal_finalize_record_stats()`
+      对整份 merged `record_log` 做第二次全量扫盘
+    - `gdb` 现场已确认旧热点栈位于：
+      - `fb_spool_read_exact()`
+      - `fb_wal_record_cursor_read_skeleton()`
+      - `fb_wal_finalize_record_stats()`
+  - 当前修复已落地：
+    - `src/fb_wal.c`
+      - 并行 payload merge 改为按 entry 读取 worker spool，
+        在合并时同步执行：
+        - `fb_index_note_materialized_record()`
+        - `fb_wal_note_precomputed_missing_blocks()`
+      - 非 locator-only 并行 payload 路径会在进入 worker merge 前
+        先初始化增量统计状态
+      - 若 merge 期发现无法就地统计的 entry，
+        会主动释放增量状态并回退到旧 finalize 路径，
+        避免错误统计
+    - `sql/fb_wal_parallel_payload.sql`
+      - 已补并行/串行 `payload_scanned_records`
+        与 `payload_kept_records` 一致性断言
+  - 当前验证状态：
+    - `make PG_CONFIG=/home/14pg/local/bin/pg_config src/fb_wal.o`
+      通过
+    - `make PG_CONFIG=/home/14pg/local/bin/pg_config install`
+      通过
+    - 14pg 现场复核同一条查询：
+      - `scenario_oa_50t_50000r.documents @ 2026-04-11 07:40:40.223683+00`
+      - `3/9 100% payload` 已从原先约 `67.7s`
+        降到本次复核的约 `20.8s-25.4s`
+    - 新版 `gdb` 抽样已确认 backend 热点转移到：
+      - `fb_replay_build_prune_lookahead()`
+      - `fb_replay_final_build_reverse_source()`
+      - 不再落在 `fb_wal_finalize_record_stats()`
+  - 下一步：
+    - 等 `fb_wal_parallel_payload.sql` 手工回归收完，
+      再补开源镜像同步
+    - 继续观察 6/9 replay final 的新主热点是否还需要单独优化
+
+- 2026-04-11 已定位 `scenario_oa_50t_50000r.documents @ 2026-04-11 07:40:40.223683+00`
+  的新 `3/9 payload` 热点：
+  - 现场 SQL：
+    - `select * from pg_flashback(NULL::"scenario_oa_50t_50000r"."documents", '2026-04-11 07:40:40.223683+00') order by id;`
+  - 当前复现状态：
+    - 冷缓存首轮复现：
+      - `3/9 30% metadata` `+3618.439 ms`
+      - `3/9 55% xact-status` `+2135.440 ms`
+      - `3/9 100% payload` `+62055.147 ms`
+      - 随后在 replay preflight 报
+        `estimated flashback working set exceeds pg_flashback.memory_limit`
+    - 热缓存复现：
+      - `3/9 100% payload` 仍稳定在约 `23.7s-25.6s`
+      - 同样在 preflight 以
+        `estimated=1848643616 bytes limit=1073741824 bytes`
+        结束
+  - 现场证据已确认这次慢点不是：
+    - `summary-span` / locator plan
+    - payload fallback 扫描真实 WAL 窗口
+    - locator-first 主路径里的全量 payload body 写 spool
+  - `gdb` 活体抽样两次都确认 backend 长时间停留在：
+    - `fb_wal_finalize_record_stats()`
+    - `fb_wal_record_cursor_read_skeleton()`
+    - `fb_spool_cursor_read()` / `fb_spool_read_exact()`
+  - 第二个 payload 期样本进一步确认当前真实调用链为：
+    - `fb_wal_finalize_record_stats()`
+    - `fb_wal_record_cursor_read_skeleton()`
+    - `fb_wal_record_materializer_load_record(... include_payload=false)`
+    - `XLogBeginRead()` / `XLogReadRecord()`
+    - `fb_wal_read_page()` / `WALRead()`
+  - 对应代码路径已经对上：
+    - `payload_locator_count > 0 && parallel_workers > 1`
+      时先走 `fb_index_append_locator_stub()`，
+      并把 `state.locator_only_payload_capture = true`
+    - payload 收尾随后命中
+      `fb_wal_build_record_index()` 里的
+      `fb_wal_finalize_record_stats(index)`
+    - finalize 顺扫 spool 时遇到 `locator_only` entry，
+      会在 `fb_wal_record_cursor_read_mode()`
+      里调用 `fb_wal_record_materializer_load_record()`
+      再按 LSN 回读原始 WAL skeleton
+  - 当前根因判断：
+    - 这次现场不是“summary 不够好”或“locator-first 没生效”
+    - 而是 `locator-only payload stub` fast path 之后，
+      payload 收尾仍要顺扫整份 spool
+    - 对每个 `locator_only` stub，
+      finalize 还会再按 `record_lsn` 回读原始 WAL，
+      只为重新累计：
+      - kept / target record stats
+      - `precomputed_missing_blocks`
+    - 结果变成：
+      - 先把 payload 写成大量 locator stub
+      - 再把这些 stub 全量顺扫一遍
+      - 顺扫过程中再按 LSN 二次触发 `XLogReadRecord`
+    - 这条链已经把 `locator-only` 节省下来的 payload body 物化收益又吃回去一大截
+  - `/proc/<pid>/io` 证据：
+    - 第一次冷缓存 payload 期采样到：
+      - `write_bytes` 约 `522 MB`
+      - query 结束后 `read_bytes` 从约 `375 MB`
+        增到约 `1182 MB`
+      - 说明 payload 后段主要在回读，而不是继续写 payload spool
+    - 热缓存复跑时，8 秒内：
+      - `rchar` 从约 `20.19 GB` 增到约 `23.03 GB`
+      - `syscr` 从约 `3654 万` 增到约 `4150 万`
+      - `read_bytes` 基本不变
+      - 说明热点已变成缓存命中的高频 spool/WAL reread
+  - 当前结论：
+    - 这次 `3/9 payload` 的真实热点已经收口为：
+      `locator-only finalize reread`
+    - 下一轮优化要打的不是 summary 覆盖率，
+      而是让 `locator-only` 路径也能像之前的并行 payload merge 一样，
+      避免最终再次落回 `fb_wal_finalize_record_stats()`
+  - 当前已完成第一阶段优化：
+    - 保留 `locator-only stub` 作为最终 `record_log`
+    - 没再沿用“直接把 locator 改写成 deferred skeleton record”的错误实现
+    - 改为新增并行 `locator stats sidecar`：
+      - worker 第一次按 locator 读取原始 WAL 时，
+        直接产出轻量 `payload stats` sidecar
+        与 `missing-block` sidecar
+      - leader 合并 sidecar 后，直接恢复：
+        - kept / target DML 统计
+        - `precomputed_missing_blocks`
+      - 纯 `locator-only` 场景不再落回
+        `fb_wal_finalize_record_stats()`
+  - 当前验证状态：
+    - `make PG_CONFIG=/home/14pg/local/bin/pg_config src/fb_wal.o` 通过
+    - `make PG_CONFIG=/home/14pg/local/bin/pg_config pg_flashback.so` 通过
+    - `make PG_CONFIG=/home/14pg/local/bin/pg_config install` 通过
+    - 活体 `gdb` 已确认 payload 期 leader 不再停在
+      `fb_wal_finalize_record_stats()`，
+      而是在等待并行 payload worker 回传 sidecar
+    - 同一现场 SQL 复跑结果：
+      - 改造前热缓存：
+        - `3/9 100% payload` 约 `23.7s-25.6s`
+      - 改造后热缓存：
+        - `3/9 100% payload` 约 `19.0s-21.1s`
+      - 改造后冷样本：
+        - `3/9 100% payload` `+57528.205 ms`
+        - 相比最初现场 `+70520.220 ms`
+          下降约 `12.99s`，约 `18.4%`
+  - 当前边界：
+    - 本轮只收口了
+      `payload_locator_fallback_base_count == 0`
+      的纯 `locator-only / 100% summary` 场景
+    - mixed `locator + fallback windows`
+      仍保留原 finalize 兜底语义
+  - 继续沿同一现场做冷跑剖面后，新的主热点已收口为：
+    - payload worker 冷读原始 WAL 本身，而不是 leader 收尾
+    - 活体抓栈已确认 worker 卡在：
+      - `pread64()`
+      - `WALRead()`
+      - `fb_wal_read_page()`
+      - `XLogReadRecord()`
+      - `fb_wal_visit_window_batch()`
+    - 冷跑采样时，worker 实际磁盘读量已明显偏大：
+      - worker `1244292`：
+        - `read_bytes = 2176782336`
+        - `window_count = 53`
+      - worker `1244297`：
+        - `read_bytes = 3583311872`
+        - `window_count = 53`
+      - 说明当前冷跑主成本已经转成 payload worker 的大体量 WAL 冷读
+  - 当前代码级 root cause 判断：
+    - `fb_build_payload_locator_visit_windows()` 当前按
+      `gap_limit = max(wal_seg_size / 8, XLOG_BLCKSZ * 8)`
+      合并 locator run，见 `src/fb_wal.c`
+    - 但 run 一旦形成，`read_end_lsn` 会直接扩到 run 末 segment 尾
+    - 后续 `fb_wal_prepare_payload_read_window()` 又把
+      `start_lsn` 直接回退到 run 首 segment 头，
+      必要时再额外借前一整个 segment
+    - 结果是：
+      - locator-run 的实际读取粒度接近“整段/整组 segment 扫描”
+      - 不是“围绕 locator 的局部精确读取”
+      - 如果同一 segment 上有多个 window，
+        worker 还会多次从 segment 头重新找首条 record
+      - 并行分片当前按 `window_count` 平分，
+        不是按 segment/byte locality 分，
+        冷跑时容易把同一 segment 的读取成本放大
+  - 下一步：
+    - 冷跑优先的下一轮优化应先打：
+      - locator visit window 的读取粒度
+      - locator 并行任务的 segment/locality 分片
+    - mixed `locator + fallback` 的 finalize 收口暂后置
+  - 2026-04-11 新约束已拍板：
+    - locator 路径严禁再通过 `fb_wal_prepare_payload_read_window()`
+      把 `start_lsn` 回退到 run 首 segment 头
+    - locator 路径严禁再为 decode 目的额外借前一整个 segment
+    - locator 合并若存在，也必须严格由 summary locator 驱动，
+      不得退化成“按整段 WAL 扩窗读取”
+  - 按上述约束完成实现后，冷跑复核结果：
+    - locator 路径已改成 strict summary-exact read：
+      - 不再经过 `fb_wal_prepare_payload_read_window()`
+      - 不再在 locator worker 路径调用 `fb_wal_visit_window_batch()`
+    - locator stats worker 分片也已改成：
+      - 按 summary locator 数量切分
+      - 尽量在 segment 边界收口
+      - 不再按 merged window 数量均分
+    - 当前冷缓存现场 SQL：
+      - `3/9 100% payload` 约 `+61948.428 ms`
+  - 这轮后的新热点已确认收口为：
+    - exact locator 冷读原始 WAL：
+      - 活体 worker 栈：
+        - `pread64()`
+        - `WALRead()`
+        - `fb_wal_read_page()`
+        - `XLogReadRecord()`
+        - `fb_wal_visit_payload_locators_exact()`
+      - 分片不均衡已明显改善：
+        - 旧样本约 `1605499 / 717750 / 248227`
+        - 新样本约 `732270 / 726796 / 726521 / 729119`
+      - 但单 worker 仍有约 `0.6GB ~ 1.3GB`
+        实际冷读
+    - `precomputed_missing_blocks` 的 hash 构建：
+      - 活体 worker 栈已落到：
+        - `element_alloc()`
+        - `hash_search(HASH_ENTER)`
+        - `fb_wal_note_precomputed_missing_blocks()`
+      - 说明在 strict locator 路径下，
+        missing-block 记账已经成为新的 CPU/内存热点
+  - 下一步：
+    - 冷跑优先的下一轮优化应改成：
+      - exact locator 冷读的去重/页缓存复用
+      - `precomputed_missing_blocks` 的 hash 插入成本
+
+- 2026-04-11 已修复 unresolved xid 调试口径误报：
+  - 现场 root cause 已收口为 `fb_wal_xid_debug_fallback_reason()` 优先级错误：
+    - 旧逻辑先判断 `!all_assignment_found`
+    - 即使同一 xid 已经满足：
+      - `resolved_by = exact_all`
+      - `all_outcome_found = true`
+      - `span_outcome_found = false`
+    - 仍会被误报成 `summary_missing_assignment`
+  - 当前修复已落地：
+    - `src/fb_wal.c`
+      - 先识别并返回：
+        - `summary_outcome_outside_span`
+        - `summary_assignment_outside_span`
+      - 只有在全局 summary 里也确实找不到 assignment 时
+        才继续返回 `summary_missing_assignment`
+    - `sql/fb_unresolved_xid_debug.sql`
+      - 已补最小回归，锁住：
+        - `resolved_by = exact_all`
+        - `diag` 含 `all_outcome_found=true`
+        - 不得再报 `summary_missing_assignment`
+  - 当前验证状态：
+    - `PG14` 下已完成重新编译与安装
+    - 由于本机现有 14pg 集群上的 `fb_summary_build_available_debug()`
+      现场执行时间异常长，runtime 复核还在继续收口
+  - 下一步：
+    - 在干净 summary 现场补完这条回归的 runtime 复核
+    - 继续观察是否还存在真正的 `summary_missing_assignment` 案例
+
+- 2026-04-11 已完成 14pg external summary progress 时间戳为空修复：
+  - 已确认不是 `pg_flashback_summary_progress` 视图读值问题
+  - 现场 root cause 已收口为 standalone build chain：
+    - `make clean` 之前不会删除 `summaryd/*.o` / `summaryd/vendor/*.o`
+    - 14pg setup 可继续复用其他 PG 版本残留的 standalone vendor 对象
+    - 结果是 daemon 侧 `XLogReaderState` 布局与当前 PG14 头文件口径错配
+    - 进一步表现为：
+      - `summaryd/fb_summaryd_standalone_shim.c`
+        的首条 record 兼容扫描在 `memcpy(state->readBuf, ...)`
+        处崩溃或读到空 summary
+      - `pg_flashback_summary_progress`
+        持续不显示 `stable_oldest_ts/stable_newest_ts`
+  - 当前修复已落地：
+    - `Makefile`
+      - `clean` 已补齐 standalone summaryd binary / object 清理
+      - PG14 build 已切换到匹配的 vendor 源：
+        - `summaryd/vendor/xlogreader_pg14.c`
+        - `summaryd/vendor/xactdesc_pg14.c`
+        - `summaryd/vendor/dynahash_pg14.c`
+    - `summaryd/fb_summaryd_standalone_shim.c`
+      - 已补 PG18 `FileReadV/FileWriteV` 兼容实现
+      - 保持 PG14-17 继续走本地 `FileRead/FileWrite`
+    - `tests/release_gate/bin/selftest.sh`
+      - 已锁住：
+        - `make clean` 必须清 standalone 产物
+        - PG14 build 必须命中 PG14 vendor 源
+        - PG18 build 继续命中当前 vendor 源
+  - 当前验证已完成：
+    - `make PG_CONFIG=/home/14pg/local/bin/pg_config clean && make ... summaryd/pg_flashback-summaryd`
+      通过
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config clean && make ... summaryd/pg_flashback-summaryd`
+      通过
+    - 14pg 真环境前台执行
+      `./summaryd/pg_flashback-summaryd --config ... --foreground --once`
+      后：
+      - `meta/summary/` 已落出非空 summary 文件
+      - 现场抽样 summary 大小恢复到 `~0.5MB-1.2MB`
+      - `352 bytes` 空 header 文件数为 `0`
+      - `pg_flashback_summary_progress`
+        已显示：
+        - `stable_oldest_ts = 2026-04-11 03:39:10.584043-04`
+        - `stable_newest_ts = 2026-04-11 04:25:19.338981-04`
+  - 下一步：
+    - 用 14pg 再走一轮 watchdog / bootstrap setup 真实安装路径，确认同口径二进制也稳定恢复
+
+- 2026-04-11 已完成 14pg 一键安装 `CREATE EXTENSION` 缺符号修复：
+  - 现场 root cause 已收口为 bootstrap 构建阶段缺少强制 clean：
+    - `scripts/b_pg_flashback.sh` 原先只执行 `make && make install`
+    - 当工作树残留旧对象文件 / 旧 `pg_flashback.so` 时
+      可能把新的 `sql/pg_flashback--0.2.2.sql`
+      和旧二进制一起安装到 `/home/14pg/local`
+    - 最终在 `CREATE EXTENSION pg_flashback`
+      执行到
+      `pg_flashback_debug_unresolv_xid(regclass, timestamptz)`
+      时命中
+      `could not find function "pg_flashback_debug_unresolv_xid" in file .../pg_flashback.so`
+  - 当前修复已落地：
+    - `scripts/b_pg_flashback.sh`
+      在 setup 的 `Build / Install` 阶段固定先执行
+      `make clean`
+      再执行 `make` / `make install`
+    - 同时继续追到 14pg 真实 root cause：
+      - 磁盘上的 `/home/14pg/local/lib/postgresql/pg_flashback.so`
+        已经导出
+        `pg_flashback_debug_unresolv_xid`
+      - 但 `SHOW shared_preload_libraries;`
+        仍返回 `pg_flashback`
+      - 说明 postmaster 还持有旧版预加载库映像；
+        未重启时即使磁盘 `.so` 已更新，
+        `CREATE EXTENSION` 仍会命中旧映像并报缺符号
+    - `scripts/b_pg_flashback.sh`
+      已新增 legacy preload 收口：
+      - 若检测到 `shared_preload_libraries`
+        仍包含 `pg_flashback`
+      - 自动重写 `postgresql.conf` /
+        `postgresql.auto.conf` 中的
+        `shared_preload_libraries`
+        去掉 `pg_flashback`
+      - 自动执行一次
+        `pg_ctl -D "$PGDATA" restart -m fast -w`
+      - 重启后再次校验 preload 已不再包含
+        `pg_flashback`
+      - 再继续执行 `CREATE EXTENSION` / `ALTER EXTENSION UPDATE`
+    - `tests/release_gate/bin/selftest.sh`
+      已新增顺序断言，锁住 bootstrap 构建顺序必须为：
+      `make clean -> make -> make install`
+      并锁住 legacy preload 处理入口仍在
+    - `README.md` / `open_source/pg_flashback/README.md`
+      已补：
+      - bootstrap 会自动移除 legacy preload 并重启
+      - 手工安装需要先 `make clean`
+      - 若仍有 `shared_preload_libraries = 'pg_flashback'`
+        需先移除并重启
+  - 下一步：
+    - 用 14pg 重新执行一次 bootstrap setup，确认
+      “legacy preload + 旧构建产物” 组合现场也不会再报缺符号
+
+- 2026-04-11 已完成 summary watchdog / cron 自恢复模型收口：
+  - 已拍板：
+    - `scripts/pg_flashback_summary.sh` 的对外控制面只保留：
+      - `start`
+      - `stop`
+      - `status`
+    - runner 不再要求用户手工传 `--config` / `--pid-file` /
+      `--log-file` / `--summaryd-bin`
+    - bootstrap 固定写：
+      - `~/.config/pg_flashback/pg_flashback-summaryd.conf`
+    - runner 固定管理：
+      - `~/.config/pg_flashback/pg_flashback-summaryd.watchdog.pid`
+      - `~/.config/pg_flashback/pg_flashback-summaryd.pid`
+      - `~/.config/pg_flashback/pg_flashback-summaryd.log`
+    - `start` 启动的不是单个 child daemon，而是 shell watchdog：
+      - watchdog 每 `1s` 检查 `summaryd` child
+      - child 丢失则自动拉起
+    - `scripts/b_pg_flashback.sh setup`
+      额外安装当前数据库 OS 用户的 `crontab`
+      保活项：
+      - `* * * * * scripts/pg_flashback_summary.sh start`
+      - `cron` 只负责保证 watchdog 存在
+      - `1s` 级自恢复仍由 watchdog 承担
+    - `scripts/b_pg_flashback.sh --remove`
+      需要同时清理：
+      - watchdog
+      - child daemon
+      - cron entry
+      - config / pid / log
+    - `summaryd` 遇到“缺 WAL / decode-tail 缺段 / 打开候选段命中 `ENOENT`”
+      一类现场时，语义收口为：
+      - 记录等待态
+      - 保持进程存活
+      - 等下一轮重试
+      - 不允许把服务生命周期交给异常退出
+  - 当前文档已补：
+    - `docs/specs/2026-04-11-summaryd-watchdog-and-cron-design.md`
+    - `docs/decisions/ADR-0036-summaryd-watchdog-and-cron-supervision.md`
+    - `docs/architecture/overview.md`
+  - 当前实现已补：
+    - `scripts/pg_flashback_summary.sh`
+      已切到固定路径 watchdog 模型，并完成 child 自恢复
+    - `scripts/b_pg_flashback.sh`
+      已改成调用固定 `start/stop/status`
+      并安装/清理 per-user cron block
+    - `summaryd/fb_summaryd_core.c`
+      已将缺 decode-tail segment / `ENOENT` 缺段现场
+      收口为 waitable error，保持 `service_enabled=true`
+    - `README.md` / `summaryd/README.md`
+      已移除 `run-once` / runner `--config` 旧用户面
+    - `README.md` / `open_source/pg_flashback/README.md`
+      安装章节已按当前真实交付面拆成：
+      - `一键安装`
+      - `用户自定义手动安装`
+      - 手动安装明确按 bootstrap 实际步骤展开：
+        `build/install -> extension create/update -> archive_dest -> fixed config -> watchdog -> cron keepalive`
+    - `Makefile`
+      的 `check-summaryd` 已纳入：
+      - `missing_segment_race_smoke`
+      - `bootstrap_cron_smoke`
+  - 验证：
+    - `bash tests/summaryd/summary_runner_smoke.sh`
+    - `bash tests/summaryd/bootstrap_help_smoke.sh`
+    - `bash tests/summaryd/bootstrap_manual_runner_smoke.sh`
+    - `bash tests/summaryd/bootstrap_cron_smoke.sh`
+    - `bash tests/summaryd/readme_surface_smoke.sh`
+    - `bash tests/summaryd/missing_segment_race_smoke.sh`
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config check-summaryd`
+  - 下一步：
+    - 继续观察真实 `archive_dest` 清理窗口下
+      watchdog + cron 长跑稳定性
+    - 若后续再出现其他 waitable WAL 缺口，
+      继续细化 waitable error 分类而不是退回服务失败态
+
+- 2026-04-11 已完成 standalone `summaryd` 自行消失问题修复：
+  - 现场结论已确认：
+    - `/home/18pg/data` 与 `/isoTest/18pgdata` 是同一 `PGDATA`
+    - `summaryd` 并非被手工停止
+    - `coredumpctl` 已确认 `pg_flashback-summaryd` 在 `2026-04-11 09:09:08 CST`
+      发生 `SIGABRT`
+    - root cause 为：
+      `fb_summary_collect_build_candidates()`
+      -> `fb_summary_collect_selected_segments()`
+      -> `fb_summary_read_wal_segment_size_from_path()`
+      在“目录扫描已发现、真正打开时 segment 已失踪”的窗口内抛出未兜底 `ERROR`
+  - 当前修复已落地：
+    - `src/fb_summary.c`
+      已将候选段 `AllocateFile()` 命中 `ENOENT`
+      收口为“忽略本轮失踪 candidate”，不再直接打断整个 sweep
+    - `summaryd/fb_summaryd_core.c`
+      已为 standalone candidate collection / cleanup 路径补 `PG_TRY`
+      防止再因收集阶段异常导致进程直接 `abort`
+    - 新增 `tests/summaryd/missing_segment_race_smoke.sh`
+      用 `LD_PRELOAD` 稳定模拟“segment 扫描后失踪”现场，并锁住
+      `summaryd --once` 仍可成功发布 `state.json`
+  - 验证：
+    - `bash tests/summaryd/missing_segment_race_smoke.sh`
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config check-summaryd`
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config install`
+    - `PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_summary_service fb_summary_daemon_state'`
+      - `All 2 tests passed.`
+  - 下一步：
+    - 继续观察真实 `archive_dest` 清理窗口下的 `summaryd` 长跑稳定性
+    - 若后续再出现 standalone `last_error` 冻结现场，继续补更细的 error 分类与状态观测
+
+- 2026-04-11 已完成 unresolved xid 调试入口与 replay 错误面增强：
+  - 已完成：
+    - 新增公开安装函数：
+      - `pg_flashback_debug_unresolv_xid(regclass, timestamptz)`
+    - 当前版本已前滚到：
+      - `0.2.2`
+    - 新函数当前返回结构化 xid 级诊断列：
+      - `xid`
+      - `xid_role`
+      - `resolved_by`
+      - `fallback_reason`
+      - `top_xid`
+      - `commit_ts`
+      - `summary_missing_segments`
+      - `fallback_windows`
+      - `diag`
+    - `src/fb_replay.c` 当前已为 replay 失败补统一稳定键值：
+      - `phase`
+      - `recidx`
+      - `record_kind`
+      - `xid`
+      - `lsn`
+      - `end_lsn`
+      - `rel`
+      - `fork`
+      - `blk`
+      - `off`
+      - `toast`
+      - `has_image`
+      - `apply_image`
+      - `has_data`
+      - `init_page`
+    - 已补回归：
+      - `fb_unresolved_xid_debug`
+      - `fb_user_surface`
+      - `fb_extension_upgrade`
+      - `fb_wal_error_surface`
+  - 验证：
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config clean`
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config`
+    - `make PG_CONFIG=/home/18pg/local/bin/pg_config install`
+    - `PGPORT=5832 PGUSER=18pg make PG_CONFIG=/home/18pg/local/bin/pg_config installcheck REGRESS='fb_user_surface fb_extension_upgrade fb_wal_error_surface fb_unresolved_xid_debug'`
+      - `All 4 tests passed.`
+  - 下一步：
+    - 继续把 `pg_flashback_debug_unresolv_xid(...)` 的 `fallback_reason`
+      从当前 summary/assignment 近似分类，收敛到更细的 root-cause 口径
+    - 若后续再出现真实 `failed to replay ...` 现场，
+      继续补齐更多 record 类型的统一错误详情字段
 
 - 2026-04-11 已完成 summary runner 脚本化与 recent-first 调度收口：
   - 已完成：

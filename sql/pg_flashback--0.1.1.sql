@@ -47,46 +47,9 @@ RETURNS TABLE (
 AS 'MODULE_PATHNAME', 'fb_summary_progress_internal'
 LANGUAGE C;
 
-CREATE FUNCTION fb_summary_service_debug_internal()
-RETURNS TABLE (
-	service_enabled boolean,
-	launcher_pid integer,
-	registered_workers integer,
-	active_workers integer,
-	queue_capacity integer,
-	hot_window integer,
-	pending_hot integer,
-	pending_cold integer,
-	running_hot integer,
-	running_cold integer,
-	snapshot_timeline_id integer,
-	snapshot_oldest_segno bigint,
-	snapshot_newest_segno bigint,
-	snapshot_hot_candidates integer,
-	snapshot_cold_candidates integer,
-	stable_candidates bigint,
-	completed_summaries bigint,
-	missing_summaries bigint,
-	hot_missing_summaries bigint,
-	cold_missing_summaries bigint,
-	summary_files bigint,
-	summary_bytes bigint,
-	scan_count bigint,
-	enqueue_count bigint,
-	build_count bigint,
-	cleanup_count bigint,
-	last_scan_at timestamptz
-)
-AS 'MODULE_PATHNAME', 'fb_summary_service_debug_internal'
-LANGUAGE C;
-
 CREATE VIEW pg_flashback_summary_progress AS
 SELECT *
 FROM fb_summary_progress_internal();
-
-CREATE VIEW pg_flashback_summary_service_debug AS
-SELECT *
-FROM fb_summary_service_debug_internal();
 
 COMMENT ON FUNCTION fb_version() IS
 'Return current pg_flashback extension version.';
@@ -99,6 +62,3 @@ COMMENT ON FUNCTION pg_flashback(anyelement, text) IS
 
 COMMENT ON VIEW pg_flashback_summary_progress IS
 'Show user-facing summary coverage progress plus the latest query-side summary fallback status.';
-
-COMMENT ON VIEW pg_flashback_summary_service_debug IS
-'Show internal summary service state such as launcher, workers, queue counters, and summary storage stats.';

@@ -393,3 +393,15 @@ fb_progress_debug_clear_clock(void)
 
 	MemSet(&fb_progress_debug_clock, 0, sizeof(fb_progress_debug_clock));
 }
+
+FbProgressStage
+fb_progress_debug_current_stage(void)
+{
+	return fb_progress_ctx.current_stage;
+}
+
+int
+fb_progress_debug_last_percent(void)
+{
+	return fb_progress_ctx.last_percent;
+}

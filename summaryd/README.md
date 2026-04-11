@@ -8,7 +8,7 @@ Current status:
 - built from the top-level `Makefile`
 - installed together with the extension
 - publishes `state.json` / `debug.json` under `PGDATA/pg_flashback/meta/summaryd`
-- supports `--config`, lock file ownership, and `--once` smoke runs
+- bootstrap-managed by a fixed shell runner plus cron keepalive
 
 Artifact paths:
 
@@ -39,7 +39,7 @@ credentials, using env-backed defaults where available:
 
 The prompt order is fixed as `pg_config -> PGDATA -> dbname -> dbuser -> db-password -> db-port`.
 The script then builds, installs, configures, and starts
-`pg_flashback-summaryd`.
+the summary watchdog for `pg_flashback-summaryd`.
 If `--archive-dest` is omitted, bootstrap first tries to autodetect the local
 archive directory from PostgreSQL `archive_command`, and only falls back to
 `PGDATA/pg_wal` when autodiscovery is unavailable.
@@ -57,6 +57,8 @@ Current bootstrap rules:
 - setup also runs
   `ALTER DATABASE ... SET pg_flashback.archive_dest = ...`
   so fresh sessions can query summary views without a manual `SET`
+- setup installs a per-user cron keepalive that runs
+  `scripts/pg_flashback_summary.sh start`
 - root must not run the bootstrap script; switch to the target PostgreSQL OS user first
 - the current OS user must own `PGDATA`
 - if the same environment is already fully initialized, rerunning setup
@@ -70,20 +72,19 @@ Current bootstrap rules:
 Manual runner entrypoints:
 
 ```bash
-scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf start
-scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf stop
-scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf status
-scripts/pg_flashback_summary.sh --config ~/.config/pg_flashback/pg_flashback-summaryd.conf run-once
+scripts/pg_flashback_summary.sh start
+scripts/pg_flashback_summary.sh stop
+scripts/pg_flashback_summary.sh status
 ```
 
 Current behavior:
 
 - run outside PostgreSQL
 - not require `shared_preload_libraries`
+- use a shell watchdog plus cron keepalive as the default service carrier
 - build and clean `DataDir/pg_flashback/meta/summary` directly from
   `PGDATA`, `archive_dest`, and `pg_wal`
-- publish daemon status for `pg_flashback_summary_progress` and
-  `pg_flashback_summary_service_debug`
+- publish daemon status for `pg_flashback_summary_progress`
 - leave query-local summary hint files to the extension-side readers
 
 Recommended startup:
@@ -124,13 +125,6 @@ Watch these columns first when checking the external daemon:
 - `daemon_state_present`
 - `daemon_state_stale`
 - `daemon_state_published_at`
-
-For the live worker / queue / scan counters:
-
-```sql
-SELECT *
-FROM pg_flashback_summary_service_debug;
-```
 
 If the daemon runs successfully, you should see status files under:
 
