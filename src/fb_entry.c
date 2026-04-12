@@ -21,6 +21,7 @@
 #include "utils/datum.h"
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
+#include "utils/numeric.h"
 #include "utils/rel.h"
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
@@ -36,6 +37,8 @@
 #include "fb_reverse_ops.h"
 #include "fb_runtime.h"
 #include "fb_wal.h"
+
+PG_FUNCTION_INFO_V1(fb_recordref_debug);
 
 /*
  * FbFlashbackQueryState
@@ -85,7 +88,7 @@ typedef struct FbDmlProfileDetailRow
 	const char *op_kind;
 	const char *op_group;
 	uint64 op_count;
-	double op_pct;
+	Datum op_pct;
 } FbDmlProfileDetailRow;
 
 typedef struct FbDmlProfileDetailResult
@@ -106,6 +109,13 @@ PG_FUNCTION_INFO_V1(fb_pg_flashback_support);
 PG_FUNCTION_INFO_V1(pg_flashback_dml_profile);
 PG_FUNCTION_INFO_V1(pg_flashback_dml_profile_detail);
 PG_FUNCTION_INFO_V1(pg_flashback);
+PG_FUNCTION_INFO_V1(fb_replay_prune_lookahead_payload_contract_debug);
+PG_FUNCTION_INFO_V1(fb_replay_discover_toast_contract_debug);
+PG_FUNCTION_INFO_V1(fb_replay_discover_skip_payload_contract_debug);
+PG_FUNCTION_INFO_V1(fb_replay_discover_materialize_reuse_contract_debug);
+PG_FUNCTION_INFO_V1(fb_replay_metadata_contract_debug);
+PG_FUNCTION_INFO_V1(fb_replay_eager_metadata_gate_contract_debug);
+PG_FUNCTION_INFO_V1(fb_apply_debug);
 
 /*
  * fb_require_target_ts_not_future
@@ -278,13 +288,24 @@ fb_record_kind_group_name(FbWalRecordKind kind)
 	}
 }
 
-static double
+static Datum
 fb_dml_profile_pct(uint64 count, uint64 total)
 {
-	if (total == 0)
-		return 0.0;
+	double pct = 0.0;
+	char *pct_text;
+	Datum pct_datum;
 
-	return ((double) count * 100.0) / (double) total;
+	if (total != 0)
+		pct = ((double) count * 100.0) / (double) total;
+
+	pct_text = psprintf("%.2f", pct);
+	pct_datum =
+		DirectFunctionCall3(numeric_in,
+							CStringGetDatum(pct_text),
+							ObjectIdGetDatum(InvalidOid),
+							Int32GetDatum(-1));
+	pfree(pct_text);
+	return pct_datum;
 }
 
 static void
@@ -403,6 +424,12 @@ fb_release_record_index(FbWalRecordIndex *index)
 		hash_destroy(index->precomputed_missing_blocks);
 		index->precomputed_missing_blocks = NULL;
 	}
+	if (index->replay_block_metadata != NULL)
+	{
+		hash_destroy(index->replay_block_metadata);
+		index->replay_block_metadata = NULL;
+	}
+	fb_replay_release_index_metadata(index);
 }
 
 static void
@@ -637,6 +664,9 @@ fb_preflight_estimate_working_set(const FbRelationInfo *info,
 	wal_bytes = (uint64) fb_spool_log_size(index->record_log);
 	wal_bytes = fb_estimate_add_u64(wal_bytes,
 									(uint64) fb_spool_log_size(index->record_tail_log));
+	wal_bytes = fb_estimate_add_u64(wal_bytes,
+									fb_estimate_mul_u64(index->locator_stream_count,
+														(uint64) sizeof(FbSummaryPayloadLocator)));
 	wal_bytes = fb_estimate_add_u64(wal_bytes,
 									fb_estimate_mul_u64(record_count,
 														(uint64) sizeof(FbRecordRef)));
@@ -1094,20 +1124,20 @@ pg_flashback_dml_profile(PG_FUNCTION_ARGS)
 		values[3] = CStringGetTextDatum(counters.unsafe_reason);
 	values[4] = Int64GetDatum((int64) counters.total_ops);
 	values[5] = Int64GetDatum((int64) counters.insert_ops);
-	values[6] = Float8GetDatum(fb_dml_profile_pct(counters.insert_ops,
-													 counters.total_ops));
+	values[6] = fb_dml_profile_pct(counters.insert_ops,
+								   counters.total_ops);
 	values[7] = Int64GetDatum((int64) counters.update_ops);
-	values[8] = Float8GetDatum(fb_dml_profile_pct(counters.update_ops,
-													 counters.total_ops));
+	values[8] = fb_dml_profile_pct(counters.update_ops,
+								   counters.total_ops);
 	values[9] = Int64GetDatum((int64) counters.delete_ops);
-	values[10] = Float8GetDatum(fb_dml_profile_pct(counters.delete_ops,
-													 counters.total_ops));
+	values[10] = fb_dml_profile_pct(counters.delete_ops,
+									counters.total_ops);
 	values[11] = Int64GetDatum((int64) counters.vacuum_ops);
-	values[12] = Float8GetDatum(fb_dml_profile_pct(counters.vacuum_ops,
-													  counters.total_ops));
+	values[12] = fb_dml_profile_pct(counters.vacuum_ops,
+									counters.total_ops);
 	values[13] = Int64GetDatum((int64) counters.other_ops);
-	values[14] = Float8GetDatum(fb_dml_profile_pct(counters.other_ops,
-													  counters.total_ops));
+	values[14] = fb_dml_profile_pct(counters.other_ops,
+									counters.total_ops);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	fb_release_record_index(&index);
@@ -1161,7 +1191,7 @@ pg_flashback_dml_profile_detail(PG_FUNCTION_ARGS)
 		values[2] = CStringGetTextDatum(row->op_kind);
 		values[3] = CStringGetTextDatum(row->op_group);
 		values[4] = Int64GetDatum((int64) row->op_count);
-		values[5] = Float8GetDatum(row->op_pct);
+		values[5] = row->op_pct;
 
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
@@ -1226,7 +1256,7 @@ fb_prepare_wal_scan_debug(PG_FUNCTION_ARGS)
  *    SQL entry point for regression-only index diagnostics.
  */
 
-static Datum
+Datum
 fb_recordref_debug(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);
@@ -1441,6 +1471,305 @@ fb_recordref_block_debug(PG_FUNCTION_ARGS)
 	PG_END_TRY();
 }
 
+Datum
+fb_replay_prune_lookahead_payload_contract_debug(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	FbRelationInfo info;
+	FbWalScanContext scan_ctx;
+	FbWalRecordIndex index;
+	FbSpoolSession *spool = NULL;
+	uint64 payload_loads = 0;
+	uint32 record_count = 0;
+	uint32 lookahead_entries = 0;
+	char *result = NULL;
+
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+	fb_catalog_load_relation_info(relid, &info);
+	MemSet(&index, 0, sizeof(index));
+
+	PG_TRY();
+	{
+		spool = fb_spool_session_create();
+		fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
+		fb_wal_build_record_index(&info, &scan_ctx, &index, FB_WAL_BUILD_FULL);
+		payload_loads = fb_replay_debug_prune_lookahead_payload_loads(&index,
+																		  &record_count,
+																		  &lookahead_entries);
+		result = psprintf(
+			"payload_loads=%llu record_count=%u lookahead_entries=%u used_metadata_only=true",
+			(unsigned long long) payload_loads,
+			record_count,
+			lookahead_entries);
+		fb_release_record_index(&index);
+		fb_spool_session_destroy(spool);
+		spool = NULL;
+		fb_runtime_cleanup_stale();
+		PG_RETURN_TEXT_P(cstring_to_text(result));
+	}
+	PG_CATCH();
+	{
+		if (spool != NULL)
+			fb_spool_session_destroy(spool);
+		fb_release_record_index(&index);
+		fb_runtime_cleanup_stale();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+Datum
+fb_replay_discover_toast_contract_debug(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	FbRelationInfo info;
+	FbWalScanContext scan_ctx;
+	FbWalRecordIndex index;
+	FbSpoolSession *spool = NULL;
+	uint64 toast_puts = 0;
+	uint32 discover_rounds = 0;
+	bool has_toast_tupdesc = false;
+	char *result = NULL;
+
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+	fb_catalog_load_relation_info(relid, &info);
+	MemSet(&index, 0, sizeof(index));
+
+	PG_TRY();
+	{
+		spool = fb_spool_session_create();
+		fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
+		fb_wal_build_record_index(&info, &scan_ctx, &index, FB_WAL_BUILD_FULL);
+		if (index.precomputed_missing_blocks != NULL)
+		{
+			hash_destroy(index.precomputed_missing_blocks);
+			index.precomputed_missing_blocks = NULL;
+			index.precomputed_missing_block_count = 0;
+		}
+		fb_replay_debug_discover_toast_contract(&info,
+												&index,
+												&toast_puts,
+												&discover_rounds,
+												&has_toast_tupdesc);
+		result = psprintf("toast_puts=%llu discover_rounds=%u toast_tupdesc=%s",
+						  (unsigned long long) toast_puts,
+						  discover_rounds,
+						  has_toast_tupdesc ? "true" : "false");
+		fb_release_record_index(&index);
+		fb_spool_session_destroy(spool);
+		spool = NULL;
+		fb_runtime_cleanup_stale();
+		PG_RETURN_TEXT_P(cstring_to_text(result));
+	}
+	PG_CATCH();
+	{
+		if (spool != NULL)
+			fb_spool_session_destroy(spool);
+		fb_release_record_index(&index);
+		fb_runtime_cleanup_stale();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+Datum
+fb_replay_discover_skip_payload_contract_debug(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	FbRelationInfo info;
+	FbWalScanContext scan_ctx;
+	FbWalRecordIndex index;
+	FbSpoolSession *spool = NULL;
+	uint64 payload_loads = 0;
+	uint32 record_index = 0;
+	FbWalRecordKind kind = 0;
+	bool skipped = false;
+	char *result = NULL;
+
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+	fb_catalog_load_relation_info(relid, &info);
+	MemSet(&index, 0, sizeof(index));
+
+	PG_TRY();
+	{
+		spool = fb_spool_session_create();
+		fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
+		fb_wal_build_record_index(&info, &scan_ctx, &index, FB_WAL_BUILD_FULL);
+		if (index.precomputed_missing_blocks != NULL)
+		{
+			hash_destroy(index.precomputed_missing_blocks);
+			index.precomputed_missing_blocks = NULL;
+			index.precomputed_missing_block_count = 0;
+		}
+		payload_loads = fb_replay_debug_discover_skip_payload_loads(&index,
+																	&skipped,
+																	&record_index,
+																	&kind);
+		result = psprintf("payload_loads=%llu skipped=%s record_index=%u record_kind=%s",
+						  (unsigned long long) payload_loads,
+						  skipped ? "true" : "false",
+						  record_index,
+						  fb_record_kind_name(kind));
+		fb_release_record_index(&index);
+		fb_spool_session_destroy(spool);
+		spool = NULL;
+		fb_runtime_cleanup_stale();
+		PG_RETURN_TEXT_P(cstring_to_text(result));
+	}
+	PG_CATCH();
+	{
+		if (spool != NULL)
+			fb_spool_session_destroy(spool);
+		fb_release_record_index(&index);
+		fb_runtime_cleanup_stale();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+Datum
+fb_replay_discover_materialize_reuse_contract_debug(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	FbRelationInfo info;
+	FbWalScanContext scan_ctx;
+	FbWalRecordIndex index;
+	FbSpoolSession *spool = NULL;
+	uint64 record_reads = 0;
+	uint32 record_index = 0;
+	FbWalRecordKind kind = 0;
+	char *result = NULL;
+
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+	fb_catalog_load_relation_info(relid, &info);
+	MemSet(&index, 0, sizeof(index));
+
+	PG_TRY();
+	{
+		spool = fb_spool_session_create();
+		fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
+		fb_wal_build_record_index(&info, &scan_ctx, &index, FB_WAL_BUILD_FULL);
+		if (index.precomputed_missing_blocks != NULL)
+		{
+			hash_destroy(index.precomputed_missing_blocks);
+			index.precomputed_missing_blocks = NULL;
+			index.precomputed_missing_block_count = 0;
+		}
+		record_reads = fb_replay_debug_discover_materialize_record_reads(&index,
+																		 &record_index,
+																		 &kind);
+		result = psprintf("record_reads=%llu record_index=%u record_kind=%s",
+						  (unsigned long long) record_reads,
+						  record_index,
+						  fb_record_kind_name(kind));
+		fb_release_record_index(&index);
+		fb_spool_session_destroy(spool);
+		spool = NULL;
+		fb_runtime_cleanup_stale();
+		PG_RETURN_TEXT_P(cstring_to_text(result));
+	}
+	PG_CATCH();
+	{
+		if (spool != NULL)
+			fb_spool_session_destroy(spool);
+		fb_release_record_index(&index);
+		fb_runtime_cleanup_stale();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+Datum
+fb_replay_eager_metadata_gate_contract_debug(PG_FUNCTION_ARGS)
+{
+	FbWalRecordIndex lookahead_index;
+	FbWalRecordIndex locator_payload_index;
+	FbWalRecordIndex plain_index;
+	char *result = NULL;
+	bool lookahead_precompute = false;
+	bool locator_payload_precompute = false;
+	bool plain_precompute = false;
+
+	MemSet(&lookahead_index, 0, sizeof(lookahead_index));
+	MemSet(&locator_payload_index, 0, sizeof(locator_payload_index));
+	MemSet(&plain_index, 0, sizeof(plain_index));
+	lookahead_index.record_count = 1;
+	lookahead_index.locator_stream_count = 1;
+	lookahead_index.lookahead_log = (FbSpoolLog *) ((uintptr_t) 1);
+	locator_payload_index.record_count = 1;
+	locator_payload_index.payload_scan_mode = FB_WAL_PAYLOAD_SCAN_LOCATOR;
+	plain_index.record_count = 1;
+	lookahead_precompute =
+		fb_replay_should_precompute_index_metadata(&lookahead_index);
+	locator_payload_precompute =
+		fb_replay_should_precompute_index_metadata(&locator_payload_index);
+	plain_precompute =
+		fb_replay_should_precompute_index_metadata(&plain_index);
+
+	result = psprintf("lookahead_eager_precompute=%s locator_payload_eager_precompute=%s plain_eager_precompute=%s",
+					  lookahead_precompute ? "true" : "false",
+					  locator_payload_precompute ? "true" : "false",
+					  plain_precompute ? "true" : "false");
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+Datum
+fb_replay_metadata_contract_debug(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	TimestampTz target_ts = PG_GETARG_TIMESTAMPTZ(1);
+	FbRelationInfo info;
+	FbWalScanContext scan_ctx;
+	FbWalRecordIndex index;
+	FbSpoolSession *spool = NULL;
+	bool lifecycle_ready = false;
+	bool prune_ready = false;
+	uint64 retire_count = 0;
+	char *result = NULL;
+
+	fb_require_target_ts_not_future(target_ts);
+	fb_require_archive_dir();
+	fb_catalog_load_relation_info(relid, &info);
+	MemSet(&index, 0, sizeof(index));
+
+	PG_TRY();
+	{
+		spool = fb_spool_session_create();
+		fb_wal_prepare_scan_context(target_ts, spool, &scan_ctx);
+		fb_wal_build_record_index(&info, &scan_ctx, &index, FB_WAL_BUILD_FULL);
+		lifecycle_ready = fb_wal_replay_block_metadata_ready(&index);
+		prune_ready = fb_replay_index_prune_lookahead_ready(&index);
+		retire_count = fb_replay_debug_block_retire_count(&info, &index);
+		result = psprintf("lifecycle_ready=%s prune_ready=%s retire_events_positive=%s",
+						  lifecycle_ready ? "true" : "false",
+						  prune_ready ? "true" : "false",
+						  retire_count > 0 ? "true" : "false");
+		fb_release_record_index(&index);
+		fb_spool_session_destroy(spool);
+		spool = NULL;
+		fb_runtime_cleanup_stale();
+		PG_RETURN_TEXT_P(cstring_to_text(result));
+	}
+	PG_CATCH();
+	{
+		if (spool != NULL)
+			fb_spool_session_destroy(spool);
+		fb_release_record_index(&index);
+		fb_runtime_cleanup_stale();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
 static Datum
 fb_recordref_lsn_debug(PG_FUNCTION_ARGS)
 {
@@ -1607,7 +1936,7 @@ fb_replay_debug(PG_FUNCTION_ARGS)
  *    SQL entry point for regression-only apply diagnostics.
  */
 
-static Datum
+Datum
 fb_apply_debug(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);

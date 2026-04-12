@@ -80,6 +80,20 @@ pg_flashback_dml_profile(anyelement, text)
   -> SQL summary/detail rows
 ```
 
+当前 profile 输出约束补充为：
+
+```text
+同一 target_ts 在无新增目标 relation WAL 时，多次调用必须得到稳定一致的 per-kind 计数；
+summary/detail 的 *_pct 统一保留两位小数
+```
+
+当前 profile 输出约束补充为：
+
+```text
+同一 target_ts 在无新增目标 relation WAL 时，多次调用必须得到稳定一致的 per-kind 计数；
+summary/detail 的 *_pct 统一保留两位小数
+```
+
 如果要再补一句当前大窗口实现特点，就是：
 
 ```text
@@ -212,7 +226,22 @@ pg_flashback_dml_profile(anyelement, text)
     - 稀疏 locator case 保留 direct read，避免 decode 范围被批量 run 放大
 - 提供查询期 backend-local summary section cache，避免同一查询重复读取相同 summary 文件
 - 供 query prefilter 和后台预建服务共用
-- 当前 `3/9 build record index` 继续收敛方向已固定为：
+ - 当前 `3/9 build record index` 继续收敛方向已固定为：
+  - 当前 `3/9 payload` 的通用契约继续收敛为：
+    - 首次 payload 访问就是 metadata 唯一真源
+    - locator / sparse / windowed fallback 共用同一套增量 collector
+    - 首次访问同步产出：
+      - `record stats`
+      - `replay block metadata`
+      - `precomputed missing-block`
+    - `fb_wal_finalize_record_stats()` 只允许作为 metadata 不完整时的兜底
+    - dense exact locator run 当前补充采用：
+      - `streaming` open hint
+      - 只给 `POSIX_FADV_SEQUENTIAL`
+      - run-local `POSIX_FADV_WILLNEED` 预取
+      - exact reader 自身不再隐式跨 gap 顺扫
+      - 对超大 dense scan 额外加全局 advisory gate，
+        避免多条 `documents` 类查询并发冲击 shared WAL buffered IO
   - `summary-span`
     - 由 query-side per-segment `palloc + copy` 迁移到 cache 期 stable public slice
     - query 侧只做 segment 去重、裁窗与 merge，不再反复复制 relation spans
@@ -236,6 +265,54 @@ pg_flashback_dml_profile(anyelement, text)
 
 - `fb_wal_build_record_index()` 仍负责顺扫构建 `RecordRef` 索引
 - `FbWalRecordCursor` 负责从 spool 中恢复记录并向 replay 发射
+- full locator-cover 的 `summary payload locator-first` 场景当前已改为：
+  - `FbWalRecordIndex` 直接挂 query-local `locator stream`
+ - 当前正在继续把 `3/9 -> replay` 契约前移为：
+   - query-local block lifecycle metadata：
+     - `last_replay_use_record_index`
+     - `last_prune_guard_index`
+   - compact future-block delta：
+     - 由 payload 期顺手产出
+     - 服务 final 直接读取，不再在 `6/9` 反向预扫整条 cursor
+     - 这些元数据必须 piggyback 现有 payload/index 物化链路，
+       不能额外增加第二遍 WAL/cursor 扫描
+ - 当前补充约束：
+   - 若 prune lookahead 仍依赖 query-local `lookahead_log`
+     做二次反扫，不能在 `3/9` eager 执行
+   - 这种形态下只前移 lifecycle metadata；
+     prune lookahead 继续在 `6/9 final` lazy fallback
+   - 只有 dense future-block delta 真正落地后，
+     才允许重新把 prune metadata 前移回 `3/9`
+
+### `fb_replay`
+
+文件：
+
+- `src/fb_replay.c`
+- `include/fb_replay.h`
+
+职责补充：
+
+- `discover/warm/final` 三段 replay 与 `ForwardOp` 提取
+- 当前正在把 `BlockReplayStore` 从 query-lifetime `dynahash`
+  收敛为 query-local compact store：
+  - 主表 / TOAST 分域
+  - `(domain, blkno)` 紧凑 key
+  - slab/arena 持有 page bytes
+  - 当前实现已切到 open addressing + state arena/freelist
+- discover 将继续从“全量 apply”收敛到 `frontier apply`
+  - 只 materialize/apply missing-block 闭包相关 record
+  - 其余记录保持 skeleton-only
+- `prune lookahead` 当前已先收口掉 final apply 热路径上的
+  `record_index -> hash_search`
+  - backward prepass 仍在
+  - 但 `final` 消费侧已经改成 dense vector 直取
+  - 当前 vector 由 build 末尾预计算挂到 `FbWalRecordIndex`
+  - 不再把 locator-only 记录逐条落成 `record_log` head stub
+  - `FbWalRecordCursor` 先消费虚拟 locator head stream，再继续 tail spool
+  - payload stats worker 改为 DSM 内存聚合返回，避免 query 热路径
+    再写 `wal-payload-stats-worker-*.bin`
+  - 关联的 missing-block sidecar 当前仍保留，后续继续收口
 - 当前也承接 xid 调试入口：
   - `pg_flashback_debug_unresolv_xid(regclass, timestamptz)`
   - 复用 metadata / summary / exact-fill 诊断链路，发射 xid 级 fallback 行

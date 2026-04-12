@@ -14,8 +14,7 @@
 
 #include "fb_common.h"
 #include "fb_spool.h"
-
-typedef struct FbSummaryQueryCache FbSummaryQueryCache;
+#include "fb_summary.h"
 
 typedef struct FbWalBlockKey
 {
@@ -30,6 +29,13 @@ typedef struct FbWalPrecomputedMissingBlock
 	uint32 first_record_index;
 	XLogRecPtr first_record_lsn;
 } FbWalPrecomputedMissingBlock;
+
+typedef struct FbWalReplayBlockMetadata
+{
+	FbWalBlockKey key;
+	uint32 last_replay_use_record_index;
+	uint32 last_prune_guard_record_index;
+} FbWalReplayBlockMetadata;
 
 typedef struct FbWalResolvedSegment
 {
@@ -297,10 +303,13 @@ typedef struct FbWalRecordIndex
 	uint64 record_materializer_reuses;
 	uint64 locator_stub_materializations;
 	uint64 deferred_payload_materializations;
+	bool payload_metadata_complete;
 	uint64 summary_payload_locator_records;
 	uint32 summary_payload_locator_segments_read;
 	uint64 summary_payload_locator_public_builds;
 	uint32 summary_payload_locator_fallback_segments;
+	const FbSummaryPayloadLocator *locator_stream;
+	uint32 locator_stream_count;
 	bool tail_inline_payload;
 	XLogRecPtr tail_cutover_lsn;
 	HTAB *xid_statuses;
@@ -309,10 +318,16 @@ typedef struct FbWalRecordIndex
 	HTAB *target_snapshot_xids;
 	FbSpoolSession *spool_session;
 	FbSpoolLog *record_log;
+	FbSpoolLog *lookahead_log;
 	FbSpoolLog *record_tail_log;
 	FbSpoolLog *xact_summary_log;
 	HTAB *precomputed_missing_blocks;
 	uint32 precomputed_missing_block_count;
+	HTAB *replay_block_metadata;
+	uint32 replay_block_metadata_count;
+	void *replay_prune_lookahead_entries;
+	uint32 replay_prune_lookahead_count;
+	bool replay_prune_lookahead_ready;
 	RelFileLocator target_locator;
 	RelFileLocator toast_locator;
 	bool has_toast_locator;
@@ -373,10 +388,25 @@ bool fb_wal_record_cursor_read(FbWalRecordCursor *cursor,
 bool fb_wal_record_cursor_read_skeleton(FbWalRecordCursor *cursor,
 										FbRecordRef *record,
 										uint32 *record_index);
+bool fb_wal_record_cursor_read_lookahead(FbWalRecordCursor *cursor,
+										 FbRecordRef *record,
+										 uint32 *record_index);
+void fb_wal_record_cursor_materialize(FbWalRecordCursor *cursor,
+									  FbRecordRef *record);
 void fb_wal_record_cursor_close(FbWalRecordCursor *cursor);
+void fb_wal_debug_payload_load_counter_reset(void);
+void fb_wal_debug_payload_load_counter_enable(bool enable);
+uint64 fb_wal_debug_payload_load_counter_value(void);
+void fb_wal_debug_record_read_counter_reset(void);
+void fb_wal_debug_record_read_counter_enable(bool enable);
+uint64 fb_wal_debug_record_read_counter_value(void);
 bool fb_wal_record_load(const FbWalRecordIndex *index,
 						 uint32 record_index,
 						 FbRecordRef *record);
+bool fb_wal_replay_block_metadata_ready(const FbWalRecordIndex *index);
+bool fb_wal_lookup_replay_block_metadata(const FbWalRecordIndex *index,
+										 const FbWalBlockKey *key,
+										 FbWalReplayBlockMetadata *metadata_out);
 bool fb_wal_record_block_materializes_page(const FbRecordRef *record,
 										   int block_index);
 bool fb_wal_decode_record_ref(XLogReaderState *reader,

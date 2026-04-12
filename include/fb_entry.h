@@ -6,7 +6,7 @@
 #ifndef FB_ENTRY_H
 #define FB_ENTRY_H
 
-#define FB_EXTENSION_VERSION "0.2.4"
+#define FB_EXTENSION_VERSION "0.2.5"
 
 #include "fb_common.h"
 #include "fb_reverse_ops.h"

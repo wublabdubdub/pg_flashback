@@ -79,3 +79,33 @@ SELECT summary.window_supported OR summary.unsafe_reason = 'storage_change' AS s
 	   summary.delete_ops = COALESCE((SELECT sum(op_count) FROM detail WHERE op_group = 'delete'), 0) AS detail_matches_delete,
 	   summary.other_ops = COALESCE((SELECT sum(op_count) FROM detail WHERE op_group = 'other'), 0) AS detail_matches_other
 FROM summary;
+
+WITH first_call AS (
+	SELECT *
+	FROM pg_flashback_dml_profile(
+		NULL::public.fb_dml_profile_target,
+		(SELECT target_ts::text FROM fb_dml_profile_mark)
+	)
+),
+second_call AS (
+	SELECT *
+	FROM pg_flashback_dml_profile(
+		NULL::public.fb_dml_profile_target,
+		(SELECT target_ts::text FROM fb_dml_profile_mark)
+	)
+),
+detail_call AS (
+	SELECT *
+	FROM pg_flashback_dml_profile_detail(
+		NULL::public.fb_dml_profile_target,
+		(SELECT target_ts::text FROM fb_dml_profile_mark)
+	)
+	WHERE op_group = 'insert'
+)
+SELECT pg_typeof(first_call.insert_pct) = 'numeric'::regtype AS summary_pct_is_numeric,
+	   pg_typeof((SELECT op_pct FROM detail_call LIMIT 1)) = 'numeric'::regtype AS detail_pct_is_numeric,
+	   first_call.total_ops = second_call.total_ops AS stable_total_ops,
+	   first_call.insert_ops = second_call.insert_ops AS stable_insert_ops,
+	   first_call.insert_pct::text ~ '^[0-9]+\\.[0-9][0-9]$' AS summary_pct_two_decimals,
+	   (SELECT op_pct::text ~ '^[0-9]+\\.[0-9][0-9]$' FROM detail_call LIMIT 1) AS detail_pct_two_decimals
+FROM first_call, second_call;

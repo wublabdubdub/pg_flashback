@@ -1,0 +1,15 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_flashback;
+RESET client_min_messages;
+SET pg_flashback.show_progress = off;
+CREATE FUNCTION fb_wal_locator_stream_contract_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_wal_locator_stream_contract_debug'
+LANGUAGE C STRICT;
+SELECT fb_wal_locator_stream_contract_debug();
+                                            fb_wal_locator_stream_contract_debug                                            
+----------------------------------------------------------------------------------------------------------------------------
+ head_spool=0 locator_stream=4 tail_spool=0 first=0/00000010 last=0/00000040 seek=1 stats_parallel=0 materialize_parallel=0
+(1 row)
+
+DROP FUNCTION fb_wal_locator_stream_contract_debug();

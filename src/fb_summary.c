@@ -36,6 +36,9 @@
 #include "fb_summary.h"
 #include "fb_wal.h"
 
+PG_FUNCTION_INFO_V1(fb_summary_payload_locator_merge_debug);
+PG_FUNCTION_INFO_V1(fb_summary_payload_locator_merge_contract_debug);
+
 #define FB_SUMMARY_MAGIC ((uint32) 0x4642534d)
 /*
  * v12 invalidates summary sidecars generated before PG14 HEAP2_VACUUM records
@@ -542,6 +545,8 @@ static int fb_summary_xid_assignment_cmp(const void *lhs, const void *rhs);
 static bool fb_summary_payload_kind_enabled(uint8 kind);
 static uint32 fb_summary_transactionid_deduplicate(TransactionId *xids,
 												   uint32 count);
+static int fb_summary_payload_locator_public_order(const FbSummaryPayloadLocator *left,
+												   const FbSummaryPayloadLocator *right);
 static uint32 fb_summary_payload_locator_deduplicate(FbSummaryPayloadLocator *locators,
 													 uint32 count);
 static uint32 fb_summary_merge_payload_locator_slices(const FbSummaryPayloadLocator *const *matched_slices,
@@ -1670,6 +1675,16 @@ fb_summary_payload_locator_public_cmp(const void *lhs, const void *rhs)
 	const FbSummaryPayloadLocator *left = (const FbSummaryPayloadLocator *) lhs;
 	const FbSummaryPayloadLocator *right = (const FbSummaryPayloadLocator *) rhs;
 
+	return fb_summary_payload_locator_public_order(left, right);
+}
+
+static int
+fb_summary_payload_locator_public_order(const FbSummaryPayloadLocator *left,
+										const FbSummaryPayloadLocator *right)
+{
+	if (left == NULL || right == NULL)
+		return 0;
+
 	if (left->record_start_lsn < right->record_start_lsn)
 		return -1;
 	if (left->record_start_lsn > right->record_start_lsn)
@@ -1719,34 +1734,71 @@ fb_summary_merge_payload_locator_slices(const FbSummaryPayloadLocator *const *ma
 										 uint32 match_count,
 										 FbSummaryPayloadLocator *locators)
 {
+	uint32	   *positions = NULL;
 	uint32 total = 0;
 	uint32 i;
 
 	if (matched_slices == NULL || matched_counts == NULL || locators == NULL)
 		return 0;
 
-	for (i = 0; i < match_count; i++)
+	if (match_count <= 1)
 	{
-		uint32 slice_count = matched_counts[i];
+		for (i = 0; i < match_count; i++)
+		{
+			uint32 slice_count = matched_counts[i];
 
-		if (slice_count == 0)
-			continue;
+			if (slice_count == 0)
+				continue;
 
-		memcpy(&locators[total],
-			   matched_slices[i],
-			   sizeof(*locators) * slice_count);
-		total += slice_count;
+			memcpy(&locators[total],
+				   matched_slices[i],
+				   sizeof(*locators) * slice_count);
+			total += slice_count;
+		}
+		return total;
 	}
 
-	if (total > 1)
+	/*
+	 * Summary slices are already sorted and deduplicated when the sidecar is
+	 * built, so the hot-path merge only needs a small k-way merge here.
+	 * Re-sorting the concatenated array turns dense multi-slice relations into
+	 * an avoidable payload hotspot.
+	 */
+	positions = palloc0(sizeof(*positions) * match_count);
+	for (;;)
 	{
-		qsort(locators,
-			  total,
-			  sizeof(*locators),
-			  fb_summary_payload_locator_public_cmp);
-		total = fb_summary_payload_locator_deduplicate(locators, total);
+		const FbSummaryPayloadLocator *best = NULL;
+		uint32 best_slice = 0;
+		bool found = false;
+
+		for (i = 0; i < match_count; i++)
+		{
+			const FbSummaryPayloadLocator *candidate;
+
+			if (matched_slices[i] == NULL || positions[i] >= matched_counts[i])
+				continue;
+
+			candidate = &matched_slices[i][positions[i]];
+			if (!found ||
+				fb_summary_payload_locator_public_order(candidate, best) < 0)
+			{
+				best = candidate;
+				best_slice = i;
+				found = true;
+			}
+		}
+
+		if (!found)
+			break;
+
+		if (total == 0 ||
+			fb_summary_payload_locator_public_order(&locators[total - 1], best) != 0)
+			locators[total++] = *best;
+
+		positions[best_slice]++;
 	}
 
+	pfree(positions);
 	return total;
 }
 
@@ -4976,27 +5028,6 @@ fb_summary_meta_stats_debug(PG_FUNCTION_ARGS)
 }
 
 static Datum
-fb_summary_path_debug(PG_FUNCTION_ARGS)
-{
-	char *wal_path = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	struct stat st;
-	char summary_path[MAXPGPATH];
-
-	fb_runtime_ensure_initialized();
-	if (stat(wal_path, &st) != 0)
-		PG_RETURN_NULL();
-	if (!fb_summary_file_path_into(summary_path, sizeof(summary_path),
-								   wal_path, &st,
-								   fb_summary_source_kind_for_path(wal_path)))
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("summary file path exceeds MAXPGPATH"),
-				 errdetail("path=%s", wal_path)));
-
-	PG_RETURN_TEXT_P(cstring_to_text(summary_path));
-}
-
-static Datum
 fb_summary_v6_rejected_debug(PG_FUNCTION_ARGS)
 {
 	FbSummaryBuildCandidate *candidates = NULL;
@@ -5109,139 +5140,8 @@ fb_summary_v6_rejected_debug(PG_FUNCTION_ARGS)
 											 rejected ? "true" : "false")));
 }
 
-static Datum
-fb_summary_candidate_debug(PG_FUNCTION_ARGS)
-{
-	char *wal_path = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	FbSummaryBuildCandidate *candidates = NULL;
-	FbSummaryBuildCandidate *candidate = NULL;
-	FbSummaryBuildCandidate candidate_copy;
-	char summary_path[MAXPGPATH];
-	struct stat st;
-	bool summary_exists = false;
-	int candidate_count;
-	int i;
 
-	fb_runtime_ensure_initialized();
-	candidate_count = fb_summary_collect_build_candidates(&candidates, false);
-
-	for (i = 0; i < candidate_count; i++)
-	{
-		if (strcmp(candidates[i].path, wal_path) == 0)
-		{
-			candidate = &candidates[i];
-			break;
-		}
-	}
-
-	if (candidate == NULL)
-	{
-		if (candidates != NULL)
-			fb_summary_free_build_candidates(candidates);
-		PG_RETURN_TEXT_P(cstring_to_text("candidate=false"));
-	}
-
-	if (stat(candidate->path, &st) != 0)
-	{
-		if (candidates != NULL)
-			fb_summary_free_build_candidates(candidates);
-		PG_RETURN_TEXT_P(cstring_to_text("candidate=true stat=false"));
-	}
-
-	if (!fb_summary_file_path_into(summary_path, sizeof(summary_path),
-								   candidate->path, &st,
-								   candidate->source_kind))
-	{
-		if (candidates != NULL)
-			fb_summary_free_build_candidates(candidates);
-		elog(ERROR, "failed to build candidate summary path");
-	}
-
-	candidate_copy = *candidate;
-	summary_exists = fb_summary_candidate_summary_exists(candidate);
-	if (candidates != NULL)
-		fb_summary_free_build_candidates(candidates);
-
-	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
-		"candidate=true source=%u segno=%llu bytes=%lld summary_exists=%s summary_path=%s",
-		candidate_copy.source_kind,
-		(unsigned long long) candidate_copy.segno,
-		(long long) candidate_copy.bytes,
-		summary_exists ? "true" : "false",
-		summary_path)));
-}
-
-static Datum
-fb_summary_build_candidate_debug(PG_FUNCTION_ARGS)
-{
-	char *wal_path = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	FbSummaryBuildCandidate *candidates = NULL;
-	FbSummaryBuildCandidate *candidate = NULL;
-	FbSummaryBuildCandidate candidate_copy;
-	char summary_path[MAXPGPATH];
-	struct stat st;
-	bool summary_exists_before = false;
-	bool build_result = false;
-	bool summary_exists_after = false;
-	int candidate_count;
-	int i;
-
-	fb_runtime_ensure_initialized();
-	candidate_count = fb_summary_collect_build_candidates(&candidates, false);
-
-	for (i = 0; i < candidate_count; i++)
-	{
-		if (strcmp(candidates[i].path, wal_path) == 0)
-		{
-			candidate = &candidates[i];
-			break;
-		}
-	}
-
-	if (candidate == NULL)
-	{
-		if (candidates != NULL)
-			fb_summary_free_build_candidates(candidates);
-		PG_RETURN_TEXT_P(cstring_to_text("candidate=false"));
-	}
-
-	if (stat(candidate->path, &st) != 0)
-	{
-		if (candidates != NULL)
-			fb_summary_free_build_candidates(candidates);
-		PG_RETURN_TEXT_P(cstring_to_text("candidate=true stat=false"));
-	}
-
-	if (!fb_summary_file_path_into(summary_path, sizeof(summary_path),
-								   candidate->path, &st,
-								   candidate->source_kind))
-	{
-		if (candidates != NULL)
-			fb_summary_free_build_candidates(candidates);
-		elog(ERROR, "failed to build candidate summary path");
-	}
-
-	candidate_copy = *candidate;
-	summary_exists_before = fb_summary_candidate_summary_exists(candidate);
-	if (!summary_exists_before)
-		build_result = fb_summary_build_candidate(candidate);
-	summary_exists_after = fb_summary_candidate_summary_exists(candidate);
-
-	if (candidates != NULL)
-		fb_summary_free_build_candidates(candidates);
-
-	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
-		"candidate=true source=%u segno=%llu bytes=%lld summary_exists_before=%s build_result=%s summary_exists_after=%s summary_path=%s",
-		candidate_copy.source_kind,
-		(unsigned long long) candidate_copy.segno,
-		(long long) candidate_copy.bytes,
-		summary_exists_before ? "true" : "false",
-		build_result ? "true" : "false",
-		summary_exists_after ? "true" : "false",
-		summary_path)));
-}
-
-static Datum
+Datum
 fb_summary_payload_locator_merge_debug(PG_FUNCTION_ARGS)
 {
 	ArrayType  *counts_array = PG_GETARG_ARRAYTYPE_P(0);
@@ -5348,6 +5248,60 @@ fb_summary_payload_locator_merge_debug(PG_FUNCTION_ARGS)
 		pfree(count_nulls);
 	if (count_datums != NULL)
 		pfree(count_datums);
+	pfree(buf.data);
+
+	PG_RETURN_TEXT_P(result);
+}
+
+Datum
+fb_summary_payload_locator_merge_contract_debug(PG_FUNCTION_ARGS)
+{
+	FbSummaryPayloadLocator slice1[] = {
+		{.record_start_lsn = 100, .kind = 1, .flags = 0},
+		{.record_start_lsn = 104, .kind = 1, .flags = 0},
+		{.record_start_lsn = 108, .kind = 1, .flags = 0}
+	};
+	FbSummaryPayloadLocator slice2[] = {
+		{.record_start_lsn = 100, .kind = 1, .flags = 0},
+		{.record_start_lsn = 102, .kind = 1, .flags = 0},
+		{.record_start_lsn = 106, .kind = 1, .flags = 0}
+	};
+	FbSummaryPayloadLocator slice3[] = {
+		{.record_start_lsn = 101, .kind = 1, .flags = 0},
+		{.record_start_lsn = 104, .kind = 1, .flags = 0},
+		{.record_start_lsn = 110, .kind = 1, .flags = 0}
+	};
+	const FbSummaryPayloadLocator *matched_slices[] = {
+		slice1,
+		slice2,
+		slice3
+	};
+	uint32 matched_counts[] = {3, 3, 3};
+	FbSummaryPayloadLocator merged[9];
+	uint32 merged_count;
+	StringInfoData buf;
+	text	   *result;
+	uint32 i;
+
+	MemSet(merged, 0, sizeof(merged));
+	merged_count =
+		fb_summary_merge_payload_locator_slices(matched_slices,
+											 matched_counts,
+											 lengthof(matched_slices),
+											 merged);
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "count=%u lsns=[", merged_count);
+	for (i = 0; i < merged_count; i++)
+	{
+		if (i > 0)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfo(&buf,
+						 "%llu",
+						 (unsigned long long) merged[i].record_start_lsn);
+	}
+	appendStringInfoChar(&buf, ']');
+	result = cstring_to_text(buf.data);
 	pfree(buf.data);
 
 	PG_RETURN_TEXT_P(result);

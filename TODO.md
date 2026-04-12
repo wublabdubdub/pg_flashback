@@ -10,7 +10,9 @@
   - [x] 明细层暴露当前支持的 `FbWalRecordKind` 分布
   - [x] 只建 record index，不进入 replay/apply
   - [x] 前滚扩展版本并补升级链
-  - [ ] 补回归并同步开源镜像
+  - [x] 修复重复调用下 `target_kind_counts` 漂移导致的 profile 计数不稳定
+  - [x] 将 profile `*_pct` 输出固定为两位小数
+  - [x] 补回归并同步开源镜像
   - [ ] 补 fresh 14pg 完整 profile 通过证据
 
 - [x] 修复 14pg summary 驱动闪回遗漏 `XLOG_HEAP2_VACUUM`
@@ -42,6 +44,11 @@
   - [x] 只保留公开用户入口 / support function / `fb_summary_progress_internal()`
   - [x] 收缩默认 `REGRESS`，移除仅依赖这些 helper 的回归入口
   - [x] 用导出符号检查与临时 PG18 安装面复核清理结果
+- [x] 清理 `fb_summary_path_debug(text)` /
+      `fb_summary_candidate_debug(text)` /
+      `fb_summary_build_candidate_debug(text)` 三个未安装的 summary 残留 helper
+  - [x] 明确其不属于公开安装面，也不纳入稳定接口
+  - [x] 删除源码残留并同步开源镜像
 - [x] 将 `fb_summary_service_debug_internal()` 从历史 SQL 链与共享库一并删除
   - [x] 历史版本安装/升级脚本不再创建该函数/视图
   - [x] 删除 `src/fb_summary_service.c` 中剩余 fmgr 导出与实现
@@ -86,6 +93,166 @@
           exact locator 冷读的页复用 / 去重
     - [ ] 下一轮冷跑热点：
           `precomputed_missing_blocks` 的 hash 插入成本
+
+- [ ] 将 full locator-cover 路径从 `locator-only payload stub + stats sidecar`
+      改为 direct locator stream
+  - [x] 补 contract regression，锁住：
+        - `record_log` head 不再写 locator stub
+        - `locator stream` 可直接 seek
+  - [x] `FbWalRecordIndex` 挂 direct locator stream
+  - [x] `FbWalRecordCursor` 支持虚拟 locator head stream
+  - [x] `fb_wal_capture_locator_stub_stats_parallel()` 将 payload stats
+        改为内存聚合返回
+  - [ ] missing-block sidecar 继续收口为无 tempfile 返回
+  - [ ] 复跑 14pg 原始现场 SQL，确认完整链路 `< 60s`
+  - [ ] 继续压 `documents` 剩余 `3/9 payload`
+    - [x] 把 `fb_find_segment_index_for_lsn()` 从线性查找改成对有序 segment 的二分
+    - [x] 去掉 `fb_summary_merge_payload_locator_slices()` 的全量 `qsort`
+    - [ ] 收口 direct locator stats worker 的 initialized/missing/replay tempfile merge
+    - [x] 补 contract regression，锁住 serial locator-window visitor
+          不会再把前窗读到后窗 locator
+    - [x] 在 dense locator case 重新启用 serial locator-window visitor
+      - [x] gate 收口为：
+            `window_count < locator_count &&
+             locator_count / window_count >= 256`
+      - [x] 14pg
+            `scenario_oa_50t_50000r.documents @ 2026-04-11 07:50:40.916510+00`
+            复跑确认：
+            `3/9 payload` 已从 `140.754s` 收口到 `11.193s` / `9.195s`
+    - [ ] 继续单独收口 `documents` 的 `3/9 30% metadata` 波动
+    - [x] 修复 pure locator case 的状态错配：
+          `payload_scan_mode=locator` 时必须真正挂 `locator_stream`，
+          不能继续把全部 payload 落进 `record_log`
+    - [x] pure locator case 不再复制 payload body，
+          也不再启用随后会被 `finalize_record_stats()` 丢弃的
+          incremental payload stats
+    - [ ] 在 pure locator head-spool 归零后，继续复核
+          `random_flashback_2.documents @ 2026-04-11 07:50:40.916510+00`
+          的 `3/9 payload < 10s`
+- [ ] 建立通用 `single-pass payload metadata contract`
+  - [x] 先补 contract regression，锁住：
+        正常 locator / sparse / windowed payload 主链
+        不再落回 `fb_wal_finalize_record_stats()`
+  - [x] 统一 `3/9` 首次 payload 访问的增量 collector：
+        同步产出 `record stats` / `replay block metadata` /
+        `precomputed missing-block`
+  - [x] mixed locator + fallback 共用同一套 completeness 判定，
+        不再拆分 finalize 语义
+  - [x] `fb_wal_finalize_record_stats()` 仅保留给
+        metadata 不完整的兜底旧路径
+  - [x] 复跑 14pg 用户现场
+        `scenario_oa_50t_50000r.documents @ 2026-04-11 07:40:40.223683+00`
+        确认 `3/9 payload` 继续明显下降
+  - [ ] 继续压 exact locator 首读本身，
+        直到 live `documents` 的 `3/9 payload` 稳定向 `< 10s` 收口
+    - [x] dense exact locator run 不再默认走 `FB_WAL_OPEN_SPARSE`
+    - [x] 新增 `fb_wal_locator_reader_profile` contract regression
+    - [x] 14pg `alldb` 同一条现场 SQL 在全新 backend 上
+          连续复跑降到 `~15.9s` / `~13.3s`
+    - [x] 收口同 payload plan 的时延分叉：
+          `07:40` / `07:50` live counter 已确认 locator plan 完全一致，
+          当前已改为 `exact_only + dense range prefetch`，
+          clean restart live SQL 收敛到
+          `3/9 payload ~= 9.67s / 10.05s`
+    - [x] 收口 dense `documents` 并发时对轻查询的 WALRead 争用放大：
+          `users @ 07:50` clean restart 单跑 `payload ~= 0.333s`，
+          并发 4 条 dense `documents` 压测下
+          已从 `payload ~= 53.111s`
+          收敛到 `payload ~= 0.619s`；
+          dense backend 当前会等待 advisory gate
+- [ ] 收口 `4/9 replay discover / BlockReplayStore` 常驻体积
+  - [x] 复核 `FbReplayWarmState.store` 被 `final` 直接复用，
+        确认不能靠 warm 结束清空 block store 取巧
+  - [x] 否决“replay 前额外全量反扫建立 `last_use` map”这一路：
+        14pg 高内存对照显示该方案新增约 `10s+` 冷跑成本，
+        无法作为 `< 60s` 主方案保留
+  - [ ] 将 block 生命周期元数据前移到已有 `3/9` / payload 物化链路，
+        避免 replay 期再做一遍全量 cursor 扫描
+    - [x] `3/9` 顺手产出 per-block
+          `last_replay_use_record_index` /
+          `last_prune_guard_index`
+    - [x] 禁止为 `last_use` 再增加额外 cursor 反扫
+    - [x] discover / warm / final 按生命周期元数据即时 retire block state
+    - [ ] 14pg 同一条 live SQL 验证 `3/9` 增量耗时 `<= 5s`
+      - [x] 当前实现已补齐 metadata / retire 代码路径
+      - [ ] 当前 build 末尾 precompute 形态失败：
+            warm-cache live 复跑 `3/9 payload +30.046s`
+      - [ ] 禁止 locator-stream + `lookahead_log` 场景在 `3/9`
+            eager 反扫构建 prune lookahead
+        - [x] 补 contract regression，锁住：
+              `lookahead_log` 存在时 eager precompute 保持关闭
+        - [x] 14pg live 复跑确认：
+              `documents` / `meetings` 的 `3/9 payload`
+              不再被 `fb_replay_build_prune_lookahead()` 主导
+      - [x] direct locator-stream stats-only worker
+            不再落 `wal-lookahead-worker-*.bin`
+      - [x] exact locator 顺序复用：
+            相邻 locator 不再每条都 `XLogBeginRead()`
+      - [ ] `documents` cold exact locator 继续收口到更稳的 `< 6s`
+  - [x] 移除 new block 进入 `BlockReplayStore` 时
+        `fb_replay_ensure_block_ready()` 的整页 `MemSet`
+  - [x] 用 query-local compact store 重写 `BlockReplayStore`
+    - [x] 不再使用现有 `dynahash + RelFileLocator/fork/blkno` 双 probe 热路径
+    - [x] key 压成 `(domain, blkno)` 的 query-local 64-bit key
+    - [x] page bytes 改为 slab/arena 持有，降低 cache miss 与 tracked bytes
+    - [ ] 补 contract regression，锁住 block store
+          `lookup/insert` 为单 probe 语义
+  - [ ] 收口 discover 期无效 TOAST store 热路径
+    - [x] 用活体 `perf/gdb` 锁定 discover 热点已前移到
+          `fb_toast_store_put_tuple()` / `hash_search`
+    - [x] 补 contract regression，锁住 discover 不再写 TOAST store
+    - [x] discover / shared warm backtrack 不再创建 `discover_toast_store`
+  - [ ] 收口 discover early-skip 记录的 full materialization
+    - [x] 用 live `perf` 锁定 discover 新热点已前移到
+          `fb_wal_record_cursor_read()` / `fb_wal_load_record_by_lsn()`
+    - [x] 补 contract regression，锁住
+          discover skip path `payload_loads=0`
+    - [x] discover pass 改为 skeleton read + on-demand payload materialize
+    - [ ] 收口 applied record 的二次 `XLogReadRecord()`
+      - [x] live `perf` 已确认当前 discover 路径存在
+            `skeleton read + materialize reread`
+      - [x] 补 contract regression，锁住
+            `skeleton -> materialize` 只读一次 WAL record
+      - [x] applied discover record 复用同一 materializer reader，
+            不再二次 WAL reread
+      - [x] 14pg targeted regressions 单测通过：
+            `fb_replay_discover_toast`
+            `fb_replay_discover_skip_payload`
+            `fb_replay_discover_materialize_reuse`
+      - [ ] live `perf` 继续收口当前新热点：
+            `ValidXLogRecord/XLogReadRecord` 首读
+            与 `fb_replay_get_block/hash_search`
+  - [ ] 复跑 14pg 原始现场 SQL，确认：
+        - 不再先撞 `BlockReplayStore` memory limit
+        - 总耗时继续向 `< 60s` 收口
+- [ ] 收口 `8/9 applying reverse ops` 的主热点
+  - [x] 用 14pg `alldb` 高内存完整链路确认：
+        `8/9` 已是当前最大隐藏时长热点
+  - [x] 用热点采样收口 `8/9` 真正时间归属
+        当前最高优先 root cause 为：
+        大表 `relpages` 被 `FB_APPLY_PARALLEL_MAX_REL_PAGES`
+        硬编码上限挡掉并行 apply
+  - [ ] 补 contract regression，锁住“大表 relpages 不再被错误排除”
+  - [ ] 收口/放开 apply parallel 的 `relpages` 上限 gate
+  - [ ] 只保留一个最终主方案继续压整条 SQL 到 `< 60s`
+- [ ] 收口 `6/9 replay final / prune lookahead` 的 WAL 冷读放大
+  - [x] 补 contract regression，锁住 prune lookahead
+        不再触发 full payload load
+  - [x] 新增 `lookahead metadata-only` cursor 读取
+  - [ ] 删除 `6/9` backward prune prepass
+    - [ ] `3/9` payload 直接产出 compact future-block delta
+    - [x] final 不再调用 `fb_replay_build_prune_lookahead()`
+    - [x] `prune_lookahead` 从 `record_index -> hash_search`
+          改为 dense vector 读取
+    - [ ] 14pg 同一条 live SQL 验证 `6/9` 至少下降 `40%`
+  - [ ] 将 discover 从“全量 apply”收窄到 `frontier apply`
+    - [ ] `3/9` 产出 block frontier / dependency 元数据
+    - [x] discover 只对 missing-block 闭包相关 record 做 materialize/apply
+    - [x] 其余 record 保持 skeleton-only
+    - [ ] live 正确性仍未过：
+          `scenario_oa_50t_50000r.documents @ 2026-04-11 07:40:40.223683+00`
+          仍报 `missing FPI for block 487549`
+  - [ ] 复跑 14pg 原始现场 SQL，确认整条链路继续向 `< 60s` 收口
 - [x] 收口 `3/9 build record index` 的 payload progress notice 语义
   - [x] 确认 `70% payload` 与 `100% payload` 是否需要对外并存
   - [x] 若可合并，仅保留单条对外 `payload` notice
@@ -815,6 +982,10 @@
   - [ ] 在 summary 命中 / locator 命中 / metadata fallback 三类路径下补齐 dedicated 回归
   - [ ] 重新开放 `FbCountAggScan` 与 `count_only_fast_path`
   - [ ] 复核恢复后的 correctness 与性能收益
+  - [ ] 处理默认会话仍走 `Aggregate -> Function Scan on pg_flashback` 的边界
+    - 当前用户现场 `count(*)` 没有吃到 `CustomScan/FbCountAggScan`
+    - 要么让 planner/custom-scan 在无 preload 会话里真正接管
+    - 要么给 SRF 主链补正确的 count-only 执行链
 
 - [x] 收敛 `documents @ '2026-04-04 23:40:13'` 的 `4/9 replay discover` 与通用 WAL 物化浪费
   - [x] 已完成 live `perf/gdb` 定位，确认热点不在 anchor lookup
@@ -1472,6 +1643,10 @@
     - 大表保护阈值，避免未成熟 apply 并行拖慢 live case
     - 串行 apply 热路径的 direct single-typed probe / bloom 风格 negative filter / CustomScan raw slot return
   - 但 live case 仍明显受 `tuple spool + leader 回读` 传输模型拖累，当前保持关闭，后续需要改成更低传输开销的方案
+  - `2026-04-12` 当前 `documents @ '2026-04-11 07:40:40.223683+00'`
+    live case 已确认：
+    - `fb_apply_debug(...) = mode=keyed apply_parallel=on parallel_logs=2 fast_path=off`
+    - 说明当前不是“并行 apply 门没开”，而是 SRF 主链下 `8/9` 传输/消费模型仍然过重
   - 当前第一阶段聚焦：
     - keyed + 单列 typed key
     - 继续把 `documents(id)` 这类 keyed live case 打到稳定优于上一轮串行 apply 基线

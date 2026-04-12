@@ -27,6 +27,8 @@
 #include "storage/dsm.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/lock.h"
+#include "storage/lockdefs.h"
 #include "storage/standbydefs.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -38,14 +40,40 @@
 #include "fb_guc.h"
 #include "fb_ckwal.h"
 #include "fb_progress.h"
+#include "fb_replay.h"
 #include "fb_runtime.h"
 #include "fb_summary.h"
 #include "fb_summary_service.h"
 #include "fb_wal.h"
 
 PG_FUNCTION_INFO_V1(pg_flashback_debug_unresolv_xid);
+PG_FUNCTION_INFO_V1(fb_dml_profile_counter_reset_contract_debug);
+PG_FUNCTION_INFO_V1(fb_wal_locator_stream_contract_debug);
+PG_FUNCTION_INFO_V1(fb_wal_locator_window_serial_contract_debug);
+PG_FUNCTION_INFO_V1(fb_wal_parallel_missing_continuity_contract_debug);
+PG_FUNCTION_INFO_V1(fb_wal_payload_metadata_contract_debug);
+PG_FUNCTION_INFO_V1(fb_wal_locator_reader_profile_contract_debug);
 
 static bool fb_wal_payload_kind_enabled(uint8 kind);
+
+static bool fb_wal_debug_payload_load_counter_enabled = false;
+static uint64 fb_wal_debug_payload_load_counter = 0;
+static bool fb_wal_debug_record_read_counter_enabled = false;
+static uint64 fb_wal_debug_record_read_counter = 0;
+
+static inline void
+fb_wal_debug_note_payload_load(void)
+{
+	if (fb_wal_debug_payload_load_counter_enabled)
+		fb_wal_debug_payload_load_counter++;
+}
+
+static inline void
+fb_wal_debug_note_record_read(void)
+{
+	if (fb_wal_debug_record_read_counter_enabled)
+		fb_wal_debug_record_read_counter++;
+}
 
 static bool fb_record_touches_main_relation(XLogReaderState *reader,
 											const FbRelationInfo *info);
@@ -60,6 +88,16 @@ static void fb_append_touched_xid_hash_samples(StringInfo buf,
 static void fb_append_unsafe_xid_hash_samples(StringInfo buf,
 											  HTAB *xids,
 											  uint32 limit);
+static bool fb_wal_should_capture_locator_stub_stats_parallel(const FbWalScanContext *ctx,
+															  uint32 payload_locator_count,
+															  uint32 fallback_window_count,
+															  bool count_only_mode);
+static bool fb_wal_should_materialize_payload_locators_parallel(const FbWalScanContext *ctx,
+																uint32 window_count,
+																uint32 locator_count);
+static XLogRecPtr fb_wal_payload_locator_small_gap_limit(const FbWalScanContext *ctx);
+static bool fb_wal_should_visit_payload_locators_windowed_serial(uint32 window_count,
+																 uint32 locator_count);
 
 #if !defined(HAVE_MEMMEM)
 /*
@@ -101,8 +139,13 @@ typedef enum FbWalSourceKind
 typedef enum FbWalOpenPattern
 {
 	FB_WAL_OPEN_SEQUENTIAL = 0,
+	FB_WAL_OPEN_STREAMING,
 	FB_WAL_OPEN_SPARSE
 } FbWalOpenPattern;
+
+static FbWalOpenPattern fb_wal_payload_locator_open_pattern(const FbWalScanContext *ctx,
+															uint32 locator_count,
+															uint32 locator_segment_count);
 
 /*
  * FbWalReaderPrivate
@@ -273,6 +316,8 @@ typedef struct FbCountOnlyXidEntry
 	uint64 update_record_count;
 } FbCountOnlyXidEntry;
 
+typedef struct FbWalPayloadStatsEntry FbWalPayloadStatsEntry;
+
 /*
  * FbWalIndexBuildState
  *    Tracks WAL index build state.
@@ -296,8 +341,13 @@ typedef struct FbWalIndexBuildState
 	bool payload_stats_only_capture;
 	FbSpoolLog **payload_log;
 	const char *payload_label;
+	FbSpoolLog **payload_lookahead_log;
+	const char *payload_lookahead_label;
 	FbSpoolLog **payload_stats_log;
 	const char *payload_stats_label;
+	FbWalPayloadStatsEntry *payload_stats_entries;
+	uint32 payload_stats_entry_base;
+	uint32 payload_stats_entry_capacity;
 	XLogRecPtr payload_emit_start_lsn;
 	XLogRecPtr payload_emit_end_lsn;
 	const FbSummaryPayloadLocator *payload_locators;
@@ -349,13 +399,13 @@ typedef struct FbSerializedRecordHeader
 	FbSerializedRecordBlockRef blocks[FB_WAL_MAX_BLOCK_REFS];
 } FbSerializedRecordHeader;
 
-typedef struct FbWalPayloadStatsEntry
+struct FbWalPayloadStatsEntry
 {
 	XLogRecPtr lsn;
 	TransactionId xid;
 	FbWalRecordKind kind;
 	uint8 flags;
-} FbWalPayloadStatsEntry;
+};
 
 #define FB_WAL_PAYLOAD_STATS_FLAG_SPECULATIVE_INSERT 0x01
 #define FB_WAL_PAYLOAD_STATS_FLAG_SUPER_DELETE 0x02
@@ -374,10 +424,14 @@ struct FbWalRecordCursor
 {
 	const FbWalRecordIndex *index;
 	FbSpoolCursor *head_cursor;
+	FbSpoolCursor *lookahead_head_cursor;
 	FbSpoolCursor *tail_cursor;
 	FbSpoolCursor *active_cursor;
 	FbSpoolDirection direction;
+	uint32 locator_count;
+	uint32 head_spool_count;
 	uint32 head_count;
+	uint32 locator_next_index;
 	bool reading_tail;
 	StringInfoData raw;
 	FbRecordRef current;
@@ -388,8 +442,55 @@ struct FbWalRecordCursor
 typedef enum FbWalCursorReadMode
 {
 	FB_WAL_CURSOR_READ_FULL = 0,
-	FB_WAL_CURSOR_READ_SKELETON
+	FB_WAL_CURSOR_READ_SKELETON,
+	FB_WAL_CURSOR_READ_PRUNE_LOOKAHEAD
 } FbWalCursorReadMode;
+
+typedef enum FbWalRecordCopyMode
+{
+	FB_WAL_RECORD_COPY_NONE = 0,
+	FB_WAL_RECORD_COPY_FULL,
+	FB_WAL_RECORD_COPY_PRUNE_LOOKAHEAD
+} FbWalRecordCopyMode;
+
+static inline FbWalRecordCopyMode
+fb_wal_record_copy_mode_from_cursor_mode(FbWalCursorReadMode read_mode)
+{
+	switch (read_mode)
+	{
+		case FB_WAL_CURSOR_READ_FULL:
+			return FB_WAL_RECORD_COPY_FULL;
+		case FB_WAL_CURSOR_READ_PRUNE_LOOKAHEAD:
+			return FB_WAL_RECORD_COPY_PRUNE_LOOKAHEAD;
+		case FB_WAL_CURSOR_READ_SKELETON:
+		default:
+			return FB_WAL_RECORD_COPY_NONE;
+	}
+}
+
+static inline bool
+fb_wal_record_copy_main_data(FbWalRecordCopyMode copy_mode)
+{
+	return copy_mode != FB_WAL_RECORD_COPY_NONE;
+}
+
+static inline bool
+fb_wal_record_copy_block_data(FbWalRecordKind kind,
+								 FbWalRecordCopyMode copy_mode)
+{
+	if (copy_mode == FB_WAL_RECORD_COPY_FULL)
+		return true;
+	if (copy_mode == FB_WAL_RECORD_COPY_PRUNE_LOOKAHEAD &&
+		kind == FB_WAL_RECORD_HEAP2_PRUNE)
+		return true;
+	return false;
+}
+
+static inline bool
+fb_wal_record_copy_block_image(FbWalRecordCopyMode copy_mode)
+{
+	return copy_mode == FB_WAL_RECORD_COPY_FULL;
+}
 
 typedef struct FbWalRecordMaterializer
 {
@@ -588,6 +689,9 @@ typedef struct FbWalPayloadTask
 	uint32 record_count;
 	uint32 stats_count;
 	uint32 missing_block_count;
+	uint32 lookahead_record_count;
+	uint32 initialized_block_count;
+	uint32 replay_block_metadata_count;
 	uint64 scanned_record_count;
 	uint64 reader_reset_count;
 	uint64 reader_reuse_count;
@@ -597,8 +701,10 @@ typedef struct FbWalPayloadTask
 	uint64 target_delete_count;
 	uint64 target_update_count;
 	char spool_path[MAXPGPATH];
-	char stats_path[MAXPGPATH];
+	char lookahead_path[MAXPGPATH];
 	char missing_blocks_path[MAXPGPATH];
+	char initialized_blocks_path[MAXPGPATH];
+	char replay_block_metadata_path[MAXPGPATH];
 	char archive_dest[MAXPGPATH];
 	char archive_dir[MAXPGPATH];
 	char debug_pg_wal_dir[MAXPGPATH];
@@ -620,6 +726,7 @@ typedef struct FbWalPayloadShared
 	Size windows_offset;
 	Size segments_offset;
 	Size locators_offset;
+	Size stats_offset;
 	char data[FLEXIBLE_ARRAY_MEMBER];
 } FbWalPayloadShared;
 
@@ -791,8 +898,13 @@ static FbWalSegmentEntry *fb_wal_prepare_segment(FbWalReaderPrivate *private,
 												 XLogSegNo next_segno);
 static void fb_wal_close_private_file(FbWalReaderPrivate *private);
 static void fb_wal_reset_record_stats(FbWalRecordIndex *index);
+static void fb_wal_reset_replay_block_metadata(FbWalRecordIndex *index);
 static void fb_wal_finalize_record_stats(FbWalRecordIndex *index);
+static bool fb_wal_should_finalize_record_stats_after_payload(const FbWalRecordIndex *index,
+															  bool count_only_mode);
+static void fb_wal_mark_payload_metadata_complete(FbWalRecordIndex *index);
 static HTAB *fb_wal_create_precomputed_missing_block_hash(void);
+static HTAB *fb_wal_create_replay_block_metadata_hash(void);
 static HTAB *fb_wal_create_block_init_state_hash(void);
 static HTAB *fb_create_target_snapshot_xid_hash(void);
 static TransactionId fb_parse_target_snapshot_field_xid(const char *field_text,
@@ -812,6 +924,9 @@ static void fb_wal_note_precomputed_missing_blocks(FbWalRecordIndex *index,
 												   HTAB *block_states,
 												   const FbRecordRef *record,
 												   uint32 record_index);
+static void fb_wal_note_replay_block_metadata(FbWalRecordIndex *index,
+											  const FbRecordRef *record,
+											  uint32 record_index);
 static uint32 fb_wal_count_window_segments(const FbWalVisitWindow *windows,
 										   uint32 window_count);
 static uint32 fb_build_prefilter_visit_windows(FbWalScanContext *ctx,
@@ -906,36 +1021,41 @@ static bool fb_record_is_super_delete(const FbRecordRef *record);
 static char *fb_copy_bytes(const char *data, Size len);
 static void fb_record_release_temp(FbRecordRef *record);
 static bool fb_record_ref_needs_payload_materialization(const FbRecordRef *record);
+static bool fb_record_ref_needs_prune_lookahead_materialization(const FbRecordRef *record);
 static void fb_wal_record_materializer_init(FbWalRecordMaterializer *materializer,
 											 const FbWalRecordIndex *index);
 static void fb_wal_record_materializer_destroy(FbWalRecordMaterializer *materializer);
 static void fb_wal_record_materializer_note_usage(FbWalRecordMaterializer *materializer);
+static bool fb_wal_record_materializer_reader_matches(FbWalRecordMaterializer *materializer,
+													  XLogRecPtr record_lsn,
+													  XLogRecPtr end_lsn);
 static void fb_wal_record_materializer_load_record(FbWalRecordMaterializer *materializer,
 													XLogRecPtr record_lsn,
 													FbRecordRef *record_out,
-													bool include_payload);
+													FbWalCursorReadMode read_mode);
 static void fb_wal_load_record_by_lsn(const FbWalRecordIndex *index,
 									  XLogRecPtr record_lsn,
 									  FbRecordRef *record_out,
-									  bool include_payload,
+									  FbWalCursorReadMode read_mode,
 									  FbWalRecordMaterializer *materializer);
 static void fb_fill_record_block_ref(FbRecordBlockRef *block_ref,
 									 XLogReaderState *reader,
 									 uint8 block_id,
 									 const FbRelationInfo *info,
-									 bool copy_payload);
+									 FbWalRecordKind kind,
+									 FbWalRecordCopyMode copy_mode);
 static bool fb_heap_record_matches_target(XLogReaderState *reader,
 										  const FbRelationInfo *info);
 static bool fb_wal_build_heap_record_ref(XLogReaderState *reader,
 										 const FbRelationInfo *info,
 										 FbWalRecordKind kind,
 										 FbRecordRef *record_out,
-										 bool include_payload);
+										 FbWalRecordCopyMode copy_mode);
 static bool fb_wal_build_xlog_fpi_record_ref(XLogReaderState *reader,
 											 const FbRelationInfo *info,
 											 FbWalRecordKind kind,
 											 FbRecordRef *record_out,
-											 bool include_payload);
+											 FbWalRecordCopyMode copy_mode);
 /*
  * fb_segment_start_lsn
  *    WAL helper.
@@ -979,6 +1099,7 @@ static FbWalPayloadTask *fb_wal_payload_tasks(FbWalPayloadShared *shared);
 static FbWalParallelWindow *fb_wal_payload_windows(FbWalPayloadShared *shared);
 static FbWalSegmentEntry *fb_wal_payload_segments(FbWalPayloadShared *shared);
 static FbSummaryPayloadLocator *fb_wal_payload_locators_shared(FbWalPayloadShared *shared);
+static FbWalPayloadStatsEntry *fb_wal_payload_stats_shared(FbWalPayloadShared *shared);
 static FbWalMetadataCollectTask *fb_wal_metadata_collect_tasks(FbWalMetadataCollectShared *shared);
 static FbWalParallelWindow *fb_wal_metadata_collect_windows(FbWalMetadataCollectShared *shared);
 static FbWalSegmentEntry *fb_wal_metadata_collect_segments(FbWalMetadataCollectShared *shared);
@@ -1000,8 +1121,10 @@ static void fb_wal_payload_fill_task(FbWalPayloadTask *task,
 									 uint32 locator_start,
 									 uint32 locator_count,
 									 const char *spool_path,
-									 const char *stats_path,
-									 const char *missing_blocks_path);
+									 const char *lookahead_path,
+									 const char *missing_blocks_path,
+									 const char *initialized_blocks_path,
+									 const char *replay_block_metadata_path);
 static bool fb_wal_payload_launch_worker(dsm_handle handle,
 										 int task_index,
 										 BackgroundWorkerHandle **handle_out);
@@ -1015,16 +1138,34 @@ static void fb_wal_dump_payload_stats_log(FbSpoolLog **log_ptr,
 										  const char *label,
 										  const FbRecordRef *record,
 										  uint8 flags);
-static void fb_wal_merge_payload_stats_log(FbWalRecordIndex *index,
-										   const char *path,
-										   uint32 item_count);
+static void fb_wal_append_serialized_record(FbSpoolLog *log,
+											const FbRecordRef *record,
+											bool defer_payload_body);
+static void fb_wal_merge_payload_stats_entries(FbWalRecordIndex *index,
+											   const FbWalPayloadStatsEntry *entries,
+											   uint32 item_count);
 static void fb_wal_dump_missing_blocks(HTAB *missing_blocks,
 									   const char *path,
 									   uint32 *count_out);
+static HTAB *fb_wal_create_block_key_hash(void);
+static void fb_wal_dump_initialized_blocks(HTAB *block_states,
+										   const char *path,
+										   uint32 *count_out);
+static void fb_wal_merge_initialized_blocks(HTAB *dest,
+											const char *path,
+											uint32 item_count);
+static void fb_wal_dump_replay_block_metadata(HTAB *metadata,
+											  const char *path,
+											  uint32 *count_out);
+static void fb_wal_merge_replay_block_metadata(FbWalRecordIndex *index,
+											   const char *path,
+											   uint32 item_count,
+											   uint32 record_index_base);
 static void fb_wal_merge_missing_blocks(FbWalRecordIndex *index,
 										const char *path,
 										uint32 item_count,
-										uint32 record_index_base);
+										uint32 record_index_base,
+										HTAB *initialized_prefix);
 static void fb_wal_metadata_collect_capture_gucs(FbWalMetadataCollectTask *task);
 static void fb_wal_metadata_collect_apply_gucs(const FbWalMetadataCollectTask *task);
 static void fb_wal_metadata_collect_fill_task(FbWalMetadataCollectTask *task,
@@ -1248,6 +1389,10 @@ static uint32 fb_build_payload_locator_visit_windows(FbWalScanContext *ctx,
 													 const FbSummaryPayloadLocator *locators,
 													 uint32 locator_count,
 													 FbWalVisitWindow **windows_out);
+static uint32 fb_wal_find_payload_locator_window_end_index(const FbSummaryPayloadLocator *locators,
+															   uint32 locator_count,
+															   uint32 start_index,
+															   XLogRecPtr end_lsn);
 static uint32 fb_build_summary_payload_locator_plan(const FbRelationInfo *info,
 													FbWalScanContext *ctx,
 													const FbWalVisitWindow *base_windows,
@@ -1265,6 +1410,17 @@ static FbWalVisitWindow *fb_copy_visit_windows(const FbWalVisitWindow *windows,
 static uint32 fb_count_payload_locator_segments(FbWalScanContext *ctx,
 												const FbSummaryPayloadLocator *locators,
 												uint32 locator_count);
+static bool fb_wal_should_prefetch_payload_locators(const FbWalScanContext *ctx,
+														uint32 locator_count,
+														uint32 locator_segment_count);
+static bool fb_wal_should_gate_dense_payload_reader(const FbWalScanContext *ctx,
+													 uint32 locator_count,
+													 uint32 locator_segment_count);
+static void fb_wal_acquire_dense_payload_gate(void);
+static void fb_wal_release_dense_payload_gate(void);
+static void fb_wal_prefetch_payload_locator_segments(FbWalScanContext *ctx,
+													 const FbSummaryPayloadLocator *locators,
+													 uint32 locator_count);
 static bool fb_should_use_sparse_payload_scan(uint32 sparse_window_count,
 											  uint32 windowed_window_count,
 											  uint32 covered_segment_count);
@@ -1274,12 +1430,18 @@ static void fb_wal_prepare_payload_read_window(FbWalScanContext *ctx,
 												 uint32 all_segment_count,
 												 FbWalVisitWindow *read_window);
 static uint32 fb_wal_visit_payload_locators_exact(FbWalScanContext *ctx,
-												  const FbSummaryPayloadLocator *locators,
-												  uint32 locator_count,
-												  FbWalIndexBuildState *state);
+									  const FbSummaryPayloadLocator *locators,
+									  uint32 locator_count,
+									  FbWalIndexBuildState *state);
+static uint32 fb_wal_visit_payload_locators_windowed_serial(FbWalScanContext *ctx,
+															 const FbWalVisitWindow *windows,
+															 uint32 window_count,
+															 const FbSummaryPayloadLocator *locators,
+															 uint32 locator_count,
+															 FbWalIndexBuildState *state);
 static uint32 fb_wal_visit_payload_locators(FbWalScanContext *ctx,
-											const FbSummaryPayloadLocator *locators,
-											uint32 locator_count,
+							  const FbSummaryPayloadLocator *locators,
+							  uint32 locator_count,
 											FbWalIndexBuildState *state);
 static bool fb_wal_visit_windows_share_segment_slice(const FbWalVisitWindow *lhs,
 													 const FbWalVisitWindow *rhs);
@@ -2307,6 +2469,12 @@ fb_wal_payload_locators_shared(FbWalPayloadShared *shared)
 	return (FbSummaryPayloadLocator *) ((char *) shared + shared->locators_offset);
 }
 
+static FbWalPayloadStatsEntry *
+fb_wal_payload_stats_shared(FbWalPayloadShared *shared)
+{
+	return (FbWalPayloadStatsEntry *) ((char *) shared + shared->stats_offset);
+}
+
 static FbWalMetadataCollectTask *
 fb_wal_metadata_collect_tasks(FbWalMetadataCollectShared *shared)
 {
@@ -2438,13 +2606,14 @@ fb_wal_payload_fill_task(FbWalPayloadTask *task,
 						 uint32 locator_start,
 						 uint32 locator_count,
 						 const char *spool_path,
-						 const char *stats_path,
-						 const char *missing_blocks_path)
+						 const char *lookahead_path,
+						 const char *missing_blocks_path,
+						 const char *initialized_blocks_path,
+						 const char *replay_block_metadata_path)
 {
 	if (task == NULL || info == NULL ||
 		(!capture_stats_only && spool_path == NULL) ||
-		(capture_stats_only &&
-		 (stats_path == NULL || missing_blocks_path == NULL)))
+		(capture_stats_only && missing_blocks_path == NULL))
 		return;
 
 	MemSet(task, 0, sizeof(*task));
@@ -2463,12 +2632,20 @@ fb_wal_payload_fill_task(FbWalPayloadTask *task,
 	task->locator_count = locator_count;
 	if (spool_path != NULL)
 		strlcpy(task->spool_path, spool_path, sizeof(task->spool_path));
-	if (stats_path != NULL)
-		strlcpy(task->stats_path, stats_path, sizeof(task->stats_path));
+	if (lookahead_path != NULL)
+		strlcpy(task->lookahead_path, lookahead_path, sizeof(task->lookahead_path));
 	if (missing_blocks_path != NULL)
 		strlcpy(task->missing_blocks_path,
 				missing_blocks_path,
 				sizeof(task->missing_blocks_path));
+	if (initialized_blocks_path != NULL)
+		strlcpy(task->initialized_blocks_path,
+				initialized_blocks_path,
+				sizeof(task->initialized_blocks_path));
+	if (replay_block_metadata_path != NULL)
+		strlcpy(task->replay_block_metadata_path,
+				replay_block_metadata_path,
+				sizeof(task->replay_block_metadata_path));
 	fb_wal_payload_capture_gucs(task);
 }
 
@@ -3961,8 +4138,7 @@ fb_build_payload_locator_visit_windows(FbWalScanContext *ctx,
 		return 0;
 
 	windows = palloc0(sizeof(*windows) * locator_count);
-	gap_limit = Max((XLogRecPtr) (ctx->wal_seg_size / 8),
-					(XLogRecPtr) (XLOG_BLCKSZ * 8));
+	gap_limit = fb_wal_payload_locator_small_gap_limit(ctx);
 
 	for (i = 0; i < locator_count; i++)
 	{
@@ -4025,6 +4201,24 @@ fb_build_payload_locator_visit_windows(FbWalScanContext *ctx,
 	else
 		pfree(windows);
 	return window_count;
+}
+
+static uint32
+fb_wal_find_payload_locator_window_end_index(const FbSummaryPayloadLocator *locators,
+												 uint32 locator_count,
+												 uint32 start_index,
+												 XLogRecPtr end_lsn)
+{
+	uint32 index = start_index;
+
+	if (locators == NULL || start_index >= locator_count)
+		return start_index;
+
+	while (index < locator_count &&
+		   locators[index].record_start_lsn < end_lsn)
+		index++;
+
+	return index;
 }
 
 static uint32
@@ -4547,11 +4741,14 @@ fb_open_file_at_path(const char *path, FbWalOpenPattern open_pattern)
 				 errmsg("could not open file \"%s\": %m", path)));
 
 #ifdef USE_POSIX_FADVISE
-	if (fd >= 0 && open_pattern == FB_WAL_OPEN_SEQUENTIAL)
+	if (fd >= 0 &&
+		(open_pattern == FB_WAL_OPEN_SEQUENTIAL ||
+		 open_pattern == FB_WAL_OPEN_STREAMING))
 	{
 		(void) posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 #ifdef POSIX_FADV_WILLNEED
-		(void) posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+		if (open_pattern == FB_WAL_OPEN_SEQUENTIAL)
+			(void) posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
 #endif
 	}
 #endif
@@ -4746,16 +4943,26 @@ fb_find_segment_index_for_lsn(FbWalSegmentEntry *segments, int segment_count,
 							 XLogRecPtr lsn, int wal_seg_size)
 {
 	XLogSegNo segno;
-	int i;
+	int low;
+	int high;
 
 	if (segments == NULL || segment_count <= 0 || XLogRecPtrIsInvalid(lsn))
 		return -1;
 
 	XLByteToSeg(lsn, segno, wal_seg_size);
-	for (i = 0; i < segment_count; i++)
+	low = 0;
+	high = segment_count - 1;
+
+	while (low <= high)
 	{
-		if (segments[i].segno == segno)
-			return i;
+		int mid = low + ((high - low) / 2);
+
+		if (segments[mid].segno == segno)
+			return mid;
+		if (segments[mid].segno < segno)
+			low = mid + 1;
+		else
+			high = mid - 1;
 	}
 
 	return -1;
@@ -6242,6 +6449,42 @@ fb_wal_record_materializer_init(FbWalRecordMaterializer *materializer,
 	materializer->private.ctx = &materializer->ctx;
 }
 
+void
+fb_wal_debug_payload_load_counter_reset(void)
+{
+	fb_wal_debug_payload_load_counter = 0;
+}
+
+void
+fb_wal_debug_payload_load_counter_enable(bool enable)
+{
+	fb_wal_debug_payload_load_counter_enabled = enable;
+}
+
+uint64
+fb_wal_debug_payload_load_counter_value(void)
+{
+	return fb_wal_debug_payload_load_counter;
+}
+
+void
+fb_wal_debug_record_read_counter_reset(void)
+{
+	fb_wal_debug_record_read_counter = 0;
+}
+
+void
+fb_wal_debug_record_read_counter_enable(bool enable)
+{
+	fb_wal_debug_record_read_counter_enabled = enable;
+}
+
+uint64
+fb_wal_debug_record_read_counter_value(void)
+{
+	return fb_wal_debug_record_read_counter;
+}
+
 static void
 fb_wal_record_materializer_note_usage(FbWalRecordMaterializer *materializer)
 {
@@ -6315,18 +6558,30 @@ fb_wal_record_materializer_destroy(FbWalRecordMaterializer *materializer)
 	}
 }
 
+static bool
+fb_wal_record_materializer_reader_matches(FbWalRecordMaterializer *materializer,
+													  XLogRecPtr record_lsn,
+													  XLogRecPtr end_lsn)
+{
+	if (materializer == NULL || materializer->reader == NULL)
+		return false;
+
+	return materializer->reader->ReadRecPtr == record_lsn &&
+		materializer->reader->EndRecPtr == end_lsn;
+}
+
 static void
 fb_wal_record_materializer_load_record(FbWalRecordMaterializer *materializer,
 										XLogRecPtr record_lsn,
 										FbRecordRef *record_out,
-										bool include_payload)
+										FbWalCursorReadMode read_mode)
 {
 	if (materializer != NULL)
 		materializer->locator_stub_materializations++;
 	fb_wal_load_record_by_lsn(materializer != NULL ? materializer->index : NULL,
 							  record_lsn,
 							  record_out,
-							  include_payload,
+							  read_mode,
 							  materializer);
 }
 
@@ -6414,6 +6669,7 @@ fb_wal_materialize_record_payload(const FbWalRecordIndex *index,
 		return;
 	if (!fb_record_ref_needs_payload_materialization(record))
 		return;
+	fb_wal_debug_note_payload_load();
 	if (XLogRecPtrIsInvalid(record->lsn))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
@@ -6435,19 +6691,27 @@ fb_wal_materialize_record_payload(const FbWalRecordIndex *index,
 	active_materializer->private.endptr_reached = false;
 	reader = active_materializer->reader;
 
+	if (!fb_wal_record_materializer_reader_matches(active_materializer,
+												   record->lsn,
+												   record->end_lsn))
+	{
 #if PG_VERSION_NUM < 130000
-	xlog_record = XLogReadRecord(reader, record->lsn, &errormsg);
+		xlog_record = NULL;
+		fb_wal_debug_note_record_read();
+		xlog_record = XLogReadRecord(reader, record->lsn, &errormsg);
 #else
-	XLogBeginRead(reader, record->lsn);
-	xlog_record = XLogReadRecord(reader, &errormsg);
+		fb_wal_debug_note_record_read();
+		XLogBeginRead(reader, record->lsn);
+		xlog_record = XLogReadRecord(reader, &errormsg);
 #endif
-	if (xlog_record == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("deferred WAL payload read failed at %X/%08X",
-						LSN_FORMAT_ARGS(record->lsn)),
-				 errdetail("%s", errormsg != NULL ? errormsg :
-							   "WAL reader returned no record for a deferred payload entry.")));
+		if (xlog_record == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("deferred WAL payload read failed at %X/%08X",
+							LSN_FORMAT_ARGS(record->lsn)),
+					 errdetail("%s", errormsg != NULL ? errormsg :
+								   "WAL reader returned no record for a deferred payload entry.")));
+	}
 	if (reader->ReadRecPtr != record->lsn ||
 		reader->EndRecPtr != record->end_lsn)
 		ereport(ERROR,
@@ -6513,6 +6777,7 @@ FbWalRecordCursor *
 fb_wal_record_cursor_open(const FbWalRecordIndex *index, FbSpoolDirection direction)
 {
 	FbWalRecordCursor *cursor;
+	uint32 tail_count = 0;
 
 	cursor = palloc0(sizeof(*cursor));
 	cursor->index = index;
@@ -6525,15 +6790,25 @@ fb_wal_record_cursor_open(const FbWalRecordIndex *index, FbSpoolDirection direct
 	initStringInfo(&cursor->raw);
 	if (index != NULL)
 	{
-		cursor->head_count = fb_spool_log_count(index->record_log);
-		if (cursor->head_count > 0)
+		cursor->locator_count = index->locator_stream_count;
+		cursor->head_spool_count = fb_spool_log_count(index->record_log);
+		cursor->head_count = cursor->locator_count + cursor->head_spool_count;
+		tail_count = fb_spool_log_count(index->record_tail_log);
+		cursor->locator_next_index = (direction == FB_SPOOL_FORWARD) ?
+			0 : cursor->locator_count;
+		if (index->lookahead_log != NULL &&
+			fb_spool_log_count(index->lookahead_log) > 0)
+			cursor->lookahead_head_cursor =
+				fb_spool_cursor_open(index->lookahead_log, direction);
+		if (cursor->head_spool_count > 0)
 			cursor->head_cursor = fb_spool_cursor_open(index->record_log, direction);
-		if (fb_spool_log_count(index->record_tail_log) > 0)
+		if (tail_count > 0)
 			cursor->tail_cursor = fb_spool_cursor_open(index->record_tail_log, direction);
 
 		if (direction == FB_SPOOL_FORWARD)
 		{
-			cursor->reading_tail = (cursor->head_cursor == NULL);
+			cursor->reading_tail = (cursor->locator_count == 0 &&
+								   cursor->head_cursor == NULL);
 			cursor->active_cursor = cursor->reading_tail ? cursor->tail_cursor :
 				cursor->head_cursor;
 		}
@@ -6554,6 +6829,9 @@ fb_wal_record_cursor_read_mode(FbWalRecordCursor *cursor,
 							   FbWalCursorReadMode mode)
 {
 	uint32 item_index = 0;
+	const FbSummaryPayloadLocator *locator = NULL;
+	bool locator_from_lookahead = false;
+	bool use_lookahead_stream = false;
 
 	if (cursor == NULL)
 		return false;
@@ -6564,8 +6842,33 @@ fb_wal_record_cursor_read_mode(FbWalRecordCursor *cursor,
 		cursor->current_materialized = false;
 	}
 
+	use_lookahead_stream =
+		(mode == FB_WAL_CURSOR_READ_PRUNE_LOOKAHEAD &&
+		 cursor->lookahead_head_cursor != NULL);
+
+	if (use_lookahead_stream &&
+		cursor->direction == FB_SPOOL_FORWARD &&
+		cursor->locator_next_index < cursor->locator_count)
+	{
+		if (!fb_spool_cursor_read(cursor->lookahead_head_cursor,
+								  &cursor->raw,
+								  &item_index))
+			return false;
+		item_index = cursor->locator_next_index++;
+		locator_from_lookahead = true;
+	}
+	else if (cursor->index != NULL &&
+		cursor->direction == FB_SPOOL_FORWARD &&
+		cursor->locator_next_index < cursor->locator_count)
+	{
+		locator = &cursor->index->locator_stream[cursor->locator_next_index];
+		item_index = cursor->locator_next_index++;
+	}
+
 	while (cursor->active_cursor != NULL)
 	{
+		if (locator != NULL)
+			break;
 		if (fb_spool_cursor_read(cursor->active_cursor, &cursor->raw, &item_index))
 			break;
 
@@ -6586,42 +6889,100 @@ fb_wal_record_cursor_read_mode(FbWalRecordCursor *cursor,
 				cursor->active_cursor = cursor->head_cursor;
 				continue;
 			}
+			if (!cursor->reading_tail)
+			{
+				cursor->active_cursor = NULL;
+				break;
+			}
 		}
 
 		return false;
 	}
 
-	if (cursor->active_cursor == NULL)
-		return false;
-
-	if (cursor->reading_tail)
-		item_index += cursor->head_count;
-
-	if (cursor->raw.len >= sizeof(FbSerializedRecordHeader) &&
-		((const FbSerializedRecordHeader *) cursor->raw.data)->locator_only)
+	if (locator != NULL)
 	{
-		const FbSerializedRecordHeader *hdr =
-			(const FbSerializedRecordHeader *) cursor->raw.data;
-
 		fb_wal_record_materializer_load_record(cursor->materializer,
-											  hdr->lsn,
+											  locator->record_start_lsn,
 											  &cursor->current,
-											  mode == FB_WAL_CURSOR_READ_FULL);
+											  mode);
 		cursor->current_materialized = true;
 	}
 	else
 	{
-		fb_wal_deserialize_record(cursor->index,
-								  cursor->raw.data,
-								  cursor->raw.len,
-								  &cursor->current);
-		if (mode == FB_WAL_CURSOR_READ_FULL &&
-			fb_record_ref_needs_payload_materialization(&cursor->current))
+		if (cursor->active_cursor == NULL)
 		{
-			fb_wal_materialize_record_payload(cursor->index,
+			if (cursor->index != NULL &&
+				cursor->direction == FB_SPOOL_BACKWARD &&
+				cursor->locator_next_index > 0)
+			{
+				if (use_lookahead_stream)
+				{
+					if (!fb_spool_cursor_read(cursor->lookahead_head_cursor,
+											  &cursor->raw,
+											  &item_index))
+						return false;
+					item_index = --cursor->locator_next_index;
+					locator_from_lookahead = true;
+				}
+				else
+				{
+					locator = &cursor->index->locator_stream[--cursor->locator_next_index];
+					item_index = cursor->locator_next_index;
+					fb_wal_record_materializer_load_record(cursor->materializer,
+													  locator->record_start_lsn,
+													  &cursor->current,
+													  mode);
+					cursor->current_materialized = true;
+				}
+			}
+			else
+				return false;
+		}
+
+		if (locator == NULL)
+		{
+			if (!locator_from_lookahead && cursor->reading_tail)
+				item_index += cursor->head_count;
+			else if (!locator_from_lookahead)
+				item_index += cursor->locator_count;
+
+			if (cursor->raw.len >= sizeof(FbSerializedRecordHeader) &&
+				((const FbSerializedRecordHeader *) cursor->raw.data)->locator_only)
+			{
+				const FbSerializedRecordHeader *hdr =
+					(const FbSerializedRecordHeader *) cursor->raw.data;
+
+				fb_wal_record_materializer_load_record(cursor->materializer,
+											  hdr->lsn,
 											  &cursor->current,
+											  mode);
+				cursor->current_materialized = true;
+			}
+			else
+			{
+				fb_wal_deserialize_record(cursor->index,
+										  cursor->raw.data,
+										  cursor->raw.len,
+										  &cursor->current);
+				if (mode == FB_WAL_CURSOR_READ_FULL &&
+					fb_record_ref_needs_payload_materialization(&cursor->current))
+				{
+					fb_wal_materialize_record_payload(cursor->index,
+												  &cursor->current,
+												  cursor->materializer);
+					cursor->current_materialized = true;
+				}
+				else if (mode == FB_WAL_CURSOR_READ_PRUNE_LOOKAHEAD &&
+						 fb_record_ref_needs_prune_lookahead_materialization(&cursor->current))
+				{
+					fb_wal_load_record_by_lsn(cursor->index,
+											  cursor->current.lsn,
+											  &cursor->current,
+											  mode,
 											  cursor->materializer);
-			cursor->current_materialized = true;
+					cursor->current_materialized = true;
+				}
+			}
 		}
 	}
 	if (record != NULL)
@@ -6642,16 +7003,36 @@ fb_wal_record_cursor_seek(FbWalRecordCursor *cursor, uint32 record_index)
 
 	tail_count = (cursor->index == NULL) ? 0 :
 		fb_spool_log_count(cursor->index->record_tail_log);
-	if (record_index > cursor->head_count + tail_count)
+	if (record_index >= cursor->head_count + tail_count)
 		return false;
 
+	if (cursor->head_cursor != NULL)
+		fb_spool_cursor_seek_item(cursor->head_cursor, 0);
+	if (cursor->lookahead_head_cursor != NULL)
+		fb_spool_cursor_seek_item(cursor->lookahead_head_cursor, 0);
+	if (cursor->tail_cursor != NULL)
+		fb_spool_cursor_seek_item(cursor->tail_cursor, 0);
+
+	if (record_index < cursor->locator_count)
+	{
+		cursor->locator_next_index = record_index;
+		cursor->reading_tail = false;
+		cursor->active_cursor = (cursor->head_cursor != NULL) ? cursor->head_cursor :
+			cursor->tail_cursor;
+		if (cursor->lookahead_head_cursor != NULL)
+			fb_spool_cursor_seek_item(cursor->lookahead_head_cursor, record_index);
+		return true;
+	}
+
+	cursor->locator_next_index = cursor->locator_count;
 	if (record_index < cursor->head_count ||
 		(record_index == cursor->head_count && cursor->head_cursor != NULL && cursor->tail_cursor == NULL))
 	{
 		cursor->reading_tail = false;
 		cursor->active_cursor = cursor->head_cursor;
 		return (cursor->head_cursor != NULL) &&
-			fb_spool_cursor_seek_item(cursor->head_cursor, record_index);
+			fb_spool_cursor_seek_item(cursor->head_cursor,
+									 record_index - cursor->locator_count);
 	}
 
 	tail_index = record_index - cursor->head_count;
@@ -6683,6 +7064,35 @@ fb_wal_record_cursor_read_skeleton(FbWalRecordCursor *cursor,
 										  FB_WAL_CURSOR_READ_SKELETON);
 }
 
+bool
+fb_wal_record_cursor_read_lookahead(FbWalRecordCursor *cursor,
+									 FbRecordRef *record,
+									 uint32 *record_index)
+{
+	return fb_wal_record_cursor_read_mode(cursor,
+										  record,
+										  record_index,
+										  FB_WAL_CURSOR_READ_PRUNE_LOOKAHEAD);
+}
+
+void
+fb_wal_record_cursor_materialize(FbWalRecordCursor *cursor,
+								 FbRecordRef *record)
+{
+	if (cursor == NULL || record == NULL || cursor->index == NULL)
+		return;
+
+	if (fb_record_ref_needs_payload_materialization(&cursor->current))
+	{
+		fb_wal_materialize_record_payload(cursor->index,
+										  &cursor->current,
+										  cursor->materializer);
+		cursor->current_materialized = true;
+	}
+
+	*record = cursor->current;
+}
+
 void
 fb_wal_record_cursor_close(FbWalRecordCursor *cursor)
 {
@@ -6694,6 +7104,8 @@ fb_wal_record_cursor_close(FbWalRecordCursor *cursor)
 
 	if (cursor->head_cursor != NULL)
 		fb_spool_cursor_close(cursor->head_cursor);
+	if (cursor->lookahead_head_cursor != NULL)
+		fb_spool_cursor_close(cursor->lookahead_head_cursor);
 	if (cursor->tail_cursor != NULL)
 		fb_spool_cursor_close(cursor->tail_cursor);
 	if (cursor->raw.data != NULL)
@@ -6730,7 +7142,7 @@ fb_wal_build_heap_record_ref(XLogReaderState *reader,
 							 const FbRelationInfo *info,
 							 FbWalRecordKind kind,
 							 FbRecordRef *record_out,
-							 bool include_payload)
+							 FbWalRecordCopyMode copy_mode)
 {
 	int block_count = 0;
 	int block_id;
@@ -6746,7 +7158,8 @@ fb_wal_build_heap_record_ref(XLogReaderState *reader,
 	record_out->info = XLogRecGetInfo(reader);
 	record_out->init_page = ((XLogRecGetInfo(reader) & XLOG_HEAP_INIT_PAGE) != 0);
 	record_out->main_data_len = XLogRecGetDataLen(reader);
-	if (include_payload && record_out->main_data_len > 0)
+	if (fb_wal_record_copy_main_data(copy_mode) &&
+		record_out->main_data_len > 0)
 		record_out->main_data = fb_copy_bytes(XLogRecGetData(reader),
 											  XLogRecGetDataLen(reader));
 
@@ -6770,7 +7183,8 @@ fb_wal_build_heap_record_ref(XLogReaderState *reader,
 								 reader,
 								 block_id,
 								 info,
-								 include_payload);
+								 kind,
+								 copy_mode);
 		block_count++;
 	}
 
@@ -6783,7 +7197,7 @@ fb_wal_build_xlog_fpi_record_ref(XLogReaderState *reader,
 								 const FbRelationInfo *info,
 								 FbWalRecordKind kind,
 								 FbRecordRef *record_out,
-								 bool include_payload)
+								 FbWalRecordCopyMode copy_mode)
 {
 	int block_count = 0;
 	int block_id;
@@ -6819,7 +7233,8 @@ fb_wal_build_xlog_fpi_record_ref(XLogReaderState *reader,
 								 reader,
 								 block_id,
 								 info,
-								 include_payload);
+								 kind,
+								 copy_mode);
 		block_count++;
 	}
 
@@ -6831,7 +7246,7 @@ static void
 fb_wal_load_record_by_lsn(const FbWalRecordIndex *index,
 						  XLogRecPtr record_lsn,
 						  FbRecordRef *record_out,
-						  bool include_payload,
+						  FbWalCursorReadMode read_mode,
 						  FbWalRecordMaterializer *materializer)
 {
 	FbWalRecordMaterializer local_materializer;
@@ -6842,6 +7257,8 @@ fb_wal_load_record_by_lsn(const FbWalRecordIndex *index,
 	char *errormsg = NULL;
 	bool built = false;
 	bool destroy_local = false;
+	FbWalRecordCopyMode copy_mode =
+		fb_wal_record_copy_mode_from_cursor_mode(read_mode);
 
 	if (index == NULL || record_out == NULL)
 		return;
@@ -6849,6 +7266,8 @@ fb_wal_load_record_by_lsn(const FbWalRecordIndex *index,
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("cannot materialize WAL record without a start LSN")));
+	if (read_mode == FB_WAL_CURSOR_READ_FULL)
+		fb_wal_debug_note_payload_load();
 
 	if (active_materializer == NULL)
 	{
@@ -6866,8 +7285,10 @@ fb_wal_load_record_by_lsn(const FbWalRecordIndex *index,
 	reader = active_materializer->reader;
 
 #if PG_VERSION_NUM < 130000
+	fb_wal_debug_note_record_read();
 	xlog_record = XLogReadRecord(reader, record_lsn, &errormsg);
 #else
+	fb_wal_debug_note_record_read();
 	XLogBeginRead(reader, record_lsn);
 	xlog_record = XLogReadRecord(reader, &errormsg);
 #endif
@@ -6892,43 +7313,43 @@ fb_wal_load_record_by_lsn(const FbWalRecordIndex *index,
 				built = fb_wal_build_heap_record_ref(reader, &active_materializer->info,
 													 FB_WAL_RECORD_HEAP_INSERT,
 													 record_out,
-													 include_payload);
+													 copy_mode);
 				break;
 			case XLOG_HEAP_DELETE:
 				built = fb_wal_build_heap_record_ref(reader, &active_materializer->info,
 													 FB_WAL_RECORD_HEAP_DELETE,
 													 record_out,
-													 include_payload);
+													 copy_mode);
 				break;
 			case XLOG_HEAP_UPDATE:
 				built = fb_wal_build_heap_record_ref(reader, &active_materializer->info,
 													 FB_WAL_RECORD_HEAP_UPDATE,
 													 record_out,
-													 include_payload);
+													 copy_mode);
 				break;
 			case XLOG_HEAP_HOT_UPDATE:
 				built = fb_wal_build_heap_record_ref(reader, &active_materializer->info,
 													 FB_WAL_RECORD_HEAP_HOT_UPDATE,
 													 record_out,
-													 include_payload);
+													 copy_mode);
 				break;
 			case XLOG_HEAP_CONFIRM:
 				built = fb_wal_build_heap_record_ref(reader, &active_materializer->info,
 													 FB_WAL_RECORD_HEAP_CONFIRM,
 													 record_out,
-													 include_payload);
+													 copy_mode);
 				break;
 			case XLOG_HEAP_LOCK:
 				built = fb_wal_build_heap_record_ref(reader, &active_materializer->info,
 													 FB_WAL_RECORD_HEAP_LOCK,
 													 record_out,
-													 include_payload);
+													 copy_mode);
 				break;
 			case XLOG_HEAP_INPLACE:
 				built = fb_wal_build_heap_record_ref(reader, &active_materializer->info,
 													 FB_WAL_RECORD_HEAP_INPLACE,
 													 record_out,
-													 include_payload);
+													 copy_mode);
 				break;
 			default:
 				break;
@@ -6945,36 +7366,36 @@ fb_wal_load_record_by_lsn(const FbWalRecordIndex *index,
 			built = fb_wal_build_heap_record_ref(reader, &active_materializer->info,
 												 FB_WAL_RECORD_HEAP2_PRUNE,
 												 record_out,
-												 include_payload);
+												 copy_mode);
 #elif PG_VERSION_NUM >= 140000
 		if (info_code == XLOG_HEAP2_PRUNE ||
 			info_code == XLOG_HEAP2_VACUUM)
 			built = fb_wal_build_heap_record_ref(reader, &active_materializer->info,
 												 FB_WAL_RECORD_HEAP2_PRUNE,
 												 record_out,
-												 include_payload);
+												 copy_mode);
 #else
 		if (info_code == XLOG_HEAP2_CLEAN)
 			built = fb_wal_build_heap_record_ref(reader, &active_materializer->info,
 												 FB_WAL_RECORD_HEAP2_PRUNE,
 												 record_out,
-												 include_payload);
+												 copy_mode);
 #endif
 		else if (info_code == XLOG_HEAP2_VISIBLE)
 			built = fb_wal_build_heap_record_ref(reader, &active_materializer->info,
 												 FB_WAL_RECORD_HEAP2_VISIBLE,
 												 record_out,
-												 include_payload);
+												 copy_mode);
 		else if (info_code == XLOG_HEAP2_MULTI_INSERT)
 			built = fb_wal_build_heap_record_ref(reader, &active_materializer->info,
 												 FB_WAL_RECORD_HEAP2_MULTI_INSERT,
 												 record_out,
-												 include_payload);
+												 copy_mode);
 		else if (info_code == XLOG_HEAP2_LOCK_UPDATED)
 			built = fb_wal_build_heap_record_ref(reader, &active_materializer->info,
 												 FB_WAL_RECORD_HEAP2_LOCK_UPDATED,
 												 record_out,
-												 include_payload);
+												 copy_mode);
 	}
 	else if (rmid == RM_XLOG_ID)
 	{
@@ -6984,12 +7405,12 @@ fb_wal_load_record_by_lsn(const FbWalRecordIndex *index,
 			built = fb_wal_build_xlog_fpi_record_ref(reader, &active_materializer->info,
 													 FB_WAL_RECORD_XLOG_FPI,
 													 record_out,
-													 include_payload);
+													 copy_mode);
 		else if (info_code == XLOG_FPI_FOR_HINT)
 			built = fb_wal_build_xlog_fpi_record_ref(reader, &active_materializer->info,
 													 FB_WAL_RECORD_XLOG_FPI_FOR_HINT,
 													 record_out,
-													 include_payload);
+													 copy_mode);
 	}
 
 	if (!built)
@@ -7129,6 +7550,15 @@ fb_wal_release_record(FbRecordRef *record)
 }
 
 static void
+fb_wal_reset_target_kind_counts(FbWalRecordIndex *index)
+{
+	if (index == NULL)
+		return;
+
+	MemSet(index->target_kind_counts, 0, sizeof(index->target_kind_counts));
+}
+
+static void
 fb_wal_reset_record_stats(FbWalRecordIndex *index)
 {
 	if (index == NULL)
@@ -7142,15 +7572,31 @@ fb_wal_reset_record_stats(FbWalRecordIndex *index)
 	index->target_insert_count = 0;
 	index->target_delete_count = 0;
 	index->target_update_count = 0;
+	fb_wal_reset_target_kind_counts(index);
 	index->payload_covered_segment_count = 0;
 	index->payload_scanned_record_count = 0;
 	index->payload_kept_record_count = 0;
+	index->payload_metadata_complete = false;
 	if (index->precomputed_missing_blocks != NULL)
 	{
 		hash_destroy(index->precomputed_missing_blocks);
 		index->precomputed_missing_blocks = NULL;
 	}
 	index->precomputed_missing_block_count = 0;
+}
+
+static void
+fb_wal_reset_replay_block_metadata(FbWalRecordIndex *index)
+{
+	if (index == NULL)
+		return;
+
+	if (index->replay_block_metadata != NULL)
+	{
+		hash_destroy(index->replay_block_metadata);
+		index->replay_block_metadata = NULL;
+	}
+	index->replay_block_metadata_count = 0;
 }
 
 static HTAB *
@@ -7168,6 +7614,20 @@ fb_wal_create_precomputed_missing_block_hash(void)
 }
 
 static HTAB *
+fb_wal_create_replay_block_metadata_hash(void)
+{
+	HASHCTL ctl;
+
+	MemSet(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(FbWalBlockKey);
+	ctl.entrysize = sizeof(FbWalReplayBlockMetadata);
+	return hash_create("fb wal replay block metadata",
+					   128,
+					   &ctl,
+					   HASH_ELEM | HASH_BLOBS);
+}
+
+static HTAB *
 fb_wal_create_block_init_state_hash(void)
 {
 	HASHCTL ctl;
@@ -7176,6 +7636,20 @@ fb_wal_create_block_init_state_hash(void)
 	ctl.keysize = sizeof(FbWalBlockKey);
 	ctl.entrysize = sizeof(FbWalBlockInitState);
 	return hash_create("fb wal block init state",
+					   128,
+					   &ctl,
+					   HASH_ELEM | HASH_BLOBS);
+}
+
+static HTAB *
+fb_wal_create_block_key_hash(void)
+{
+	HASHCTL ctl;
+
+	MemSet(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(FbWalBlockKey);
+	ctl.entrysize = sizeof(FbWalBlockKey);
+	return hash_create("fb wal block keys",
 					   128,
 					   &ctl,
 					   HASH_ELEM | HASH_BLOBS);
@@ -7361,11 +7835,13 @@ fb_wal_finalize_record_stats(FbWalRecordIndex *index)
 		return;
 
 	fb_wal_reset_record_stats(index);
+	fb_wal_reset_replay_block_metadata(index);
 	index->precomputed_missing_blocks = fb_wal_create_precomputed_missing_block_hash();
 	block_states = fb_wal_create_block_init_state_hash();
 	cursor = fb_wal_record_cursor_open(index, FB_SPOOL_FORWARD);
 	while (fb_wal_record_cursor_read_skeleton(cursor, &record, &record_index))
 	{
+		fb_wal_note_replay_block_metadata(index, &record, record_index);
 		fb_index_note_materialized_record(index, &record);
 		fb_wal_note_precomputed_missing_blocks(index, block_states, &record,
 											  record_index);
@@ -7375,6 +7851,26 @@ fb_wal_finalize_record_stats(FbWalRecordIndex *index)
 	if (index->precomputed_missing_blocks != NULL)
 		index->precomputed_missing_block_count =
 			hash_get_num_entries(index->precomputed_missing_blocks);
+	index->payload_metadata_complete = true;
+}
+
+static bool
+fb_wal_should_finalize_record_stats_after_payload(const FbWalRecordIndex *index,
+												  bool count_only_mode)
+{
+	if (count_only_mode)
+		return false;
+
+	return (index == NULL) || !index->payload_metadata_complete;
+}
+
+static void
+fb_wal_mark_payload_metadata_complete(FbWalRecordIndex *index)
+{
+	if (index == NULL)
+		return;
+
+	index->payload_metadata_complete = true;
 }
 
 static void
@@ -7389,12 +7885,14 @@ fb_wal_enable_incremental_payload_stats(FbWalRecordIndex *index,
 	index->target_insert_count = 0;
 	index->target_delete_count = 0;
 	index->target_update_count = 0;
+	fb_wal_reset_target_kind_counts(index);
 	if (index->precomputed_missing_blocks != NULL)
 	{
 		hash_destroy(index->precomputed_missing_blocks);
 		index->precomputed_missing_blocks = NULL;
 	}
 	index->precomputed_missing_block_count = 0;
+	index->payload_metadata_complete = false;
 	state->payload_block_states = fb_wal_create_block_init_state_hash();
 }
 
@@ -8041,6 +8539,31 @@ fb_record_ref_needs_payload_materialization(const FbRecordRef *record)
 	return false;
 }
 
+static bool
+fb_record_ref_needs_prune_lookahead_materialization(const FbRecordRef *record)
+{
+	int block_index;
+
+	if (record == NULL)
+		return false;
+	if (record->main_data_len > 0 && record->main_data == NULL)
+		return true;
+	if (record->kind != FB_WAL_RECORD_HEAP2_PRUNE)
+		return false;
+
+	for (block_index = 0; block_index < record->block_count; block_index++)
+	{
+		const FbRecordBlockRef *block_ref = &record->blocks[block_index];
+
+		if (block_ref->has_data &&
+			block_ref->data_len > 0 &&
+			block_ref->data == NULL)
+			return true;
+	}
+
+	return false;
+}
+
 static void
 fb_index_append_locator_stub(FbWalRecordIndex *index,
 							 FbSpoolLog **log_ptr,
@@ -8067,21 +8590,16 @@ fb_index_append_locator_stub(FbWalRecordIndex *index,
 }
 
 static void
-fb_index_append_record(FbWalRecordIndex *index,
-					   FbSpoolLog **log_ptr,
-					   const char *label,
-					   const FbRecordRef *record,
-					   bool defer_payload_body)
+fb_wal_append_serialized_record(FbSpoolLog *log,
+								const FbRecordRef *record,
+								bool defer_payload_body)
 {
 	StringInfoData buf;
 	FbSerializedRecordHeader hdr;
-	FbSpoolLog *log;
 	int block_index;
 
-	if (index == NULL || log_ptr == NULL || label == NULL || record == NULL)
+	if (log == NULL || record == NULL)
 		return;
-
-	log = fb_index_ensure_record_log(index, log_ptr, label);
 
 	initStringInfo(&buf);
 	MemSet(&hdr, 0, sizeof(hdr));
@@ -8137,7 +8655,24 @@ fb_index_append_record(FbWalRecordIndex *index,
 
 	fb_spool_log_append(log, buf.data, buf.len);
 	pfree(buf.data);
+}
+
+static void
+fb_index_append_record(FbWalRecordIndex *index,
+					   FbSpoolLog **log_ptr,
+					   const char *label,
+					   const FbRecordRef *record,
+					   bool defer_payload_body)
+{
+	FbSpoolLog *log;
+
+	if (index == NULL || log_ptr == NULL || label == NULL || record == NULL)
+		return;
+
+	log = fb_index_ensure_record_log(index, log_ptr, label);
+	fb_wal_append_serialized_record(log, record, defer_payload_body);
 	index->record_count++;
+	fb_wal_note_replay_block_metadata(index, record, index->record_count - 1);
 }
 
 static void
@@ -8163,6 +8698,39 @@ fb_wal_dump_payload_stats_log(FbSpoolLog **log_ptr,
 	entry.kind = record->kind;
 	entry.flags = flags;
 	fb_spool_log_append(log, &entry, sizeof(entry));
+}
+
+static void
+fb_wal_store_payload_stats(FbWalIndexBuildState *state,
+						   const FbRecordRef *record,
+						   uint8 flags)
+{
+	FbWalPayloadStatsEntry *entry;
+	uint32 entry_index;
+
+	if (state == NULL || record == NULL || state->index == NULL)
+		return;
+
+	if (state->payload_stats_entries != NULL)
+	{
+		entry_index = state->payload_stats_entry_base + state->index->record_count;
+		if (entry_index >= state->payload_stats_entry_capacity)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("payload stats entry index is out of range")));
+		entry = &state->payload_stats_entries[entry_index];
+		MemSet(entry, 0, sizeof(*entry));
+		entry->lsn = record->lsn;
+		entry->xid = record->xid;
+		entry->kind = record->kind;
+		entry->flags = flags;
+		return;
+	}
+
+	fb_wal_dump_payload_stats_log(state->payload_stats_log,
+								  state->payload_stats_label,
+								  record,
+								  flags);
 }
 
 static void
@@ -8249,6 +8817,52 @@ fb_index_note_materialized_record(FbWalRecordIndex *index,
 }
 
 static void
+fb_wal_note_replay_block_metadata(FbWalRecordIndex *index,
+								  const FbRecordRef *record,
+								  uint32 record_index)
+{
+	int block_index;
+
+	if (index == NULL || record == NULL || record->block_count <= 0)
+		return;
+
+	if (index->replay_block_metadata == NULL)
+		index->replay_block_metadata = fb_wal_create_replay_block_metadata_hash();
+
+	for (block_index = 0; block_index < record->block_count; block_index++)
+	{
+		const FbRecordBlockRef *block_ref = &record->blocks[block_index];
+		FbWalReplayBlockMetadata *entry;
+		FbWalBlockKey key;
+		bool found = false;
+
+		if (!block_ref->in_use)
+			continue;
+
+		MemSet(&key, 0, sizeof(key));
+		key.locator = block_ref->locator;
+		key.forknum = block_ref->forknum;
+		key.blkno = block_ref->blkno;
+
+		entry = (FbWalReplayBlockMetadata *) hash_search(index->replay_block_metadata,
+														 &key,
+														 HASH_ENTER,
+														 &found);
+		if (!found)
+		{
+			MemSet(entry, 0, sizeof(*entry));
+			entry->key = key;
+			entry->last_prune_guard_record_index = UINT32_MAX;
+			index->replay_block_metadata_count++;
+		}
+
+		entry->last_replay_use_record_index = record_index;
+		if (record->kind == FB_WAL_RECORD_HEAP2_PRUNE)
+			entry->last_prune_guard_record_index = record_index;
+	}
+}
+
+static void
 fb_record_release_temp(FbRecordRef *record)
 {
 	int block_index;
@@ -8323,17 +8937,21 @@ fb_record_block_copy_image(FbRecordBlockRef *block_ref,
 static void
 fb_fill_record_block_ref(FbRecordBlockRef *block_ref, XLogReaderState *reader,
 						 uint8 block_id, const FbRelationInfo *info,
-						 bool copy_payload)
+						 FbWalRecordKind kind,
+						 FbWalRecordCopyMode copy_mode)
 {
 	RelFileLocator locator;
 	ForkNumber forknum;
 	BlockNumber blkno;
 	Size datalen = 0;
 	char *data;
+	bool copy_block_data;
 
 	MemSet(block_ref, 0, sizeof(*block_ref));
 	if (!fb_xlogrec_get_block_tag(reader, block_id, &locator, &forknum, &blkno))
 		return;
+
+	copy_block_data = fb_wal_record_copy_block_data(kind, copy_mode);
 
 	block_ref->in_use = true;
 	block_ref->block_id = block_id;
@@ -8351,12 +8969,13 @@ fb_fill_record_block_ref(FbRecordBlockRef *block_ref, XLogReaderState *reader,
 		if (block_ref->has_data)
 		{
 			block_ref->data_len = datalen;
-			if (copy_payload)
+			if (copy_block_data)
 				block_ref->data = fb_copy_bytes(data, datalen);
 		}
 	}
 
-	fb_record_block_copy_image(block_ref, reader, copy_payload);
+	fb_record_block_copy_image(block_ref, reader,
+							   fb_wal_record_copy_block_image(copy_mode));
 }
 
 /*
@@ -8723,36 +9342,17 @@ fb_index_note_payload_stats_entry(FbWalRecordIndex *index,
 }
 
 static void
-fb_wal_merge_payload_stats_log(FbWalRecordIndex *index,
-							   const char *path,
-							   uint32 item_count)
+fb_wal_merge_payload_stats_entries(FbWalRecordIndex *index,
+								   const FbWalPayloadStatsEntry *entries,
+								   uint32 item_count)
 {
-	FbSpoolLog *source;
-	FbSpoolCursor *cursor;
-	StringInfoData buf;
 	uint32 item_index;
 
-	if (index == NULL || path == NULL || item_count == 0)
+	if (index == NULL || entries == NULL || item_count == 0)
 		return;
 
-	source = fb_spool_log_open_readonly(path, item_count);
-	cursor = fb_spool_cursor_open(source, FB_SPOOL_FORWARD);
-	initStringInfo(&buf);
-	while (fb_spool_cursor_read(cursor, &buf, &item_index))
-	{
-		FbWalPayloadStatsEntry entry;
-
-		if (buf.len != sizeof(entry))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("fb WAL payload stats spool entry has invalid length")));
-		memcpy(&entry, buf.data, sizeof(entry));
-		fb_index_note_payload_stats_entry(index, &entry);
-	}
-	pfree(buf.data);
-	fb_spool_cursor_close(cursor);
-	fb_spool_log_close(source);
-	unlink(path);
+	for (item_index = 0; item_index < item_count; item_index++)
+		fb_index_note_payload_stats_entry(index, &entries[item_index]);
 }
 
 static void
@@ -8783,10 +9383,163 @@ fb_wal_dump_missing_blocks(HTAB *missing_blocks,
 }
 
 static void
+fb_wal_dump_initialized_blocks(HTAB *block_states,
+							   const char *path,
+							   uint32 *count_out)
+{
+	FbSpoolLog *log;
+	HASH_SEQ_STATUS status;
+	FbWalBlockInitState *entry;
+	uint32 count = 0;
+
+	if (count_out != NULL)
+		*count_out = 0;
+	if (block_states == NULL || path == NULL)
+		return;
+
+	log = fb_spool_log_create_path(path);
+	hash_seq_init(&status, block_states);
+	while ((entry = (FbWalBlockInitState *) hash_seq_search(&status)) != NULL)
+	{
+		if (!entry->initialized)
+			continue;
+		fb_spool_log_append(log, &entry->key, sizeof(entry->key));
+		count++;
+	}
+	fb_spool_log_close(log);
+	if (count_out != NULL)
+		*count_out = count;
+}
+
+static void
+fb_wal_merge_initialized_blocks(HTAB *dest,
+								const char *path,
+								uint32 item_count)
+{
+	FbSpoolLog *source;
+	FbSpoolCursor *cursor;
+	StringInfoData buf;
+	uint32 item_index;
+
+	if (dest == NULL || path == NULL || item_count == 0)
+		return;
+
+	source = fb_spool_log_open_readonly(path, item_count);
+	cursor = fb_spool_cursor_open(source, FB_SPOOL_FORWARD);
+	initStringInfo(&buf);
+	while (fb_spool_cursor_read(cursor, &buf, &item_index))
+	{
+		FbWalBlockKey key;
+		bool found = false;
+
+		if (buf.len != sizeof(key))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("fb WAL initialized-block spool entry has invalid length")));
+		memcpy(&key, buf.data, sizeof(key));
+		(void) hash_search(dest, &key, HASH_ENTER, &found);
+	}
+	pfree(buf.data);
+	fb_spool_cursor_close(cursor);
+	fb_spool_log_close(source);
+	unlink(path);
+}
+
+static void
+fb_wal_dump_replay_block_metadata(HTAB *metadata,
+								  const char *path,
+								  uint32 *count_out)
+{
+	FbSpoolLog *log;
+	HASH_SEQ_STATUS status;
+	FbWalReplayBlockMetadata *entry;
+	uint32 count = 0;
+
+	if (count_out != NULL)
+		*count_out = 0;
+	if (metadata == NULL || path == NULL)
+		return;
+
+	log = fb_spool_log_create_path(path);
+	hash_seq_init(&status, metadata);
+	while ((entry = (FbWalReplayBlockMetadata *) hash_seq_search(&status)) != NULL)
+	{
+		fb_spool_log_append(log, entry, sizeof(*entry));
+		count++;
+	}
+	fb_spool_log_close(log);
+	if (count_out != NULL)
+		*count_out = count;
+}
+
+static void
+fb_wal_merge_replay_block_metadata(FbWalRecordIndex *index,
+								   const char *path,
+								   uint32 item_count,
+								   uint32 record_index_base)
+{
+	FbSpoolLog *source;
+	FbSpoolCursor *cursor;
+	StringInfoData buf;
+	uint32 item_index;
+
+	if (index == NULL || path == NULL || item_count == 0)
+		return;
+
+	if (index->replay_block_metadata == NULL)
+		index->replay_block_metadata = fb_wal_create_replay_block_metadata_hash();
+
+	source = fb_spool_log_open_readonly(path, item_count);
+	cursor = fb_spool_cursor_open(source, FB_SPOOL_FORWARD);
+	initStringInfo(&buf);
+	while (fb_spool_cursor_read(cursor, &buf, &item_index))
+	{
+		FbWalReplayBlockMetadata incoming;
+		FbWalReplayBlockMetadata *entry;
+		bool found = false;
+
+		if (buf.len != sizeof(incoming))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("fb WAL replay-metadata spool entry has invalid length")));
+		memcpy(&incoming, buf.data, sizeof(incoming));
+		incoming.last_replay_use_record_index += record_index_base;
+		if (incoming.last_prune_guard_record_index != UINT32_MAX)
+			incoming.last_prune_guard_record_index += record_index_base;
+
+		entry = (FbWalReplayBlockMetadata *) hash_search(index->replay_block_metadata,
+														 &incoming.key,
+														 HASH_ENTER,
+														 &found);
+		if (!found)
+		{
+			*entry = incoming;
+			index->replay_block_metadata_count++;
+			continue;
+		}
+
+		entry->last_replay_use_record_index =
+			Max(entry->last_replay_use_record_index,
+				incoming.last_replay_use_record_index);
+		if (entry->last_prune_guard_record_index == UINT32_MAX)
+			entry->last_prune_guard_record_index = incoming.last_prune_guard_record_index;
+		else if (incoming.last_prune_guard_record_index != UINT32_MAX)
+			entry->last_prune_guard_record_index =
+				Max(entry->last_prune_guard_record_index,
+					incoming.last_prune_guard_record_index);
+	}
+	pfree(buf.data);
+	fb_spool_cursor_close(cursor);
+	fb_spool_log_close(source);
+	unlink(path);
+}
+
+static void
 fb_wal_merge_missing_blocks(FbWalRecordIndex *index,
 							const char *path,
 							uint32 item_count,
-							uint32 record_index_base)
+							uint32 record_index_base,
+							HTAB *initialized_prefix)
 {
 	FbSpoolLog *source;
 	FbSpoolCursor *cursor;
@@ -8814,6 +9567,9 @@ fb_wal_merge_missing_blocks(FbWalRecordIndex *index,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("fb WAL missing-block spool entry has invalid length")));
 		memcpy(&incoming, buf.data, sizeof(incoming));
+		if (initialized_prefix != NULL &&
+			hash_search(initialized_prefix, &incoming.key, HASH_FIND, NULL) != NULL)
+			continue;
 		incoming.first_record_index += record_index_base;
 		entry = (FbWalPrecomputedMissingBlock *)
 			hash_search(index->precomputed_missing_blocks,
@@ -8838,13 +9594,54 @@ fb_wal_merge_missing_blocks(FbWalRecordIndex *index,
  */
 
 static void
+fb_wal_append_lookahead_record(XLogReaderState *reader,
+							   const FbRelationInfo *info,
+							   FbWalRecordKind kind,
+							   FbWalIndexBuildState *state)
+{
+	FbRecordRef lookahead_record;
+	FbSpoolLog *log;
+	bool built = false;
+
+	if (reader == NULL || info == NULL || state == NULL ||
+		state->payload_lookahead_log == NULL ||
+		state->payload_lookahead_label == NULL)
+		return;
+
+	log = *state->payload_lookahead_log;
+	if (log == NULL)
+		return;
+
+	MemSet(&lookahead_record, 0, sizeof(lookahead_record));
+	if (kind == FB_WAL_RECORD_XLOG_FPI ||
+		kind == FB_WAL_RECORD_XLOG_FPI_FOR_HINT)
+		built = fb_wal_build_xlog_fpi_record_ref(reader,
+												 info,
+												 kind,
+												 &lookahead_record,
+												 FB_WAL_RECORD_COPY_PRUNE_LOOKAHEAD);
+	else
+		built = fb_wal_build_heap_record_ref(reader,
+											 info,
+											 kind,
+											 &lookahead_record,
+											 FB_WAL_RECORD_COPY_PRUNE_LOOKAHEAD);
+	if (!built)
+		return;
+
+	fb_wal_append_serialized_record(log, &lookahead_record, false);
+	fb_record_release_temp(&lookahead_record);
+}
+
+static void
 fb_copy_heap_record_ref(XLogReaderState *reader, const FbRelationInfo *info,
 						FbWalRecordKind kind, FbWalIndexBuildState *state)
 {
 	FbRecordRef record;
 	FbWalRecordIndex *index = state->index;
 	bool stats_only = state->payload_stats_only_capture;
-	bool copy_payload = !stats_only;
+	bool locator_only = state->locator_only_payload_capture;
+	bool copy_payload = !stats_only && !locator_only;
 	uint8 payload_stats_flags = 0;
 	int block_count = 0;
 	int block_id;
@@ -8892,27 +9689,38 @@ fb_copy_heap_record_ref(XLogReaderState *reader, const FbRelationInfo *info,
 		if (!fb_locator_matches_relation(&locator, info))
 			continue;
 
-		fb_fill_record_block_ref(&record.blocks[block_count], reader, block_id, info, copy_payload);
+		fb_fill_record_block_ref(&record.blocks[block_count],
+								 reader,
+								 block_id,
+								 info,
+								 kind,
+								 copy_payload ? FB_WAL_RECORD_COPY_FULL :
+												FB_WAL_RECORD_COPY_NONE);
 		block_count++;
 	}
 
 	record.block_count = block_count;
 	if (!stats_only)
-		fb_index_append_record(index,
-							   state->payload_log,
-							   state->payload_label,
-							   &record,
-							   state->defer_payload_body);
+	{
+		if (locator_only)
+			index->record_count++;
+		else
+			fb_index_append_record(index,
+								   state->payload_log,
+								   state->payload_label,
+								   &record,
+								   state->defer_payload_body);
+	}
 	else
 	{
-		fb_wal_dump_payload_stats_log(state->payload_stats_log,
-									  state->payload_stats_label,
-									  &record,
-									  payload_stats_flags);
+		fb_wal_store_payload_stats(state, &record, payload_stats_flags);
 		index->record_count++;
+		fb_wal_append_lookahead_record(reader, info, kind, state);
 	}
 	if (state->payload_block_states != NULL && index->record_count > 0)
 	{
+		if (stats_only)
+			fb_wal_note_replay_block_metadata(index, &record, index->record_count - 1);
 		if (!stats_only)
 			fb_index_note_materialized_record(index, &record);
 		fb_wal_note_precomputed_missing_blocks(index,
@@ -8935,7 +9743,8 @@ fb_copy_xlog_fpi_record_ref(XLogReaderState *reader, const FbRelationInfo *info,
 	FbRecordRef record;
 	FbWalRecordIndex *index = state->index;
 	bool stats_only = state->payload_stats_only_capture;
-	bool copy_payload = !stats_only;
+	bool locator_only = state->locator_only_payload_capture;
+	bool copy_payload = !stats_only && !locator_only;
 	int block_count = 0;
 	int block_id;
 
@@ -8963,27 +9772,38 @@ fb_copy_xlog_fpi_record_ref(XLogReaderState *reader, const FbRelationInfo *info,
 		if (!fb_locator_matches_relation(&locator, info))
 			continue;
 
-		fb_fill_record_block_ref(&record.blocks[block_count], reader, block_id, info, copy_payload);
+		fb_fill_record_block_ref(&record.blocks[block_count],
+								 reader,
+								 block_id,
+								 info,
+								 kind,
+								 copy_payload ? FB_WAL_RECORD_COPY_FULL :
+												FB_WAL_RECORD_COPY_NONE);
 		block_count++;
 	}
 
 	record.block_count = block_count;
 	if (!stats_only)
-		fb_index_append_record(index,
-							   state->payload_log,
-							   state->payload_label,
-							   &record,
-							   state->defer_payload_body);
+	{
+		if (locator_only)
+			index->record_count++;
+		else
+			fb_index_append_record(index,
+								   state->payload_log,
+								   state->payload_label,
+								   &record,
+								   state->defer_payload_body);
+	}
 	else
 	{
-		fb_wal_dump_payload_stats_log(state->payload_stats_log,
-									  state->payload_stats_label,
-									  &record,
-									  0);
+		fb_wal_store_payload_stats(state, &record, 0);
 		index->record_count++;
+		fb_wal_append_lookahead_record(reader, info, kind, state);
 	}
 	if (state->payload_block_states != NULL && index->record_count > 0)
 	{
+		if (stats_only)
+			fb_wal_note_replay_block_metadata(index, &record, index->record_count - 1);
 		if (!stats_only)
 			fb_index_note_materialized_record(index, &record);
 		fb_wal_note_precomputed_missing_blocks(index,
@@ -11807,6 +12627,9 @@ fb_wal_visit_payload_locators_exact(FbWalScanContext *ctx,
 	bool saved_prefilter_used;
 	bool saved_current_segment_may_hit;
 	bool reader_initialized = false;
+	bool gate_held = false;
+	uint32 locator_segment_count;
+	XLogRecPtr next_record_lsn = InvalidXLogRecPtr;
 	uint32 visited = 0;
 	uint32 i;
 
@@ -11824,12 +12647,24 @@ fb_wal_visit_payload_locators_exact(FbWalScanContext *ctx,
 	ctx->segment_hit_map = NULL;
 	ctx->segment_prefilter_used = false;
 	ctx->current_segment_may_hit = true;
+	locator_segment_count = fb_count_payload_locator_segments(ctx,
+															   locators,
+															   locator_count);
+	if (fb_wal_should_gate_dense_payload_reader(ctx,
+												 locator_count,
+												 locator_segment_count))
+	{
+		fb_wal_acquire_dense_payload_gate();
+		gate_held = true;
+	}
 
 	MemSet(&private, 0, sizeof(private));
 	private.timeline_id = ctx->timeline_id;
 	private.endptr = InvalidXLogRecPtr;
 	private.current_file = -1;
-	private.open_pattern = FB_WAL_OPEN_SPARSE;
+	private.open_pattern = fb_wal_payload_locator_open_pattern(ctx,
+															   locator_count,
+															   locator_segment_count);
 	private.ctx = ctx;
 
 #if PG_VERSION_NUM < 130000
@@ -11857,22 +12692,35 @@ fb_wal_visit_payload_locators_exact(FbWalScanContext *ctx,
 	{
 		XLogRecord *record;
 		char *errormsg = NULL;
+		bool sequential_reuse = false;
+
+		state->payload_emit_start_lsn = locators[i].record_start_lsn;
+		state->payload_emit_end_lsn = locators[i].record_start_lsn + 1;
 
 		if (!reader_initialized)
 		{
 			ctx->payload_sparse_reader_resets++;
 			reader_initialized = true;
 		}
-		else
+		else if (!XLogRecPtrIsInvalid(next_record_lsn) &&
+				 locators[i].record_start_lsn == next_record_lsn)
+		{
+			sequential_reuse = true;
 			ctx->payload_sparse_reader_reuses++;
-
-		state->payload_emit_start_lsn = locators[i].record_start_lsn;
-		state->payload_emit_end_lsn = locators[i].record_start_lsn + 1;
+		}
+		else
+			ctx->payload_sparse_reader_resets++;
 
 #if PG_VERSION_NUM < 130000
-		record = XLogReadRecord(reader, locators[i].record_start_lsn, &errormsg);
+		if (sequential_reuse)
+			record = XLogReadRecord(reader, InvalidXLogRecPtr, &errormsg);
+		else
+			record = XLogReadRecord(reader,
+									locators[i].record_start_lsn,
+									&errormsg);
 #else
-		XLogBeginRead(reader, locators[i].record_start_lsn);
+		if (!sequential_reuse)
+			XLogBeginRead(reader, locators[i].record_start_lsn);
 		record = XLogReadRecord(reader, &errormsg);
 #endif
 		if (record == NULL)
@@ -11895,6 +12743,7 @@ fb_wal_visit_payload_locators_exact(FbWalScanContext *ctx,
 		ctx->last_record_lsn = reader->EndRecPtr;
 		if (XLogRecPtrIsInvalid(ctx->first_record_lsn))
 			ctx->first_record_lsn = reader->ReadRecPtr;
+		next_record_lsn = reader->EndRecPtr;
 		visited++;
 		if (!fb_index_record_visitor(reader, state))
 			break;
@@ -11902,9 +12751,208 @@ fb_wal_visit_payload_locators_exact(FbWalScanContext *ctx,
 
 	XLogReaderFree(reader);
 	fb_wal_close_private_file(&private);
+	if (gate_held)
+		fb_wal_release_dense_payload_gate();
 	ctx->segment_hit_map = saved_hit_map;
 	ctx->segment_prefilter_used = saved_prefilter_used;
 	ctx->current_segment_may_hit = saved_current_segment_may_hit;
+	return visited;
+}
+
+static uint32
+fb_wal_visit_payload_locators_windowed_serial(FbWalScanContext *ctx,
+												 const FbWalVisitWindow *windows,
+												 uint32 window_count,
+												 const FbSummaryPayloadLocator *locators,
+												 uint32 locator_count,
+												 FbWalIndexBuildState *state)
+{
+	FbWalReaderPrivate private;
+	XLogReaderState *reader;
+	void *saved_segments;
+	uint32 saved_segment_count;
+	bool *saved_hit_map;
+	bool saved_prefilter_used;
+	bool saved_current_segment_may_hit;
+	FbWalVisitWindow previous_read_window;
+	bool previous_read_valid = false;
+	const FbSummaryPayloadLocator *saved_locators;
+	uint32 saved_locator_count;
+	uint32 saved_locator_index;
+	uint32 next_locator_index = 0;
+	uint32 visited = 0;
+	uint32 i;
+	bool keep_scanning = true;
+
+	if (ctx == NULL)
+		elog(ERROR, "FbWalScanContext must not be NULL");
+	if (state == NULL)
+		elog(ERROR, "FbWalIndexBuildState must not be NULL");
+	if (windows == NULL || window_count == 0 || locators == NULL || locator_count == 0)
+		return 0;
+
+	saved_segments = ctx->resolved_segments;
+	saved_segment_count = ctx->resolved_segment_count;
+	saved_hit_map = ctx->segment_hit_map;
+	saved_prefilter_used = ctx->segment_prefilter_used;
+	saved_current_segment_may_hit = ctx->current_segment_may_hit;
+	saved_locators = state->payload_locators;
+	saved_locator_count = state->payload_locator_count;
+	saved_locator_index = state->payload_locator_index;
+
+	ctx->segment_hit_map = NULL;
+	ctx->segment_prefilter_used = false;
+	ctx->current_segment_may_hit = true;
+
+	MemSet(&private, 0, sizeof(private));
+	private.timeline_id = ctx->timeline_id;
+	private.endptr = InvalidXLogRecPtr;
+	private.current_file = -1;
+	private.open_pattern = FB_WAL_OPEN_SEQUENTIAL;
+	private.ctx = ctx;
+
+#if PG_VERSION_NUM < 130000
+	reader = XLogReaderAllocate(ctx->wal_seg_size, fb_wal_read_page, &private);
+#else
+	{
+		char *archive_dir;
+
+		archive_dir = fb_get_effective_archive_dir();
+		reader = XLogReaderAllocate(ctx->wal_seg_size, archive_dir,
+									XL_ROUTINE(.page_read = fb_wal_read_page,
+											   .segment_open = fb_wal_open_segment,
+											   .segment_close = fb_wal_close_segment),
+									&private);
+		pfree(archive_dir);
+	}
+#endif
+	if (reader == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory"),
+				 errdetail("Failed while allocating a WAL reading processor.")));
+
+	for (i = 0; i < window_count && keep_scanning; i++)
+	{
+		const FbWalVisitWindow *window = &windows[i];
+		FbWalVisitWindow read_window;
+		uint32 window_start = next_locator_index;
+		uint32 window_end;
+		XLogRecPtr first_record;
+
+		while (window_start < locator_count &&
+			   locators[window_start].record_start_lsn < window->start_lsn)
+			window_start++;
+		window_end =
+			fb_wal_find_payload_locator_window_end_index(locators,
+														 locator_count,
+														 window_start,
+														 window->end_lsn);
+		next_locator_index = window_end;
+		if (window_end <= window_start)
+			continue;
+
+		fb_wal_prepare_payload_read_window(ctx,
+										   window,
+										   (FbWalSegmentEntry *) saved_segments,
+										   saved_segment_count,
+										   &read_window);
+		if (i + 1 < window_count &&
+			windows[i + 1].start_lsn < read_window.read_end_lsn)
+			read_window.read_end_lsn = windows[i + 1].start_lsn;
+
+		if (!previous_read_valid ||
+			!fb_wal_visit_windows_share_segment_slice(&previous_read_window,
+													 &read_window))
+		{
+			ctx->resolved_segments = read_window.segments;
+			ctx->resolved_segment_count = read_window.segment_count;
+			fb_wal_close_private_file(&private);
+			private.last_open_segno_valid = false;
+			private.last_open_entry = NULL;
+			private.current_file = -1;
+			private.current_file_segno_valid = false;
+			ctx->payload_sparse_reader_resets++;
+		}
+		else
+			ctx->payload_sparse_reader_reuses++;
+
+		private.endptr = read_window.read_end_lsn;
+		private.endptr_reached = false;
+		state->payload_locators = locators + window_start;
+		state->payload_locator_count = window_end - window_start;
+		state->payload_locator_index = 0;
+		first_record =
+			fb_xlog_find_next_record_compat(reader, read_window.start_lsn);
+		if (XLogRecPtrIsInvalid(first_record) ||
+			first_record >= read_window.read_end_lsn)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("summary payload locator window read failed at %X/%08X",
+							LSN_FORMAT_ARGS(locators[window_start].record_start_lsn)),
+					 errdetail("Window %u did not expose a readable first record before %X/%08X.",
+							   i + 1,
+							   LSN_FORMAT_ARGS(read_window.read_end_lsn))));
+
+		if (XLogRecPtrIsInvalid(ctx->first_record_lsn))
+			ctx->first_record_lsn = first_record;
+
+#if PG_VERSION_NUM >= 130000
+		XLogBeginRead(reader, first_record);
+#endif
+		while (true)
+		{
+			XLogRecord *record;
+			char *errormsg = NULL;
+
+#if PG_VERSION_NUM < 130000
+			record = XLogReadRecord(reader, InvalidXLogRecPtr, &errormsg);
+#else
+			record = XLogReadRecord(reader, &errormsg);
+#endif
+			if (record == NULL)
+				break;
+
+			ctx->records_scanned++;
+			ctx->last_record_lsn = reader->EndRecPtr;
+			if (!fb_index_record_visitor(reader, state))
+			{
+				keep_scanning = false;
+				break;
+			}
+		}
+		if (keep_scanning &&
+			state->payload_locator_index != state->payload_locator_count)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("summary payload locator window visit ended early"),
+					 errdetail("Consumed %u of %u payload locators in window %u.",
+							   state->payload_locator_index,
+							   state->payload_locator_count,
+							   i + 1)));
+		visited += state->payload_locator_count;
+		previous_read_window = read_window;
+		previous_read_valid = true;
+	}
+
+	XLogReaderFree(reader);
+	fb_wal_close_private_file(&private);
+	ctx->resolved_segments = saved_segments;
+	ctx->resolved_segment_count = saved_segment_count;
+	ctx->segment_hit_map = saved_hit_map;
+	ctx->segment_prefilter_used = saved_prefilter_used;
+	ctx->current_segment_may_hit = saved_current_segment_may_hit;
+	state->payload_locators = saved_locators;
+	state->payload_locator_count = saved_locator_count;
+	state->payload_locator_index = saved_locator_index;
+	if (keep_scanning && next_locator_index != locator_count)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("summary payload locator windows left trailing locators"),
+				 errdetail("Visited %u of %u payload locators across %u windows.",
+						   next_locator_index,
+						   locator_count,
+						   window_count)));
 	return visited;
 }
 
@@ -11926,10 +12974,14 @@ fb_wal_visit_payload_locators(FbWalScanContext *ctx,
 
 	visit_window_count =
 		fb_build_payload_locator_visit_windows(ctx, locators, locator_count, &visit_windows);
+	fb_wal_prefetch_payload_locator_segments(ctx, locators, locator_count);
 	if (visit_window_count > 0 && visit_window_count < locator_count)
 	{
 		fb_wal_enable_incremental_payload_stats(state->index, state);
 		if (state->index != NULL &&
+			fb_wal_should_materialize_payload_locators_parallel(ctx,
+																visit_window_count,
+																locator_count) &&
 			fb_wal_materialize_payload_locators_parallel(state->info,
 														 ctx,
 														 state->index,
@@ -11942,6 +12994,21 @@ fb_wal_visit_payload_locators(FbWalScanContext *ctx,
 				if (visit_windows != NULL)
 					pfree(visit_windows);
 				return visit_window_count;
+		}
+		if (fb_wal_should_visit_payload_locators_windowed_serial(visit_window_count,
+																 locator_count))
+		{
+			uint32 visited;
+
+			visited = fb_wal_visit_payload_locators_windowed_serial(ctx,
+																	  visit_windows,
+																	  visit_window_count,
+																	  locators,
+																	  locator_count,
+																	  state);
+			if (visit_windows != NULL)
+				pfree(visit_windows);
+			return visited;
 		}
 		if (visit_windows != NULL)
 			pfree(visit_windows);
@@ -12125,11 +13192,13 @@ fb_wal_payload_worker_main(Datum main_arg)
 	FbWalParallelWindow *windows;
 	FbWalSegmentEntry *segments;
 	FbSummaryPayloadLocator *locators;
+	FbWalPayloadStatsEntry *stats_entries;
 	FbRelationInfo info;
 	FbWalScanContext ctx;
 	FbWalRecordIndex index;
 	FbWalIndexBuildState state;
 	FbSpoolLog *log = NULL;
+	FbSpoolLog *lookahead_log = NULL;
 	FbSpoolLog *stats_log = NULL;
 	FbWalVisitWindow *task_windows = NULL;
 	uint32 task_window_count = 0;
@@ -12148,6 +13217,7 @@ fb_wal_payload_worker_main(Datum main_arg)
 	windows = fb_wal_payload_windows(shared);
 	segments = fb_wal_payload_segments(shared);
 	locators = fb_wal_payload_locators_shared(shared);
+	stats_entries = fb_wal_payload_stats_shared(shared);
 	task->status = FB_WAL_PAYLOAD_TASK_RUNNING;
 
 	fb_wal_payload_apply_gucs(task);
@@ -12169,10 +13239,10 @@ fb_wal_payload_worker_main(Datum main_arg)
 		index.target_ts = task->target_ts;
 		index.query_now_ts = task->target_ts;
 		index.anchor_redo_lsn = task->anchor_redo_lsn;
-		if (task->capture_stats_only)
-			stats_log = fb_spool_log_create_path(task->stats_path);
-		else
+		if (!task->capture_stats_only)
 			log = fb_spool_log_create_path(task->spool_path);
+		else if (task->lookahead_path[0] != '\0')
+			lookahead_log = fb_spool_log_create_path(task->lookahead_path);
 
 		MemSet(&state, 0, sizeof(state));
 		state.info = &info;
@@ -12183,9 +13253,14 @@ fb_wal_payload_worker_main(Datum main_arg)
 		state.tail_capture_allowed = false;
 		state.payload_log = &log;
 		state.payload_label = "wal-records-worker";
+		state.payload_lookahead_log = &lookahead_log;
+		state.payload_lookahead_label = "wal-lookahead-worker";
 		state.payload_stats_only_capture = task->capture_stats_only;
 		state.payload_stats_log = &stats_log;
 		state.payload_stats_label = "wal-payload-stats-worker";
+		state.payload_stats_entries = task->capture_stats_only ? stats_entries : NULL;
+		state.payload_stats_entry_base = task->locator_start;
+		state.payload_stats_entry_capacity = shared->locator_count;
 		if (task->capture_stats_only)
 			state.payload_block_states = fb_wal_create_block_init_state_hash();
 		if (task->locator_count > 0)
@@ -12238,6 +13313,8 @@ fb_wal_payload_worker_main(Datum main_arg)
 
 		task->record_count = index.record_count;
 		task->stats_count = index.record_count;
+		task->lookahead_record_count = (lookahead_log != NULL) ?
+			index.record_count : 0;
 		task->kept_record_count = index.kept_record_count;
 		task->target_record_count = index.target_record_count;
 		task->target_insert_count = index.target_insert_count;
@@ -12251,6 +13328,12 @@ fb_wal_payload_worker_main(Datum main_arg)
 			fb_wal_dump_missing_blocks(index.precomputed_missing_blocks,
 									   task->missing_blocks_path,
 									   &task->missing_block_count);
+			fb_wal_dump_initialized_blocks(state.payload_block_states,
+										   task->initialized_blocks_path,
+										   &task->initialized_block_count);
+			fb_wal_dump_replay_block_metadata(index.replay_block_metadata,
+											  task->replay_block_metadata_path,
+											  &task->replay_block_metadata_count);
 			if (state.payload_block_states != NULL)
 			{
 				hash_destroy(state.payload_block_states);
@@ -12260,6 +13343,16 @@ fb_wal_payload_worker_main(Datum main_arg)
 			{
 				hash_destroy(index.precomputed_missing_blocks);
 				index.precomputed_missing_blocks = NULL;
+			}
+			if (index.replay_block_metadata != NULL)
+			{
+				hash_destroy(index.replay_block_metadata);
+				index.replay_block_metadata = NULL;
+			}
+			if (lookahead_log != NULL)
+			{
+				fb_spool_log_close(lookahead_log);
+				lookahead_log = NULL;
 			}
 			fb_spool_log_close(stats_log);
 			stats_log = NULL;
@@ -12290,6 +13383,10 @@ fb_wal_payload_worker_main(Datum main_arg)
 			hash_destroy(state.payload_block_states);
 		if (index.precomputed_missing_blocks != NULL)
 			hash_destroy(index.precomputed_missing_blocks);
+		if (index.replay_block_metadata != NULL)
+			hash_destroy(index.replay_block_metadata);
+		if (lookahead_log != NULL)
+			fb_spool_log_close(lookahead_log);
 		if (task_windows != NULL)
 			pfree(task_windows);
 		strlcpy(task->errmsg,
@@ -12862,6 +13959,8 @@ fb_wal_payload_merge_log(FbWalRecordIndex *index,
 			else
 			{
 				fb_wal_deserialize_record(index, buf.data, buf.len, &record);
+				fb_wal_note_replay_block_metadata(index, &record,
+												  index->record_count - 1);
 				fb_index_note_materialized_record(index, &record);
 				fb_wal_note_precomputed_missing_blocks(index,
 													  block_states,
@@ -13367,6 +14466,8 @@ fb_wal_materialize_payload_parallel(const FbRelationInfo *info,
 									 0,
 									 spool_path,
 									 NULL,
+									 NULL,
+									 NULL,
 									 NULL);
 			if (!fb_wal_payload_launch_worker(handle, i, &worker_handles[i]))
 				break;
@@ -13547,6 +14648,8 @@ fb_wal_materialize_payload_locators_parallel(const FbRelationInfo *info,
 									 task_locator_count,
 									 spool_path,
 									 NULL,
+									 NULL,
+									 NULL,
 									 NULL);
 			if (!fb_wal_payload_launch_worker(handle, i, &worker_handles[i]))
 				break;
@@ -13616,6 +14719,7 @@ fb_wal_capture_locator_stub_stats_parallel(const FbRelationInfo *info,
 	Size windows_size;
 	Size segments_size;
 	Size locators_size;
+	Size stats_size;
 	Size shared_size;
 	dsm_segment *seg;
 	dsm_handle handle;
@@ -13660,8 +14764,9 @@ fb_wal_capture_locator_stub_stats_parallel(const FbRelationInfo *info,
 		windows_size = 0;
 		segments_size = MAXALIGN(sizeof(FbWalSegmentEntry) * ctx->resolved_segment_count);
 		locators_size = MAXALIGN(sizeof(FbSummaryPayloadLocator) * locator_count);
+		stats_size = MAXALIGN(sizeof(FbWalPayloadStatsEntry) * locator_count);
 		shared_size = MAXALIGN(sizeof(FbWalPayloadShared)) +
-			tasks_size + windows_size + segments_size + locators_size;
+			tasks_size + windows_size + segments_size + locators_size + stats_size;
 		seg = dsm_create(shared_size, 0);
 		handle = dsm_segment_handle(seg);
 		shared = (FbWalPayloadShared *) dsm_segment_address(seg);
@@ -13676,6 +14781,7 @@ fb_wal_capture_locator_stub_stats_parallel(const FbRelationInfo *info,
 		shared->windows_offset = shared->tasks_offset + tasks_size;
 		shared->segments_offset = shared->windows_offset + windows_size;
 		shared->locators_offset = shared->segments_offset + segments_size;
+		shared->stats_offset = shared->locators_offset + locators_size;
 		tasks = fb_wal_payload_tasks(shared);
 		memcpy(fb_wal_payload_segments(shared),
 			   ctx->resolved_segments,
@@ -13683,16 +14789,21 @@ fb_wal_capture_locator_stub_stats_parallel(const FbRelationInfo *info,
 		memcpy(fb_wal_payload_locators_shared(shared),
 			   locators,
 			   sizeof(FbSummaryPayloadLocator) * locator_count);
+		MemSet(fb_wal_payload_stats_shared(shared), 0, stats_size);
 
 		for (i = 0; i < task_count; i++)
 		{
-			char stats_path[MAXPGPATH];
 			char missing_path[MAXPGPATH];
-			snprintf(stats_path, sizeof(stats_path),
-					 "%s/wal-payload-stats-worker-%d.bin",
-					 session_dir, i + 1);
+			char initialized_path[MAXPGPATH];
+			char replay_metadata_path[MAXPGPATH];
 			snprintf(missing_path, sizeof(missing_path),
 					 "%s/wal-payload-missing-worker-%d.bin",
+					 session_dir, i + 1);
+			snprintf(initialized_path, sizeof(initialized_path),
+					 "%s/wal-payload-initialized-worker-%d.bin",
+					 session_dir, i + 1);
+			snprintf(replay_metadata_path, sizeof(replay_metadata_path),
+					 "%s/wal-payload-replay-metadata-worker-%d.bin",
 					 session_dir, i + 1);
 			fb_wal_payload_fill_task(&tasks[i],
 									 info,
@@ -13704,8 +14815,10 @@ fb_wal_capture_locator_stub_stats_parallel(const FbRelationInfo *info,
 									 task_locator_offsets[i],
 									 task_locator_counts[i],
 									 NULL,
-									 stats_path,
-									 missing_path);
+									 NULL,
+									 missing_path,
+									 initialized_path,
+									 replay_metadata_path);
 			if (!fb_wal_payload_launch_worker(handle, i, &worker_handles[i]))
 				break;
 			launched++;
@@ -13723,10 +14836,12 @@ fb_wal_capture_locator_stub_stats_parallel(const FbRelationInfo *info,
 					ereport(ERROR,
 							(errcode(ERRCODE_INTERNAL_ERROR),
 							 errmsg("postmaster died while stopping pg_flashback WAL payload stats workers")));
-				if (tasks[i].stats_path[0] != '\0')
-					unlink(tasks[i].stats_path);
 				if (tasks[i].missing_blocks_path[0] != '\0')
 					unlink(tasks[i].missing_blocks_path);
+				if (tasks[i].initialized_blocks_path[0] != '\0')
+					unlink(tasks[i].initialized_blocks_path);
+				if (tasks[i].replay_block_metadata_path[0] != '\0')
+					unlink(tasks[i].replay_block_metadata_path);
 			}
 			dsm_detach(seg);
 			continue;
@@ -13735,18 +14850,31 @@ fb_wal_capture_locator_stub_stats_parallel(const FbRelationInfo *info,
 		fb_wal_reset_record_stats(index);
 		for (i = 0; i < task_count; i++)
 			fb_wal_payload_wait_worker(worker_handles[i], &tasks[i]);
+		{
+			HTAB *initialized_prefix = fb_wal_create_block_key_hash();
+
 		for (i = 0; i < task_count; i++)
 		{
-			fb_wal_merge_payload_stats_log(index,
-										   tasks[i].stats_path,
-										   tasks[i].stats_count);
+			fb_wal_merge_payload_stats_entries(index,
+											   fb_wal_payload_stats_shared(shared) + tasks[i].locator_start,
+											   tasks[i].stats_count);
 			fb_wal_merge_missing_blocks(index,
 										tasks[i].missing_blocks_path,
 										tasks[i].missing_block_count,
-										tasks[i].locator_start);
+										tasks[i].locator_start,
+										initialized_prefix);
+			fb_wal_merge_replay_block_metadata(index,
+											   tasks[i].replay_block_metadata_path,
+											   tasks[i].replay_block_metadata_count,
+											   tasks[i].locator_start);
+			fb_wal_merge_initialized_blocks(initialized_prefix,
+											tasks[i].initialized_blocks_path,
+											tasks[i].initialized_block_count);
 			index->payload_scanned_record_count += tasks[i].scanned_record_count;
 			index->payload_sparse_reader_resets += tasks[i].reader_reset_count;
 			index->payload_sparse_reader_reuses += tasks[i].reader_reuse_count;
+		}
+			hash_destroy(initialized_prefix);
 		}
 		if (index->precomputed_missing_blocks != NULL)
 			index->precomputed_missing_block_count =
@@ -13758,6 +14886,227 @@ fb_wal_capture_locator_stub_stats_parallel(const FbRelationInfo *info,
 	}
 
 	return false;
+}
+
+static bool
+fb_wal_should_capture_locator_stub_stats_parallel(const FbWalScanContext *ctx,
+															  uint32 payload_locator_count,
+															  uint32 fallback_window_count,
+															  bool count_only_mode)
+{
+	/*
+	 * The worker-based locator stats path currently spends more time waiting
+	 * for workers and merging tempfile sidecars than it saves on payload
+	 * capture. On release-gate datasets this turns direct locator-stream
+	 * queries into a systematic 3/9 payload regression. Keep the simpler
+	 * direct locator visit path until the sidecar merge is removed.
+	 */
+	(void) ctx;
+	(void) payload_locator_count;
+	(void) fallback_window_count;
+	(void) count_only_mode;
+	return false;
+}
+
+static bool
+fb_wal_should_materialize_payload_locators_parallel(const FbWalScanContext *ctx,
+																uint32 window_count,
+																uint32 locator_count)
+{
+	/*
+	 * The current parallel locator materialize path also pays a large
+	 * bgworker/tempfile merge cost on release-gate datasets. Until that merge
+	 * path is removed, prefer the direct exact-locator visit even when the
+	 * summary locators coalesce into a small number of windows.
+	 */
+	(void) ctx;
+	(void) window_count;
+	(void) locator_count;
+	return false;
+}
+
+static XLogRecPtr
+fb_wal_payload_locator_small_gap_limit(const FbWalScanContext *ctx)
+{
+	if (ctx == NULL || ctx->wal_seg_size == 0)
+		return (XLogRecPtr) (XLOG_BLCKSZ * 2);
+
+	/*
+	 * Dense clipped locator windows may bridge genuinely tiny holes, but must
+	 * not grow large enough to reintroduce the over-decode behavior that made
+	 * release-gate `documents` unstable.
+	 */
+	return Min((XLogRecPtr) (ctx->wal_seg_size / 256),
+			   (XLogRecPtr) (XLOG_BLCKSZ * 8));
+}
+
+static FbWalOpenPattern
+fb_wal_payload_locator_open_pattern(const FbWalScanContext *ctx,
+									 uint32 locator_count,
+									 uint32 locator_segment_count)
+{
+	uint32 locators_per_segment = 0;
+
+	if (ctx == NULL || locator_count == 0 || locator_segment_count == 0)
+		return FB_WAL_OPEN_SPARSE;
+
+	locators_per_segment = locator_count / locator_segment_count;
+
+	/*
+	 * When exact locators are dense within each covered segment, the reader is
+	 * already effectively walking the WAL sequentially. In that shape,
+	 * sequential open advice lets the kernel keep readahead hot without
+	 * changing decode semantics.
+	 */
+	if (locators_per_segment >= 512)
+		return FB_WAL_OPEN_STREAMING;
+
+	return FB_WAL_OPEN_SPARSE;
+}
+
+static bool
+fb_wal_should_prefetch_payload_locators(const FbWalScanContext *ctx,
+											uint32 locator_count,
+											uint32 locator_segment_count)
+{
+	return fb_wal_payload_locator_open_pattern(ctx,
+												  locator_count,
+												  locator_segment_count) == FB_WAL_OPEN_STREAMING &&
+		locator_segment_count >= 128;
+}
+
+static void
+fb_wal_acquire_dense_payload_gate(void)
+{
+	LOCKTAG tag;
+
+	SET_LOCKTAG_ADVISORY(tag,
+						MyDatabaseId,
+						0x46425741U,
+						0x4c504159U,
+						0x4741U);
+	(void) LockAcquire(&tag, ExclusiveLock, false, false);
+}
+
+static void
+fb_wal_release_dense_payload_gate(void)
+{
+	LOCKTAG tag;
+
+	SET_LOCKTAG_ADVISORY(tag,
+						MyDatabaseId,
+						0x46425741U,
+						0x4c504159U,
+						0x4741U);
+	(void) LockRelease(&tag, ExclusiveLock, false);
+}
+
+static bool
+fb_wal_should_gate_dense_payload_reader(const FbWalScanContext *ctx,
+											 uint32 locator_count,
+											 uint32 locator_segment_count)
+{
+	return fb_wal_should_prefetch_payload_locators(ctx,
+												   locator_count,
+												   locator_segment_count) &&
+		locator_count >= 524288 &&
+		locator_segment_count >= 256;
+}
+
+static void
+fb_wal_prefetch_payload_locator_segments(FbWalScanContext *ctx,
+											 const FbSummaryPayloadLocator *locators,
+											 uint32 locator_count)
+{
+#if defined(USE_POSIX_FADVISE) && defined(POSIX_FADV_WILLNEED)
+	FbWalSegmentEntry *segments;
+	uint32 locator_segment_count;
+	uint32 segment_index = 0;
+	uint32 i = 0;
+
+	if (ctx == NULL || locators == NULL || locator_count == 0 ||
+		ctx->resolved_segments == NULL || ctx->resolved_segment_count == 0)
+		return;
+
+	locator_segment_count = fb_count_payload_locator_segments(ctx,
+															 locators,
+															 locator_count);
+	if (!fb_wal_should_prefetch_payload_locators(ctx,
+													 locator_count,
+													 locator_segment_count))
+		return;
+
+	segments = (FbWalSegmentEntry *) ctx->resolved_segments;
+	while (i < locator_count && segment_index < ctx->resolved_segment_count)
+	{
+		XLogSegNo locator_segno;
+		uint32 group_end = i + 1;
+		off_t start_offset;
+		off_t end_offset;
+		off_t length;
+		int fd;
+
+		XLByteToSeg(locators[i].record_start_lsn, locator_segno, ctx->wal_seg_size);
+		while (segment_index < ctx->resolved_segment_count &&
+			   segments[segment_index].segno < locator_segno)
+			segment_index++;
+		if (segment_index >= ctx->resolved_segment_count ||
+			segments[segment_index].segno != locator_segno)
+			break;
+
+		while (group_end < locator_count)
+		{
+			XLogSegNo next_segno;
+
+			XLByteToSeg(locators[group_end].record_start_lsn, next_segno, ctx->wal_seg_size);
+			if (next_segno != locator_segno)
+				break;
+			group_end++;
+		}
+
+		start_offset = (off_t) (locators[i].record_start_lsn % ctx->wal_seg_size);
+		start_offset -= start_offset % XLOG_BLCKSZ;
+		end_offset = (off_t) (locators[group_end - 1].record_start_lsn % ctx->wal_seg_size);
+		end_offset = Min((off_t) ctx->wal_seg_size,
+						 end_offset + (off_t) (XLOG_BLCKSZ * 8));
+		length = end_offset - start_offset;
+		if (length <= 0)
+		{
+			i = group_end;
+			continue;
+		}
+
+		fd = fb_open_file_at_path(segments[segment_index].path, FB_WAL_OPEN_STREAMING);
+		if (fd >= 0)
+		{
+			(void) posix_fadvise(fd, start_offset, length, POSIX_FADV_WILLNEED);
+			CloseTransientFile(fd);
+		}
+
+		i = group_end;
+	}
+#else
+	(void) ctx;
+	(void) locators;
+	(void) locator_count;
+#endif
+}
+
+static bool
+fb_wal_should_visit_payload_locators_windowed_serial(uint32 window_count,
+														 uint32 locator_count)
+{
+	if (window_count == 0 || locator_count == 0)
+		return false;
+	if (window_count >= locator_count)
+		return false;
+
+	/*
+	 * Keep sparse locator plans on the exact visitor. The windowed serial
+	 * reader only pays off when each merged window amortizes many exact
+	 * reader resets.
+	 */
+	return locator_count / window_count >= 256;
 }
 
 /*
@@ -14131,11 +15480,11 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 		state.capture_payload = !count_only_mode;
 		state.count_only_capture = count_only_mode;
 		state.tail_capture_allowed = false;
-		state.payload_log = &index->record_log;
-		state.payload_label = "wal-records";
 		index->summary_payload_locator_records = payload_locator_count;
 		index->summary_payload_locator_public_builds =
 			fb_summary_query_cache_payload_locator_public_builds(ctx->summary_cache);
+		index->locator_stream = payload_locators;
+		index->locator_stream_count = payload_locator_count;
 		index->payload_scan_mode = (payload_locator_count > 0) ?
 			FB_WAL_PAYLOAD_SCAN_LOCATOR :
 			(payload_use_sparse_scan ?
@@ -14147,21 +15496,25 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 		index->payload_parallel_workers = 0;
 		index->payload_covered_segment_count = payload_covered_segment_count;
 		ctx->visited_segment_count = scan_segment_total;
+		state.locator_only_payload_capture =
+			(!count_only_mode &&
+			 payload_locator_count > 0 &&
+			 payload_locator_fallback_base_count == 0);
+		state.payload_log = state.locator_only_payload_capture ?
+			NULL : &index->record_log;
+		state.payload_label = state.locator_only_payload_capture ?
+			NULL : "wal-records";
 		if (payload_use_sparse_scan)
 			qsort(payload_sparse_windows, payload_sparse_count, sizeof(*payload_sparse_windows),
 				  fb_visit_window_cmp);
-		if (payload_locator_count > 0 &&
-			ctx->parallel_workers > 1 &&
-			!count_only_mode)
+		if (fb_wal_should_capture_locator_stub_stats_parallel(ctx,
+															  payload_locator_count,
+															  payload_locator_fallback_base_count,
+															  count_only_mode))
 		{
-			for (i = 0; i < payload_locator_count; i++)
-				fb_index_append_locator_stub(index,
-											 state.payload_log,
-											 state.payload_label,
-											 payload_locators[i].record_start_lsn);
+			index->record_count += payload_locator_count;
 			index->payload_scanned_record_count += payload_locator_count;
 			index->payload_window_count = payload_locator_count;
-			state.locator_only_payload_capture = true;
 			if (payload_locator_fallback_base_count == 0)
 				locator_stub_stats_done =
 					fb_wal_capture_locator_stub_stats_parallel(info,
@@ -14305,7 +15658,8 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 		}
 		if (payload_locators != NULL)
 		{
-			pfree(payload_locators);
+			if (index->locator_stream != payload_locators)
+				pfree(payload_locators);
 			payload_locators = NULL;
 		}
 		if (payload_base_windows != NULL)
@@ -14326,15 +15680,7 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 			if (index->precomputed_missing_blocks != NULL)
 				index->precomputed_missing_block_count =
 					hash_get_num_entries(index->precomputed_missing_blocks);
-		}
-		else if (!count_only_mode && state.locator_only_payload_capture)
-		{
-			if (state.payload_block_states != NULL)
-			{
-				hash_destroy(state.payload_block_states);
-				state.payload_block_states = NULL;
-			}
-			fb_wal_finalize_record_stats(index);
+			fb_wal_mark_payload_metadata_complete(index);
 		}
 		else if (!count_only_mode && state.payload_block_states != NULL)
 		{
@@ -14343,8 +15689,10 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 			if (index->precomputed_missing_blocks != NULL)
 				index->precomputed_missing_block_count =
 					hash_get_num_entries(index->precomputed_missing_blocks);
+			fb_wal_mark_payload_metadata_complete(index);
 		}
-		else if (!count_only_mode)
+		else if (fb_wal_should_finalize_record_stats_after_payload(index,
+																   count_only_mode))
 			fb_wal_finalize_record_stats(index);
 		index->payload_covered_segment_count = payload_covered_segment_count;
 		index->payload_scanned_record_count = payload_scanned_record_count;
@@ -14354,6 +15702,8 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 		fb_summary_service_report_query_summary_usage(GetCurrentTimestamp(),
 													  ctx->summary_span_fallback_segments,
 													  ctx->metadata_fallback_windows);
+		if (!count_only_mode)
+			fb_replay_precompute_index_metadata(index);
 	}
 
 	fb_progress_update_percent(FB_PROGRESS_STAGE_BUILD_INDEX,
@@ -14380,6 +15730,377 @@ fb_wal_build_record_index(const FbRelationInfo *info,
 	hash_destroy(state.unsafe_xids);
 	if (state.count_only_xids != NULL)
 		hash_destroy(state.count_only_xids);
+}
+
+Datum
+fb_wal_locator_stream_contract_debug(PG_FUNCTION_ARGS)
+{
+	FbWalRecordIndex index;
+	FbWalScanContext ctx;
+	FbSummaryPayloadLocator locators[4];
+	FbWalRecordCursor *cursor;
+	bool materialize_parallel;
+	bool seek_ok;
+	bool stats_parallel;
+
+	MemSet(&index, 0, sizeof(index));
+	MemSet(&ctx, 0, sizeof(ctx));
+	MemSet(locators, 0, sizeof(locators));
+	locators[0].record_start_lsn = InvalidXLogRecPtr + 0x10;
+	locators[1].record_start_lsn = InvalidXLogRecPtr + 0x20;
+	locators[2].record_start_lsn = InvalidXLogRecPtr + 0x30;
+	locators[3].record_start_lsn = InvalidXLogRecPtr + 0x40;
+
+	index.locator_stream = locators;
+	index.locator_stream_count = lengthof(locators);
+	index.record_count = lengthof(locators);
+	ctx.parallel_workers = 4;
+	stats_parallel =
+		fb_wal_should_capture_locator_stub_stats_parallel(&ctx,
+														  lengthof(locators),
+														  0,
+														  false);
+	materialize_parallel =
+		fb_wal_should_materialize_payload_locators_parallel(&ctx,
+															lengthof(locators) - 1,
+															lengthof(locators));
+
+	cursor = fb_wal_record_cursor_open(&index, FB_SPOOL_FORWARD);
+	seek_ok = fb_wal_record_cursor_seek(cursor, 1);
+	fb_wal_record_cursor_close(cursor);
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+		"head_spool=%u locator_stream=%u tail_spool=%u first=%X/%08X last=%X/%08X seek=%d stats_parallel=%d materialize_parallel=%d",
+		(unsigned int) fb_spool_log_count(index.record_log),
+		(unsigned int) index.locator_stream_count,
+		(unsigned int) fb_spool_log_count(index.record_tail_log),
+		LSN_FORMAT_ARGS(locators[0].record_start_lsn),
+		LSN_FORMAT_ARGS(locators[lengthof(locators) - 1].record_start_lsn),
+		seek_ok ? 1 : 0,
+		stats_parallel ? 1 : 0,
+		materialize_parallel ? 1 : 0)));
+}
+
+Datum
+fb_wal_locator_window_serial_contract_debug(PG_FUNCTION_ARGS)
+{
+	FbWalScanContext ctx;
+	FbWalSegmentEntry segments[1];
+	FbSummaryPayloadLocator locators[2];
+	FbWalVisitWindow *windows = NULL;
+	XLogRecPtr first_end_lsn = InvalidXLogRecPtr;
+	XLogRecPtr second_start_lsn = InvalidXLogRecPtr;
+	uint32 first_window_end = 0;
+	uint32 second_window_end = 0;
+	uint32 window_count;
+	bool windowed_serial;
+
+	MemSet(&ctx, 0, sizeof(ctx));
+	MemSet(segments, 0, sizeof(segments));
+	MemSet(locators, 0, sizeof(locators));
+
+	ctx.wal_seg_size = 16 * 1024 * 1024;
+	ctx.resolved_segments = segments;
+	ctx.resolved_segment_count = lengthof(segments);
+	segments[0].segno = 0;
+	locators[0].record_start_lsn = InvalidXLogRecPtr + UINT64CONST(0x00100000);
+	locators[1].record_start_lsn = InvalidXLogRecPtr + UINT64CONST(0x00400000);
+
+	window_count =
+		fb_build_payload_locator_visit_windows(&ctx,
+											   locators,
+											   lengthof(locators),
+											   &windows);
+	if (window_count > 0)
+	{
+		first_window_end =
+			fb_wal_find_payload_locator_window_end_index(locators,
+														 lengthof(locators),
+														 0,
+														 windows[0].end_lsn);
+		first_end_lsn = windows[0].end_lsn;
+	}
+	if (window_count > 1)
+	{
+		second_window_end =
+			fb_wal_find_payload_locator_window_end_index(locators,
+														 lengthof(locators),
+														 first_window_end,
+														 windows[1].end_lsn);
+		second_start_lsn = windows[1].start_lsn;
+	}
+	windowed_serial =
+		fb_wal_should_visit_payload_locators_windowed_serial(window_count,
+															 lengthof(locators) * 256);
+
+	if (windows != NULL)
+		pfree(windows);
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+		"windows=%u first_locators=%u first_end=%X/%08X second_locators=%u second_start=%X/%08X windowed_serial=%d",
+		window_count,
+		first_window_end,
+		LSN_FORMAT_ARGS(first_end_lsn),
+		(second_window_end > first_window_end) ?
+			(second_window_end - first_window_end) : 0,
+		LSN_FORMAT_ARGS(second_start_lsn),
+		windowed_serial ? 1 : 0)));
+}
+
+Datum
+fb_wal_parallel_missing_continuity_contract_debug(PG_FUNCTION_ARGS)
+{
+	FbSpoolSession *session = NULL;
+	FbWalRecordIndex index;
+	HTAB *initialized = NULL;
+	HTAB *missing = NULL;
+	HTAB *worker_initialized = NULL;
+	FbWalPrecomputedMissingBlock *missing_entry;
+	FbWalBlockInitState *init_entry;
+	FbWalBlockKey key_skip;
+	FbWalBlockKey key_keep;
+	FbWalPrecomputedMissingBlock probe;
+	char missing_path[MAXPGPATH];
+	char initialized_path[MAXPGPATH];
+	bool found = false;
+	bool skipped_ok = false;
+	bool kept_ok = false;
+	uint32 merged_count = 0;
+
+	MemSet(&index, 0, sizeof(index));
+	MemSet(&key_skip, 0, sizeof(key_skip));
+	MemSet(&key_keep, 0, sizeof(key_keep));
+	key_skip.forknum = MAIN_FORKNUM;
+	key_skip.blkno = 42;
+	key_keep.forknum = MAIN_FORKNUM;
+	key_keep.blkno = 43;
+
+	PG_TRY();
+	{
+		session = fb_spool_session_create();
+		snprintf(missing_path, sizeof(missing_path), "%s/contract-missing.bin",
+				 fb_spool_session_dir(session));
+		snprintf(initialized_path, sizeof(initialized_path), "%s/contract-initialized.bin",
+				 fb_spool_session_dir(session));
+
+		initialized = fb_wal_create_block_key_hash();
+		missing = fb_wal_create_precomputed_missing_block_hash();
+		worker_initialized = fb_wal_create_block_init_state_hash();
+
+		init_entry = (FbWalBlockInitState *) hash_search(worker_initialized,
+														 &key_skip,
+														 HASH_ENTER,
+														 &found);
+		if (!found)
+			MemSet(init_entry, 0, sizeof(*init_entry));
+		init_entry->key = key_skip;
+		init_entry->initialized = true;
+
+		missing_entry = (FbWalPrecomputedMissingBlock *) hash_search(missing,
+																	 &key_skip,
+																	 HASH_ENTER,
+																	 &found);
+		if (!found)
+			MemSet(missing_entry, 0, sizeof(*missing_entry));
+		missing_entry->key = key_skip;
+		missing_entry->first_record_index = 1;
+		missing_entry->first_record_lsn = InvalidXLogRecPtr + 0x20;
+
+		missing_entry = (FbWalPrecomputedMissingBlock *) hash_search(missing,
+																	 &key_keep,
+																	 HASH_ENTER,
+																	 &found);
+		if (!found)
+			MemSet(missing_entry, 0, sizeof(*missing_entry));
+		missing_entry->key = key_keep;
+		missing_entry->first_record_index = 3;
+		missing_entry->first_record_lsn = InvalidXLogRecPtr + 0x40;
+
+		fb_wal_dump_initialized_blocks(worker_initialized,
+									   initialized_path,
+									   NULL);
+		fb_wal_merge_initialized_blocks(initialized, initialized_path, 1);
+		fb_wal_dump_missing_blocks(missing, missing_path, NULL);
+		fb_wal_merge_missing_blocks(&index, missing_path, 2, 10, initialized);
+
+		if (index.precomputed_missing_blocks != NULL)
+			merged_count = hash_get_num_entries(index.precomputed_missing_blocks);
+
+		skipped_ok =
+			(index.precomputed_missing_blocks == NULL ||
+			 hash_search(index.precomputed_missing_blocks,
+						 &key_skip,
+						 HASH_FIND,
+						 NULL) == NULL);
+
+		MemSet(&probe, 0, sizeof(probe));
+		kept_ok = false;
+		if (index.precomputed_missing_blocks != NULL)
+		{
+			FbWalPrecomputedMissingBlock *merged =
+				(FbWalPrecomputedMissingBlock *) hash_search(index.precomputed_missing_blocks,
+															 &key_keep,
+															 HASH_FIND,
+															 NULL);
+			if (merged != NULL)
+			{
+				probe = *merged;
+				kept_ok = (merged->first_record_index == 13);
+			}
+		}
+
+		if (worker_initialized != NULL)
+			hash_destroy(worker_initialized);
+		if (missing != NULL)
+			hash_destroy(missing);
+		if (initialized != NULL)
+			hash_destroy(initialized);
+		if (index.precomputed_missing_blocks != NULL)
+			hash_destroy(index.precomputed_missing_blocks);
+		fb_spool_session_destroy(session);
+
+		PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+			"parallel_missing_continuity=%s merged_count=%u kept_first_record_index=%u",
+			(skipped_ok && kept_ok && merged_count == 1) ? "true" : "false",
+			merged_count,
+			probe.first_record_index)));
+	}
+	PG_CATCH();
+	{
+		if (worker_initialized != NULL)
+			hash_destroy(worker_initialized);
+		if (missing != NULL)
+			hash_destroy(missing);
+		if (initialized != NULL)
+			hash_destroy(initialized);
+		if (index.precomputed_missing_blocks != NULL)
+			hash_destroy(index.precomputed_missing_blocks);
+		if (session != NULL)
+			fb_spool_session_destroy(session);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+Datum
+fb_dml_profile_counter_reset_contract_debug(PG_FUNCTION_ARGS)
+{
+	FbWalRecordIndex reset_index;
+	FbWalRecordIndex incremental_index;
+	FbWalIndexBuildState state;
+	bool reset_ok;
+	bool incremental_ok;
+
+	MemSet(&reset_index, 0, sizeof(reset_index));
+	MemSet(&incremental_index, 0, sizeof(incremental_index));
+	MemSet(&state, 0, sizeof(state));
+
+	reset_index.target_kind_counts[FB_WAL_RECORD_HEAP_INSERT] = 7;
+	reset_index.target_kind_counts[FB_WAL_RECORD_HEAP_DELETE] = 3;
+	fb_wal_reset_record_stats(&reset_index);
+	reset_ok =
+		(reset_index.target_kind_counts[FB_WAL_RECORD_HEAP_INSERT] == 0) &&
+		(reset_index.target_kind_counts[FB_WAL_RECORD_HEAP_DELETE] == 0);
+
+	incremental_index.target_kind_counts[FB_WAL_RECORD_HEAP_INSERT] = 5;
+	incremental_index.target_kind_counts[FB_WAL_RECORD_HEAP2_MULTI_INSERT] = 2;
+	fb_wal_enable_incremental_payload_stats(&incremental_index, &state);
+	incremental_ok =
+		(incremental_index.target_kind_counts[FB_WAL_RECORD_HEAP_INSERT] == 0) &&
+		(incremental_index.target_kind_counts[FB_WAL_RECORD_HEAP2_MULTI_INSERT] == 0);
+
+	if (state.payload_block_states != NULL)
+		hash_destroy(state.payload_block_states);
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+		"kind_counts_reset=%d incremental_kind_counts_reset=%d",
+		reset_ok ? 1 : 0,
+		incremental_ok ? 1 : 0)));
+}
+
+Datum
+fb_wal_payload_metadata_contract_debug(PG_FUNCTION_ARGS)
+{
+	FbWalRecordIndex locator_index;
+	FbWalRecordIndex sparse_index;
+	FbWalRecordIndex windowed_index;
+	FbWalRecordIndex legacy_index;
+	bool locator_finalize;
+	bool sparse_finalize;
+	bool windowed_finalize;
+	bool legacy_finalize;
+	bool metadata_complete;
+
+	MemSet(&locator_index, 0, sizeof(locator_index));
+	MemSet(&sparse_index, 0, sizeof(sparse_index));
+	MemSet(&windowed_index, 0, sizeof(windowed_index));
+	MemSet(&legacy_index, 0, sizeof(legacy_index));
+
+	fb_wal_mark_payload_metadata_complete(&locator_index);
+	fb_wal_mark_payload_metadata_complete(&sparse_index);
+	fb_wal_mark_payload_metadata_complete(&windowed_index);
+
+	locator_finalize =
+		fb_wal_should_finalize_record_stats_after_payload(&locator_index, false);
+	sparse_finalize =
+		fb_wal_should_finalize_record_stats_after_payload(&sparse_index, false);
+	windowed_finalize =
+		fb_wal_should_finalize_record_stats_after_payload(&windowed_index, false);
+	legacy_finalize =
+		fb_wal_should_finalize_record_stats_after_payload(&legacy_index, false);
+	metadata_complete = locator_index.payload_metadata_complete &&
+		sparse_index.payload_metadata_complete &&
+		windowed_index.payload_metadata_complete &&
+		!legacy_index.payload_metadata_complete;
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+		"locator_finalize=%d sparse_finalize=%d windowed_finalize=%d legacy_finalize=%d metadata_complete=%d",
+		locator_finalize ? 1 : 0,
+		sparse_finalize ? 1 : 0,
+		windowed_finalize ? 1 : 0,
+		legacy_finalize ? 1 : 0,
+		metadata_complete ? 1 : 0)));
+}
+
+Datum
+fb_wal_locator_reader_profile_contract_debug(PG_FUNCTION_ARGS)
+{
+	FbWalScanContext ctx;
+	FbWalOpenPattern dense_pattern;
+	FbWalOpenPattern sparse_pattern;
+	XLogRecPtr window_gap;
+	bool dense_prefetch;
+	bool sparse_prefetch;
+	bool dense_gate;
+	bool sparse_gate;
+	bool dense_windowed;
+	bool sparse_windowed;
+
+	MemSet(&ctx, 0, sizeof(ctx));
+	ctx.wal_seg_size = 16 * 1024 * 1024;
+
+	dense_pattern = fb_wal_payload_locator_open_pattern(&ctx, 1024, 1);
+	sparse_pattern = fb_wal_payload_locator_open_pattern(&ctx, 2, 2);
+	window_gap = fb_wal_payload_locator_small_gap_limit(&ctx);
+	dense_prefetch = fb_wal_should_prefetch_payload_locators(&ctx, 1024 * 128, 128);
+	sparse_prefetch = fb_wal_should_prefetch_payload_locators(&ctx, 2, 2);
+	dense_gate = fb_wal_should_gate_dense_payload_reader(&ctx, 1024 * 1024, 256);
+	sparse_gate = fb_wal_should_gate_dense_payload_reader(&ctx, 2, 2);
+	dense_windowed = fb_wal_should_visit_payload_locators_windowed_serial(2, 512);
+	sparse_windowed = fb_wal_should_visit_payload_locators_windowed_serial(2, 2);
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+		"dense_pattern=%s sparse_pattern=%s exact_gap_policy=exact_only window_gap=%llu dense_prefetch=%d sparse_prefetch=%d dense_gate=%d sparse_gate=%d dense_windowed=%d sparse_windowed=%d",
+		dense_pattern == FB_WAL_OPEN_STREAMING ? "streaming" :
+		(dense_pattern == FB_WAL_OPEN_SEQUENTIAL ? "sequential" : "sparse"),
+		sparse_pattern == FB_WAL_OPEN_SEQUENTIAL ? "sequential" : "sparse",
+		(unsigned long long) window_gap,
+		dense_prefetch ? 1 : 0,
+		sparse_prefetch ? 1 : 0,
+		dense_gate ? 1 : 0,
+		sparse_gate ? 1 : 0,
+		dense_windowed ? 1 : 0,
+		sparse_windowed ? 1 : 0)));
 }
 
 static Datum
@@ -15501,4 +17222,35 @@ fb_wal_payload_scan_mode_name(FbWalPayloadScanMode mode)
 	}
 
 	return "unknown";
+}
+
+bool
+fb_wal_replay_block_metadata_ready(const FbWalRecordIndex *index)
+{
+	return index != NULL &&
+		index->replay_block_metadata != NULL &&
+		index->replay_block_metadata_count > 0;
+}
+
+bool
+fb_wal_lookup_replay_block_metadata(const FbWalRecordIndex *index,
+									const FbWalBlockKey *key,
+									FbWalReplayBlockMetadata *metadata_out)
+{
+	FbWalReplayBlockMetadata *entry;
+
+	if (metadata_out != NULL)
+		MemSet(metadata_out, 0, sizeof(*metadata_out));
+	if (index == NULL || key == NULL || index->replay_block_metadata == NULL)
+		return false;
+
+	entry = (FbWalReplayBlockMetadata *) hash_search(index->replay_block_metadata,
+													 key,
+													 HASH_FIND,
+													 NULL);
+	if (entry == NULL)
+		return false;
+	if (metadata_out != NULL)
+		*metadata_out = *entry;
+	return true;
 }

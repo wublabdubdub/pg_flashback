@@ -1,0 +1,15 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_flashback;
+RESET client_min_messages;
+SET pg_flashback.show_progress = off;
+CREATE FUNCTION fb_wal_locator_reader_profile_contract_debug()
+RETURNS text
+AS '$libdir/pg_flashback', 'fb_wal_locator_reader_profile_contract_debug'
+LANGUAGE C STRICT;
+SELECT fb_wal_locator_reader_profile_contract_debug();
+                                                                        fb_wal_locator_reader_profile_contract_debug                                                                         
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ dense_pattern=streaming sparse_pattern=sparse exact_gap_policy=exact_only window_gap=65536 dense_prefetch=1 sparse_prefetch=0 dense_gate=1 sparse_gate=0 dense_windowed=1 sparse_windowed=0
+(1 row)
+
+DROP FUNCTION fb_wal_locator_reader_profile_contract_debug();

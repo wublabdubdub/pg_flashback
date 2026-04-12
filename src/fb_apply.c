@@ -38,7 +38,6 @@
 #define FB_APPLY_PARALLEL_ERRMSG_MAX 512
 #define FB_APPLY_PARALLEL_GUC_MAX 64
 #define FB_APPLY_PARALLEL_MIN_REL_PAGES 64
-#define FB_APPLY_PARALLEL_MAX_REL_PAGES 32768
 #define FB_APPLY_PARALLEL_TUPLE_QUEUE_SIZE (1024 * 1024)
 
 typedef enum FbApplyParallelTaskStatus
@@ -161,6 +160,7 @@ struct FbApplyContext
 };
 
 PGDLLEXPORT void fb_apply_parallel_worker_main(Datum main_arg);
+PG_FUNCTION_INFO_V1(fb_apply_parallel_gate_contract_debug);
 
 static FbApplyParallelTask *fb_apply_parallel_tasks(FbApplyParallelShared *shared);
 static const void *fb_apply_parallel_reverse_shared_const(const FbApplyParallelShared *shared);
@@ -197,6 +197,19 @@ static void fb_apply_take_buffered_emit(FbApplyBufferedEmit *buffer,
 										FbApplyEmit *emit);
 static bool fb_apply_next_count_only_emit(FbApplyContext *ctx,
 										  FbApplyEmit *emit);
+
+static bool
+fb_apply_parallel_relpages_supported(BlockNumber relpages)
+{
+	return relpages >= FB_APPLY_PARALLEL_MIN_REL_PAGES;
+}
+
+static bool
+fb_apply_parallel_fast_path_compatible(const FbFastPathSpec *fast_path)
+{
+	(void) fast_path;
+	return true;
+}
 
 static FbApplyParallelTask *
 fb_apply_parallel_tasks(FbApplyParallelShared *shared)
@@ -384,16 +397,42 @@ fb_apply_parallel_supported(const FbRelationInfo *info,
 		return false;
 	if (info == NULL || info->mode != FB_APPLY_KEYED)
 		return false;
-	if (fast_path != NULL && fast_path->mode != FB_FAST_PATH_NONE)
+	if (!fb_apply_parallel_fast_path_compatible(fast_path))
 		return false;
 	if (rel == NULL || rel->rd_rel == NULL)
 		return false;
-	if (rel->rd_rel->relpages < FB_APPLY_PARALLEL_MIN_REL_PAGES)
-		return false;
-	if (rel->rd_rel->relpages > FB_APPLY_PARALLEL_MAX_REL_PAGES)
+	if (!fb_apply_parallel_relpages_supported(rel->rd_rel->relpages))
 		return false;
 
 	return true;
+}
+
+Datum
+fb_apply_parallel_gate_contract_debug(PG_FUNCTION_ARGS)
+{
+	bool large_ok;
+	bool small_ok;
+	FbFastPathSpec fast_path_none;
+	FbFastPathSpec fast_path_keyeq;
+	bool fast_path_none_ok;
+	bool fast_path_keyeq_ok;
+
+	large_ok = fb_apply_parallel_relpages_supported((BlockNumber) 458789);
+	small_ok = fb_apply_parallel_relpages_supported((BlockNumber) 64);
+	MemSet(&fast_path_none, 0, sizeof(fast_path_none));
+	MemSet(&fast_path_keyeq, 0, sizeof(fast_path_keyeq));
+	fast_path_keyeq.mode = FB_FAST_PATH_KEY_EQ;
+	fast_path_none_ok =
+		fb_apply_parallel_fast_path_compatible(&fast_path_none);
+	fast_path_keyeq_ok =
+		fb_apply_parallel_fast_path_compatible(&fast_path_keyeq);
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+		"large_relpages_parallel_supported=%s small_relpages_supported=%s fast_path_none_parallel_supported=%s fast_path_keyeq_parallel_supported=%s",
+		large_ok ? "true" : "false",
+		small_ok ? "true" : "false",
+		fast_path_none_ok ? "true" : "false",
+		fast_path_keyeq_ok ? "true" : "false")));
 }
 
 bool
