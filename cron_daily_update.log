@@ -158,3 +158,50 @@ To github.com:wublabdubdub/pg_flashback.git
 To github.com:wublabdubdub/pg_flashback.git
    0d93c71..1676cb4  main -> main
 [2026-04-12 01:00:07 CST] auto update finished
+[2026-04-13 01:00:30 CST] committing changes to origin/main
+[main 13827c8] update
+ 62 files changed, 6261 insertions(+), 571 deletions(-)
+ create mode 100644 docs/decisions/ADR-0038-locator-stream-no-stub-sidecars.md
+ create mode 100644 docs/decisions/ADR-0039-replay-metadata-frontier-and-compact-store.md
+ create mode 100644 docs/decisions/ADR-0040-disable-eager-prune-precompute-on-lookahead-spool.md
+ create mode 100644 docs/decisions/ADR-0041-single-pass-payload-metadata-contract.md
+ create mode 100644 docs/decisions/ADR-0042-dense-payload-io-gate.md
+ create mode 100644 docs/superpowers/plans/2026-04-12-locator-stream-no-stub-plan.md
+ create mode 100644 docs/superpowers/plans/2026-04-12-replay-metadata-frontier-compact-store-plan.md
+ create mode 100644 expected/fb_apply_parallel_gate.out
+ create mode 100644 expected/fb_dml_profile_contract.out
+ create mode 100644 expected/fb_replay_block_state_init.out
+ create mode 100644 expected/fb_replay_discover_materialize_reuse.out
+ create mode 100644 expected/fb_replay_discover_skip_payload.out
+ create mode 100644 expected/fb_replay_discover_toast.out
+ create mode 100644 expected/fb_replay_eager_metadata_gate.out
+ create mode 100644 expected/fb_replay_metadata_contract.out
+ create mode 100644 expected/fb_replay_prune_lookahead_payload.out
+ create mode 100644 expected/fb_summary_payload_locator_merge.out
+ create mode 100644 expected/fb_wal_locator_reader_profile.out
+ create mode 100644 expected/fb_wal_locator_stream.out
+ create mode 100644 expected/fb_wal_locator_window_serial.out
+ create mode 100644 expected/fb_wal_parallel_missing_continuity.out
+ create mode 100644 expected/fb_wal_payload_metadata_contract.out
+ create mode 100644 perf.data
+ create mode 100644 sql/fb_apply_parallel_gate.sql
+ create mode 100644 sql/fb_dml_profile_contract.sql
+ create mode 100644 sql/fb_replay_block_state_init.sql
+ create mode 100644 sql/fb_replay_discover_materialize_reuse.sql
+ create mode 100644 sql/fb_replay_discover_skip_payload.sql
+ create mode 100644 sql/fb_replay_discover_toast.sql
+ create mode 100644 sql/fb_replay_eager_metadata_gate.sql
+ create mode 100644 sql/fb_replay_metadata_contract.sql
+ create mode 100644 sql/fb_replay_prune_lookahead_payload.sql
+ create mode 100644 sql/fb_summary_payload_locator_merge.sql
+ create mode 100644 sql/fb_wal_locator_reader_profile.sql
+ create mode 100644 sql/fb_wal_locator_stream.sql
+ create mode 100644 sql/fb_wal_locator_window_serial.sql
+ create mode 100644 sql/fb_wal_parallel_missing_continuity.sql
+ create mode 100644 sql/fb_wal_payload_metadata_contract.sql
+ create mode 100644 sql/pg_flashback--0.2.4--0.2.5.sql
+ create mode 100644 sql/pg_flashback--0.2.5.sql
+[2026-04-13 01:00:50 CST] pushing to origin/main
+To github.com:wublabdubdub/pg_flashback.git
+   1676cb4..13827c8  main -> main
+[2026-04-13 01:00:55 CST] auto update finished
